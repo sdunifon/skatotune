@@ -1,0 +1,5 @@
+# Lets you run `cargo xtask bundle vocal_tune --release` to build the plugin bundles.
+[alias]
+xtask = "run --package xtask --release --"
+# `cargo standalone` runs the plugin in its own window with live mic input (no DAW).
+standalone = "run --release --package vocal_tune --features standalone --bin vocal_tune_standalone"

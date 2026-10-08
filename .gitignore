@@ -1,0 +1,9 @@
+# Build output at any depth (e.g. xtask/target from IDE builds)
+target/
+# Offline renders and evaluation output from vt-eval
+/out
+*.wav
+!/testdata/**/*.wav
+.DS_Store
+# Local validator installs (clap-validator, pluginval, VST3 SDK validator)
+/.tools

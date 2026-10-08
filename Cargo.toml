@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vt_core",
+    "crates/vt_detect",
+    "crates/vt_control",
+    "crates/vt_shift",
+    "crates/vt_engine",
+    "crates/vocal_tune",
+    "crates/vt_eval",
+    "xtask",
+]
+default-members = ["crates/vt_core", "crates/vt_detect", "crates/vt_control", "crates/vt_shift", "crates/vt_engine", "crates/vt_eval"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "ISC"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+vt_core = { path = "crates/vt_core" }
+vt_detect = { path = "crates/vt_detect" }
+vt_control = { path = "crates/vt_control" }
+vt_shift = { path = "crates/vt_shift" }
+vt_engine = { path = "crates/vt_engine" }
+vt_eval = { path = "crates/vt_eval" }
+
+# Plugin framework: nice-plug is the maintained community fork of nih-plug. Its
+# VST3 wrapper uses the MIT/Apache `vst3` bindings rather than GPLv3 vst3-sys.
+nice-plug = { version = "=0.4.2" }
+nice-plug-egui = { version = "=0.5.1" }
+
+# Realtime plumbing
+rtrb = "0.4.0"
+triple_buffer = "9.0.0"
+atomic_float = "1.1.0"
+
+# DSP
+realfft = "3.5.0"
+rustfft = "6.4.1"
+
+# Dev / eval
+hound = "3.5.1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "plotters"] }
+
+# Hot DSP loops are also exercised by unit tests; build dependencies (and our own
+# crates in test/bench) optimized so tests that render seconds of audio stay fast.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+
+# `cargo bench` inherits release; keep symbols so profilers can attribute samples.
+[profile.bench]
+inherits = "release"
+debug = "line-tables-only"
+
+[profile.profiling]
+inherits = "release"
+debug = true

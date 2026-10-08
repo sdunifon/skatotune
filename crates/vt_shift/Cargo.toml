@@ -1,0 +1,11 @@
+[package]
+name = "vt_shift"
+description = "Pitch-mark tracking and pitch-shifting engines (Classic, PSOLA) for Vocal Tune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vt_core.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "vt_control"
+description = "Pitch-correction control law (scale, notes, retune, vibrato, MIDI) for Vocal Tune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vt_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "control"
+harness = false

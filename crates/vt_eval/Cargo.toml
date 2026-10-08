@@ -1,0 +1,28 @@
+[package]
+name = "vt_eval"
+description = "Offline evaluation harness: test signals, rendering, metrics, benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vt_core.workspace = true
+vt_engine.workspace = true
+hound.workspace = true
+# Telemetry consumer type handed out by `Engine::take_telemetry`.
+rtrb.workspace = true
+# f64 FFTs for the offline reference tracker and latency cross-correlation.
+realfft.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bin]]
+name = "vt_eval"
+path = "src/main.rs"
+
+[[bench]]
+name = "engine"
+harness = false
