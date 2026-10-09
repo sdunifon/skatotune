@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="266" viewBox="0 0 760 266" role="img" aria-label="Pitch-analysis kernel speed">
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .title { font-size: 15px; font-weight: 600; fill: #1f2328; }
+  .sub   { font-size: 12px; fill: #59636e; }
+  .lab   { font-size: 12.5px; fill: #1f2328; }
+  .val   { font-size: 12px; fill: #59636e; }
+  .tick  { font-size: 11px; fill: #59636e; }
+  .grid  { stroke: #d1d9e0; stroke-width: 1; }
+  .axis  { stroke: #818b98; stroke-width: 1; }
+  .ref   { stroke: #818b98; stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; }
+  @media (prefers-color-scheme: dark) {
+    .title, .lab { fill: #f0f6fc; }
+    .sub, .val, .tick { fill: #9198a1; }
+    .grid { stroke: #2f353d; }
+    .axis, .ref { stroke: #656c76; }
+    .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; }
+  }
+</style>
+<text x="20.0" y="28.0" class="title" text-anchor="start">Pitch-analysis kernel: time per window (µs, log scale, lower is better)</text><text x="20.0" y="47.0" class="sub" text-anchor="start">One 1024-sample analysis window with 512 lags on an M4 Max. Choosing the algorithm mattered far more than SIMD.</text><line x1="230.0" y1="64" x2="230.0" y2="220" class="grid"/><text x="230.0" y="236.0" class="tick" text-anchor="middle">1 µs</text><line x1="350.0" y1="64" x2="350.0" y2="220" class="grid"/><text x="350.0" y="236.0" class="tick" text-anchor="middle">10 µs</text><line x1="470.0" y1="64" x2="470.0" y2="220" class="grid"/><text x="470.0" y="236.0" class="tick" text-anchor="middle">100 µs</text><line x1="590.0" y1="64" x2="590.0" y2="220" class="grid"/><text x="590.0" y="236.0" class="tick" text-anchor="middle">1000 µs</text><text x="220.0" y="83.0" class="lab" text-anchor="end">Naive loop</text><rect x="230.0" y="70.0" width="297.9" height="16.0" rx="2" class="s1"/><text x="533.9" y="83.0" class="val" text-anchor="start">304 µs</text><text x="220.0" y="113.0" class="lab" text-anchor="end">Direct, auto-vectorised Rust</text><rect x="230.0" y="100.0" width="169.4" height="16.0" rx="2" class="s1"/><text x="405.4" y="113.0" class="val" text-anchor="start">25.8 µs</text><text x="220.0" y="143.0" class="lab" text-anchor="end">Direct, hand-written NEON</text><rect x="230.0" y="130.0" width="145.8" height="16.0" rx="2" class="s1"/><text x="381.8" y="143.0" class="val" text-anchor="start">16.4 µs</text><text x="220.0" y="173.0" class="lab" text-anchor="end">FFT (realfft, exact size)</text><rect x="230.0" y="160.0" width="78.0" height="16.0" rx="2" class="s2"/><text x="314.0" y="173.0" class="val" text-anchor="start">4.47 µs  (shipping)</text><text x="220.0" y="203.0" class="lab" text-anchor="end">FFT (Apple vDSP), in isolation</text><rect x="230.0" y="190.0" width="62.5" height="16.0" rx="2" class="s1"/><text x="298.5" y="203.0" class="val" text-anchor="start">3.32 µs  (slower in the full plugin)</text></svg>
