@@ -113,12 +113,82 @@ impl PitchHistory {
     pub fn iter_range(&self, from: usize, to: usize) -> impl Iterator<Item = &PitchFrame> + '_ {
         (from..to.min(self.len)).filter_map(move |i| self.get(i))
     }
+
+    /// Whether any stored frame is voiced (drives the "No pitch" hint).
+    pub fn any_voiced(&self) -> bool {
+        self.iter_range(0, self.len)
+            .any(|f| f.flags & vt_core::frame_flags::VOICED != 0)
+    }
 }
 
-/// Seconds the display may run ahead of the newest frame. Covers the gap
-/// between bursts for host blocks up to ~85 ms; when audio stops the graph
-/// coasts this far and then halts instead of scrolling into emptiness.
-const MAX_LEAD_S: f64 = 0.1;
+/// Longest silence the graph shows between two runs of telemetry, and how far
+/// the display keeps scrolling while no frames arrive. Bitwig puts a quiet
+/// CLAP plugin to sleep and nice-plug calls `reset()` when it wakes, which
+/// restarts the engine's sample counter; short pauses must not freeze or wipe
+/// the graph, while a stopped transport still halts it after this long.
+pub const MAX_GAP_S: f64 = 1.5;
+
+/// Maps engine telemetry positions onto one monotonic display timeline.
+///
+/// Engine positions restart at 0 whenever the engine is reset (CLAP
+/// sleep/wake, host reset, transport restart) or rebuilt. Instead of dropping
+/// the history, the new run is placed after the old one, separated by the
+/// real time that passed (capped at [`MAX_GAP_S`]), so the previous phrase
+/// stays on screen and simply scrolls away.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timeline {
+    /// Display position minus engine position for the current run (a fresh
+    /// engine may start ahead of the old run, so this can be negative).
+    offset: i64,
+    last_raw: Option<u64>,
+    last_mapped: u64,
+    last_arrival: Option<Instant>,
+    /// The next frame starts a new run even if its position did not go back
+    /// (a freshly built engine).
+    restart_pending: bool,
+}
+
+impl Timeline {
+    /// Forget everything (sample-rate change: old positions mean nothing).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The next frame comes from a new engine.
+    pub fn restart(&mut self) {
+        self.restart_pending = true;
+    }
+
+    /// Display position for a frame at engine position `raw` that arrived at
+    /// `now`. Always ≥ the previous result.
+    pub fn map(&mut self, raw: u64, now: Instant, sample_rate: f64) -> u64 {
+        let went_back = self.last_raw.is_some_and(|prev| raw < prev);
+        if self.last_raw.is_some() && (went_back || self.restart_pending) {
+            let gap_s = self
+                .last_arrival
+                .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64())
+                .min(MAX_GAP_S);
+            let gap = ((gap_s * sample_rate.max(1.0)) as i64).max(1);
+            self.offset = clamp_i64(self.last_mapped) + gap - clamp_i64(raw);
+        }
+        self.restart_pending = false;
+        self.last_raw = Some(raw);
+        self.last_arrival = Some(now);
+        let mapped = clamp_i64(raw).saturating_add(self.offset).max(0) as u64;
+        self.last_mapped = mapped.max(self.last_mapped);
+        self.last_mapped
+    }
+}
+
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Seconds the display may run ahead of the newest frame: bursty delivery
+/// needs ~0.1 s, and short sleeps of the plugin (see [`MAX_GAP_S`]) are coasted
+/// through so the graph keeps scrolling; after that it halts instead of
+/// scrolling into emptiness.
+const MAX_LEAD_S: f64 = MAX_GAP_S;
 /// Time constant of the clock's correction toward the frame timeline.
 const SLEW_TAU_S: f64 = 0.15;
 /// Errors larger than this are jumps (seek, restart), not jitter: snap.
@@ -302,6 +372,71 @@ mod tests {
         h.push(frame(64)); // engine reset
         assert_eq!(h.len(), 1);
         assert_eq!(h.last().unwrap().sample_pos, 64);
+    }
+
+    #[test]
+    fn engine_resets_continue_the_timeline_instead_of_wiping_it() {
+        let sr = 48_000.0;
+        let t0 = Instant::now();
+        let mut tl = Timeline::default();
+        let mut h = PitchHistory::default();
+        h.ensure_allocated();
+        for k in 0..100u64 {
+            h.push(frame(tl.map(5_000 + k * 64, t0, sr)));
+        }
+        let before = h.last().unwrap().sample_pos;
+        // The plugin sleeps for 0.4 s, wakes, and the engine counts from 0 again.
+        let woke = t0 + Duration::from_millis(400);
+        let first = tl.map(213, woke, sr);
+        h.push(frame(first));
+        assert_eq!(h.len(), 101, "the old phrase must survive the reset");
+        let gap = (first - before) as f64 / sr;
+        assert!((gap - 0.4).abs() < 0.01, "gap shown {gap} s, expected the real 0.4 s");
+        // Later frames of the new run keep their spacing.
+        assert_eq!(tl.map(213 + 64, woke, sr), first + 64);
+        // A long stop is shown as at most MAX_GAP_S.
+        let late = woke + Duration::from_secs(30);
+        let again = tl.map(10, late, sr);
+        let shown = (again - (first + 64)) as f64 / sr;
+        assert!(shown <= MAX_GAP_S + 1e-3, "gap {shown} s exceeds the cap");
+    }
+
+    #[test]
+    fn a_new_engine_starts_a_new_run_even_without_going_back() {
+        let sr = 48_000.0;
+        let t0 = Instant::now();
+        let mut tl = Timeline::default();
+        let last = tl.map(1_000, t0, sr);
+        tl.restart();
+        let next = tl.map(50_000, t0 + Duration::from_millis(100), sr);
+        assert_eq!(next, last + 4_800, "placed 0.1 s after the old run");
+    }
+
+    #[test]
+    fn clock_coasts_through_short_sleeps_without_jumping() {
+        let sr = 48_000.0;
+        let t0 = Instant::now();
+        let mut tl = Timeline::default();
+        let mut c = DisplayClock::default();
+        let mut newest = 0;
+        for k in 0..60u64 {
+            let t = t0 + Duration::from_millis(k * 16);
+            newest = tl.map(k * 768, t, sr);
+            c.on_frames(newest, t);
+            c.tick(t, sr);
+        }
+        // 0.5 s with no frames (plugin asleep): the display keeps moving.
+        let mut pos = 0.0;
+        for k in 60..91u64 {
+            pos = c.tick(t0 + Duration::from_millis(k * 16), sr);
+        }
+        assert!(pos > newest as f64 + 0.4 * sr, "display froze during a short pause");
+        // Wake: the engine restarted, the next frame lands near the display.
+        let t = t0 + Duration::from_millis(91 * 16);
+        let woke = tl.map(64, t, sr);
+        c.on_frames(woke, t);
+        let after = c.tick(t, sr);
+        assert!((after - pos).abs() < 0.1 * sr, "display jumped {} s", (after - pos) / sr);
     }
 
     #[test]

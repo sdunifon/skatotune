@@ -250,7 +250,9 @@ pub fn draw_pitch_roll(
     draw_output(&painter, cols, points, ymap, Stroke::new(2.4, ACCENT));
 
     draw_now_marker(&painter, plot, history, ctx, ymap, &x_of);
-    if cols.is_empty() {
+    // Only when nothing voiced is stored at all: a pause between phrases (or a
+    // plugin sleep/wake) must not replace the previous phrase with this hint.
+    if cols.is_empty() && !history.any_voiced() {
         painter.text(
             plot.center(),
             Align2::CENTER_CENTER,

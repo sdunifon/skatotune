@@ -47,7 +47,7 @@ use crate::params::{
 };
 use crate::shared::SharedState;
 use graph::{RollContext, RollScratch, draw_pitch_roll, is_voiced, note_label};
-use history::{DisplayClock, GraphView, PitchHistory};
+use history::{DisplayClock, GraphView, PitchHistory, Timeline};
 use theme::{ACCENT, BAD, BORDER, PANEL, TEXT, TEXT_DIM, TEXT_FAINT, WARN};
 use widgets::KnobSpec;
 
@@ -240,6 +240,10 @@ pub struct VocalTuneEditor {
     telemetry: Option<rtrb::Consumer<PitchFrame>>,
     history: PitchHistory,
     clock: DisplayClock,
+    /// Stitches engine resets (CLAP sleep/wake, rebuilds) into one timeline.
+    timeline: Timeline,
+    /// Sample rate the stored history was recorded at.
+    history_sr: f64,
     view: GraphView,
     scratch: RollScratch,
     readouts: Readouts,
@@ -266,6 +270,8 @@ impl VocalTuneEditor {
             telemetry: None,
             history: PitchHistory::default(),
             clock: DisplayClock::default(),
+            timeline: Timeline::default(),
+            history_sr: 0.0,
             view: GraphView::default(),
             scratch: RollScratch::default(),
             readouts: Readouts::default(),
@@ -290,11 +296,19 @@ impl VocalTuneEditor {
     /// Drain the telemetry ring into the history (bounded by the ring size).
     /// Returns whether any voiced frame arrived.
     fn pump_telemetry(&mut self, now: Instant) -> bool {
+        let sr = self.sample_rate();
         if let Some(consumer) = self.shared.take_telemetry() {
-            // A new engine: positions restart, old frames are meaningless.
+            // A new engine: its positions start again. Keep the history and
+            // continue the timeline, unless the sample rate changed (then the
+            // stored positions no longer convert to time correctly).
             self.telemetry = Some(consumer);
+            self.timeline.restart();
+        }
+        if sr != self.history_sr {
+            self.history_sr = sr;
             self.history.clear();
             self.clock.reset();
+            self.timeline.reset();
         }
         let mut newest = None;
         let mut voiced_seen = false;
@@ -309,7 +323,14 @@ impl VocalTuneEditor {
                     self.demo_active = false;
                     self.history.clear();
                     self.clock.reset();
+                    self.timeline.reset();
                 }
+                // Engine resets restart sample positions; map them onto one
+                // monotonic display timeline instead of wiping the graph.
+                let f = PitchFrame {
+                    sample_pos: self.timeline.map(f.sample_pos, now, sr),
+                    ..f
+                };
                 self.history.push(f);
                 newest = Some(f.sample_pos);
             }
