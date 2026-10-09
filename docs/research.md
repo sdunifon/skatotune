@@ -1,4 +1,4 @@
-# Vocal Tune: Research and Architecture
+# Skatotune: Research and Architecture
 
 **Project:** real-time monophonic vocal pitch correction ("Auto-Tune style") in Rust, shipped as VST3 and CLAP. Tested in Ableton Live 12 (VST3) and Bitwig Studio (CLAP) on macOS Apple Silicon, and kept cross-platform capable.
 
@@ -1031,7 +1031,7 @@ n = tanh(W_n x + b_n + r ⊙ (U_n h + c_n));  h' = (1 − z) ⊙ n + z ⊙ h
 | Plan B | clack 0.2.0 (CLAP, MIT/Apache) + clap-wrapper-rs (VST3/AUv2). crates.io 0.3.1 bundles clap-wrapper 0.14; 0.16 is git-only | Fallback if nice-plug stalls. Also the route to AUv2 for Logic, via `export_auv2!()` on nice-plug's `clap_entry` |
 | Rejected | Upstream nih-plug (GPLv3 VST3, maintenance mode), coupler ("not production-ready"), truce 6.3.0 (one maintainer, quiet since 2026-07-18, open state-recall bug #232), beamer (no CLAP), AURA (GPL-3.0+), vizia-plug (pinned to nice-plug-core 0.1.4) | |
 
-**Existing repo note.** `xtask/Cargo.toml` currently pulls `nih_plug_xtask` from upstream nih-plug (git rev `f36931f7…`). Switch it to `nice-plug-xtask = "=0.1.1"`, or keep every nice-plug crate on one git rev so that there is only one nice-plug-core. The xtask hard-codes `CFBundleIdentifier = com.nice-plug.<package>`, which with the package name in `bundler.toml` gives `com.nice-plug.vocal_tune`. Patch the plist and re-sign if a different identifier is wanted.
+**Existing repo note.** `xtask/Cargo.toml` currently pulls `nih_plug_xtask` from upstream nih-plug (git rev `f36931f7…`). Switch it to `nice-plug-xtask = "=0.1.1"`, or keep every nice-plug crate on one git rev so that there is only one nice-plug-core. The xtask hard-codes `CFBundleIdentifier = com.nice-plug.<package>`, which with the package name in `bundler.toml` gives `com.nice-plug.skatotune`. Patch the plist and re-sign if a different identifier is wanted.
 
 ### 9.2 Crates
 
@@ -1064,18 +1064,18 @@ n = tanh(W_n x + b_n + r ⊙ (U_n h + c_n));  h' = (1 − z) ⊙ n + z ⊙ h
 ### 9.3 Workspace layout
 
 ```
-vocal_tune/
+skatotune/
   rust-toolchain.toml        channel = "1.99.0", components = ["rustfmt","clippy"],
                              targets = ["aarch64-apple-darwin","x86_64-apple-darwin"]
   Cargo.toml                 workspace, resolver = "3", edition 2024, rust-version "1.95"
   .cargo/config.toml         [alias] xtask = "run --package xtask --release --" (exists)
-  bundler.toml               [vocal_tune] name = "Vocal Tune" (exists)
-  crates/vt_dsp/             pure DSP: detector, vibrato, note logic, control law, engines,
+  bundler.toml               [skatotune] name = "Skatotune" (exists)
+  crates/skato_dsp/             pure DSP: detector, vibrato, note logic, control law, engines,
                              formant. No plugin deps; offline-testable; no_std-friendly core
-  crates/vt_nn/              (optional) hand-written kernels + safetensors loading
-  crates/vocal_tune/         nice-plug wrapper + egui editor; crate-type ["cdylib","lib"];
+  crates/skato_nn/              (optional) hand-written kernels + safetensors loading
+  crates/skatotune/         nice-plug wrapper + egui editor; crate-type ["cdylib","lib"];
                              `standalone` behind a NON-default feature
-  crates/vt_eval/            CLI that renders WAV through the exact process path
+  crates/skato_eval/            CLI that renders WAV through the exact process path
                              (block-size patterns), emits telemetry CSV; driven by Python
   xtask/                     fn main() -> nice_plug_xtask::Result<()> { nice_plug_xtask::main() }
 ```
@@ -1187,7 +1187,7 @@ Commit `Cargo.lock`. After every update, check that `cargo tree -d | grep basevi
 ### 9.8 Dev loop, signing, hosts
 
 - **Build and install.**
-  - `cargo xtask bundle vocal_tune --release` produces `target/bundled/*.vst3|.clap`, ad-hoc signed (`Signature=adhoc` was verified).
+  - `cargo xtask bundle skatotune --release` produces `target/bundled/*.vst3|.clap`, ad-hoc signed (`Signature=adhoc` was verified).
   - Copy the bundles (do not symlink) into `~/Library/Audio/Plug-Ins/{VST3,CLAP}`.
   - Both installed DAWs carry `disable-library-validation`, so ad-hoc signatures load.
 - **Debug in Bitwig.** Both its audio engine and its plug-in host have `get-task-allow`, so `lldb -p` works in "Within Bitwig" mode and in the sandboxed modes. Use the "Individually" hosting mode for crash isolation.
@@ -1203,7 +1203,7 @@ Commit `Cargo.lock`. After every update, check that `cargo tree -d | grep basevi
 ### 10.1 Principles
 
 - **No public benchmark measures what we ship**, which is causal correction of singing at 1-50 ms. So we build our own harness and make it a CI gate from week one.
-- The DSP core (`vt_dsp`) is host-independent. `vt_eval` renders WAV through the *exact* `process()` path, including block-size patterns, and writes telemetry. Python drives the metrics: pyworld for detuning, ViSQOL, VERSA and the F0 ensemble.
+- The DSP core (`skato_dsp`) is host-independent. `skato_eval` renders WAV through the *exact* `process()` path, including block-size patterns, and writes telemetry. Python drives the metrics: pyworld for detuning, ViSQOL, VERSA and the F0 ensemble.
 - **Never gate a release on delay-tolerant metrics alone.** For a tuner, lag *is* the defect.
 
 ### 10.2 Synthetic-detune round trip (primary protocol)

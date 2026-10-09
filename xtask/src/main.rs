@@ -2,7 +2,7 @@
 //! own bundle identifier.
 //!
 //! ```text
-//! cargo xtask bundle vocal_tune --release   # nice-plug bundle, then the notices
+//! cargo xtask bundle skatotune --release   # nice-plug bundle, then the notices
 //!                                            # and LICENSE go into every bundle
 //! cargo xtask notices                        # regenerate THIRD-PARTY-NOTICES.txt
 //! cargo xtask notices --check                # fail if it is out of date

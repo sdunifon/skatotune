@@ -1,16 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/vt_core",
-    "crates/vt_detect",
-    "crates/vt_control",
-    "crates/vt_shift",
-    "crates/vt_engine",
-    "crates/vocal_tune",
-    "crates/vt_eval",
+    "crates/skato_core",
+    "crates/skato_detect",
+    "crates/skato_control",
+    "crates/skato_shift",
+    "crates/skato_engine",
+    "crates/skatotune",
+    "crates/skato_eval",
     "xtask",
 ]
-default-members = ["crates/vt_core", "crates/vt_detect", "crates/vt_control", "crates/vt_shift", "crates/vt_engine", "crates/vt_eval"]
+default-members = ["crates/skato_core", "crates/skato_detect", "crates/skato_control", "crates/skato_shift", "crates/skato_engine", "crates/skato_eval"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,12 +21,12 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates
-vt_core = { path = "crates/vt_core" }
-vt_detect = { path = "crates/vt_detect" }
-vt_control = { path = "crates/vt_control" }
-vt_shift = { path = "crates/vt_shift" }
-vt_engine = { path = "crates/vt_engine" }
-vt_eval = { path = "crates/vt_eval" }
+skato_core = { path = "crates/skato_core" }
+skato_detect = { path = "crates/skato_detect" }
+skato_control = { path = "crates/skato_control" }
+skato_shift = { path = "crates/skato_shift" }
+skato_engine = { path = "crates/skato_engine" }
+skato_eval = { path = "crates/skato_eval" }
 
 # Plugin framework: nice-plug is the maintained community fork of nih-plug. Its
 # VST3 wrapper uses the MIT/Apache `vst3` bindings rather than GPLv3 vst3-sys.

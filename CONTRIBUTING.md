@@ -10,23 +10,23 @@ Requirements: Rust (the exact toolchain is pinned in `rust-toolchain.toml` and i
 cargo build --workspace
 cargo test --workspace --release
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo xtask bundle vocal_tune --release      # VST3 + CLAP bundles in target/bundled/
+cargo xtask bundle skatotune --release      # VST3 + CLAP bundles in target/bundled/
 cargo standalone                             # run the plugin without a DAW
 ```
 
-The evaluation harness lives in `crates/vt_eval`:
+The evaluation harness lives in `crates/skato_eval`:
 
 ```sh
-cargo test -p vt_eval --release --test quality_gates   # the quality gates (tuning, settling, vibrato, latency, CPU)
-cargo run --release -p vt_eval -- suite --out out      # synthetic singing suite → out/report.md
-cargo run --release -p vt_eval -- latency              # measured vs reported latency
+cargo test -p skato_eval --release --test quality_gates   # the quality gates (tuning, settling, vibrato, latency, CPU)
+cargo run --release -p skato_eval -- suite --out out      # synthetic singing suite → out/report.md
+cargo run --release -p skato_eval -- latency              # measured vs reported latency
 ```
 
 ## Ground rules
 
 - **Real-time safety.** Nothing on the audio thread may allocate, lock, log, make system calls or panic. Everything is allocated up front. The rules are in `docs/DESIGN.md` §2.1, and zero-allocation tests enforce them.
-- **Latency is a contract.** The latency a mode reports to the host must equal the measured latency exactly; `vt_eval latency` checks every mode, voice range and sample rate.
-- **Measure, don't guess.** DSP changes report before/after numbers from `vt_eval` (and the real-singing evaluation when it applies). Performance changes report criterion results and end-to-end engine numbers (`docs/PERFORMANCE.md`).
+- **Latency is a contract.** The latency a mode reports to the host must equal the measured latency exactly; `skato_eval latency` checks every mode, voice range and sample rate.
+- **Measure, don't guess.** DSP changes report before/after numbers from `skato_eval` (and the real-singing evaluation when it applies). Performance changes report criterion results and end-to-end engine numbers (`docs/PERFORMANCE.md`).
 - **Never loosen a quality gate** to make a change pass. If a gate is wrong, open an issue with the evidence.
 - **Licensing.** Only permissively licensed dependencies (MIT, Apache-2.0, ISC, BSD, Zlib and similar). Never copy code from GPL/LGPL/AGPL projects; reimplement from papers instead. Run `cargo xtask notices` after changing dependencies.
 

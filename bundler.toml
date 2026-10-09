@@ -1,3 +1,3 @@
 # Display name used for the .vst3 / .clap bundles produced by `cargo xtask bundle`.
-[vocal_tune]
-name = "Vocal Tune"
+[skatotune]
+name = "Skatotune"

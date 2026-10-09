@@ -1,4 +1,4 @@
-# Vocal Tune: Rust Performance and Real-Time Engineering
+# Skatotune: Rust Performance and Real-Time Engineering
 
 **Date:** 2026-10-08
 **Status:** performance architecture v1. Companion to [`research.md`](research.md), the architecture baseline.
@@ -21,7 +21,7 @@
 |---|---|---|---|
 | §9.2 `wide` as the explicit SIMD crate; fearless_simd "only when shipping x86" | `wide` 1.7.1 | **fearless_simd 1.1.0** for all portable kernels, with wide logical vectors (f32x16) | It matches hand-written NEON on the M4 and dispatches at runtime on x86. `wide` is compile-time only, so a default x86 build is stuck at SSE2 (§2.2) |
 | §8.4 `N = next_pow2(W + τ_max)` | power of two | **N = smallest f·2^k ≥ W+τ_max, f ∈ {1,3,5,15}** | 11-25% faster, same accuracy (measured, §6.2) |
-| §9.4 rule 5 "FTZ only needed on x86" and the implied assumption that the framework sets it | | **nice-plug 0.4.2 does *not* set FTZ by default** (opt-in feature `unsafe_flush_denormals`). We set our own guard in process() and in every worker task | Gives the same numerics on every thread and in vt_eval, and is required for x86 (§3.6) |
+| §9.4 rule 5 "FTZ only needed on x86" and the implied assumption that the framework sets it | | **nice-plug 0.4.2 does *not* set FTZ by default** (opt-in feature `unsafe_flush_denormals`). We set our own guard in process() and in every worker task | Gives the same numerics on every thread and in skato_eval, and is required for x86 (§3.6) |
 | §9.6 "No real-time worker threads of our own" | inline only | Inline core stays authoritative. **Optional assist jobs** run on a process-wide pool of real-time worker threads, each joined to its own Apple work interval, pipelined one hop behind and never waited on | Under load, RT workers missed 0 of 1500 deadlines, against 2-3% for normal or QoS workers (measured). This is what delivers "quality scales with CPU" (§4.5) |
 | §8.16 "8-16-tap Kaiser-windowed sinc" (table phase handling unspecified) | | **Interpolate linearly between table phases.** A truncated phase index costs 20-50 dB of SNR | Truncated: −55 to −83 dB. Interpolated: −106 to −121 dB, at about zero extra cost (measured, §6.4) |
 | §10.7 CPU budgets | p99 per kernel and block | Adds the paced per-call WCET/jitter matrix (32/64/128/512), RTF gates, load and E-core axes, and pass/fail tables (§5) | |
@@ -86,7 +86,7 @@ Work in this order: **algorithm first, then portable SIMD, then threads, and pro
 |---|---|
 | Toolchain | Rust **1.99.0** pinned (already in `rust-toolchain.toml`). This brings algebraic float ops and NEON `vdotq_s32` (1.98), `array_windows` (1.94), `as_chunks` (1.88), safe intrinsics (1.87) and safe `#[target_feature]` (1.86). Add `x86_64-apple-darwin` to the toolchain targets for Rosetta tests. |
 | SIMD layer | **fearless_simd 1.1.0** + fearless_simd_macros 0.1.0. Kernels use `f32x16` (four q-registers on NEON, two ymm on AVX2, one zmm on AVX-512). Detect the `Level` once per instance. |
-| FFT | `vt_core::fft::RealFft` trait. **vDSP DFT** (`vDSP_DFT_zrop`) on macOS, **realfft 3.5.0** (`process_with_scratch` only) elsewhere. Sizes are f·2^k with f ∈ {1,3,5,15}, k ≥ 4. phastft is rejected for now. |
+| FFT | `skato_core::fft::RealFft` trait. **vDSP DFT** (`vDSP_DFT_zrop`) on macOS, **realfft 3.5.0** (`process_with_scratch` only) elsewhere. Sizes are f·2^k with f ∈ {1,3,5,15}, k ≥ 4. phastft is rejected for now. |
 | FMA | Fused on aarch64. On x86, fused only inside FMA-enabled paths (fearless `.mul_add()` on AVX2 or multiversion clones), never bare `f32::mul_add`. |
 | Numerics | Fast exp2/log2/tanh with tested bounds (errors ≤ 0.001 cent). f64 for sample positions and energy accumulators. Our own `FtzGuard` (FZ on aarch64, FTZ+DAZ on x86) in process() and in every worker task. |
 | Interpolation | 16-tap Blackman-Harris polyphase, 512 phases, **linear interpolation between phases** (c = c0 + a·dc). |
@@ -94,7 +94,7 @@ Work in this order: **algorithm first, then portable SIMD, then threads, and pro
 | Audio thread | Allocate in `activate()` (cached by configuration), pre-fault, fixed hop, rtrb/triple_buffer/atomics only, no locks, logging, `thread::current()` or channels. |
 | Workers | One refcounted, process-wide pool. Each worker: `audio_thread_priority` 0.38.0 promotion, its own work interval on macOS, rtrb + `Thread::unpark` wake-ups, never spins. |
 | Pipeline | A sample ring owns the job windows. Results are drained to the newest. Late results fall back to the inline estimate. The assist runs inline, with the same one-hop lag, in offline or faster-than-real-time rendering. |
-| Proof | divan kernel A/B tables; criterion block baselines plus a `VT_SIMD=fallback` A/B; gungraun instruction counts on Linux CI; paced hdrhistogram WCET harness; RTF harness; RTSan; counting-allocator and page-fault tests; exact-latency and block-invariance tests; Rosetta SSE4.2 and AVX runs. |
+| Proof | divan kernel A/B tables; criterion block baselines plus a `SKATO_SIMD=fallback` A/B; gungraun instruction counts on Linux CI; paced hdrhistogram WCET harness; RTF harness; RTSan; counting-allocator and page-fault tests; exact-latency and block-invariance tests; Rosetta SSE4.2 and AVX runs. |
 
 ### 1.3 Headline numbers (measured, M4 Max)
 
@@ -294,10 +294,10 @@ rustflags = ["-C", "target-cpu=x86-64-v2"]   # Rosetta implements SSE4.2/POPCNT
 
 ### 3.2 Where kernels live
 
-All kernels go in `vt_core`, which has no plugin dependencies. Every kernel module exposes the same three layers, so the tests and the A/B benchmarks can reach every variant:
+All kernels go in `skato_core`, which has no plugin dependencies. Every kernel module exposes the same three layers, so the tests and the A/B benchmarks can reach every variant:
 
 ```
-crates/vt_core/src/
+crates/skato_core/src/
   simd/mod.rs        Kernels { level: fearless_simd::Level, ... }  (built in activate())
   simd/dot.rs        pub fn reference(a,b) -> f64    // f64 oracle, obviously correct
                      pub fn scalar(a,b) -> f32       // plain Rust, no SIMD types
@@ -317,7 +317,7 @@ crates/vt_core/src/
   rt/prefault.rs     prefault + mlock helpers
 ```
 
-Hot code calls the dispatched entry point (`dispatch!(self.level, s => dot::simd(s, a, b))`). `Level` comes from `Level::new()`, called once in `activate()`. On aarch64 it returns the static NEON level; on x86 it reads a cached runtime detection. Test and bench builds may override it from `VT_SIMD=fallback` (§5.3).
+Hot code calls the dispatched entry point (`dispatch!(self.level, s => dot::simd(s, a, b))`). `Level` comes from `Level::new()`, called once in `activate()`. On aarch64 it returns the static NEON level; on x86 it reads a cached runtime detection. Test and bench builds may override it from `SKATO_SIMD=fallback` (§5.3).
 
 Dispatch **once per block or per hop**, never per sample. Write the inner loop inside the `#[simd]` function so that every helper inlines into the target-feature context. Mark helpers `#[inline(always)]` when they are not `#[simd]` themselves.
 
@@ -449,7 +449,7 @@ Notes:
 - **`process()` on realfft/rustfft allocates scratch on every call** (realfft `src/lib.rs` calls `make_scratch_vec()`). Only `process_with_scratch` is allowed on the audio thread.
 - The error relative to signal energy is 5e-7 to 1.1e-6 for both backends and sizes (measured). The f0 estimate agrees with the direct method within 0.5 cent (test). On very quiet input, the CMNDF threshold must be checked against an energy floor (silence gate first).
 - The two f64 energy loops are strictly sequential and are probably a visible share of a 3-4 µs kernel (estimate). If profiling confirms it, compute e0 with a multi-accumulator `f64x4` sum, or maintain prefix sums of x² per input sample with an exact recompute every hop.
-- At the verifier rates of research.md §8.2 (16-24 kHz after decimation), the windows are much shorter (for example W+τ_max ≈ 1056 → N = 1280 for Alto/Tenor at 24 kHz). Benchmark each (range, rate) cell in `vt_detect/benches` instead of extrapolating from the 48 kHz figures.
+- At the verifier rates of research.md §8.2 (16-24 kHz after decimation), the windows are much shorter (for example W+τ_max ≈ 1056 → N = 1280 for Alto/Tenor at 24 kHz). Benchmark each (range, rate) cell in `skato_detect/benches` instead of extrapolating from the 48 kHz figures.
 
 #### 3.4.2 Windowed overlap-add (PSOLA grains)
 
@@ -566,7 +566,7 @@ Use it:
 
 - at the top of `Plugin::process()`;
 - around every worker job;
-- in vt_eval renders;
+- in skato_eval renders;
 - in every benchmark and test harness (so the offline and plugin numerics match).
 
 Also put explicit flushes (`if s.abs() < 1e-20 { s = 0.0 }`, or a tiny DC offset) in the few recursive paths (DC blocker, one-pole smoothers, envelope followers). Changing the FP environment is technically UB according to the Rust docs (LLVM assumes the default environment), but it is standard audio practice. The explicit flushes make the x86 behaviour deterministic either way.
@@ -591,7 +591,7 @@ CI asserts the bounds: exp2 relative < 1e-6, log2 absolute < 1e-5, tanh absolute
 - **No panics in process().** nice-plug has no `catch_unwind`, and a panic escaping `extern "C"` aborts the DAW. In hot kernels:
   - Use `#[no_panic]` (no-panic 0.1.37) under a `cfg(feature = "no-panic-check")` release CI build. It proves at link time that the function cannot panic.
   - Use saturating or wrapping arithmetic on indices and `debug_assert!` for invariants.
-- **clippy ban list** for the audio-path crates (`vt_detect`, `vt_control`, `vt_shift`, `vt_engine`, and `vt_core::{simd,rt}`) through `clippy.toml`:
+- **clippy ban list** for the audio-path crates (`skato_detect`, `skato_control`, `skato_shift`, `skato_engine`, and `skato_core::{simd,rt}`) through `clippy.toml`:
   - `disallowed-methods`: `std::sync::Mutex::lock`, `std::sync::RwLock::{read,write}`, `std::thread::current`, `slice::sort`, `slice::sort_by`, `std::time::SystemTime::now`, `Vec::with_capacity`/`Vec::new`. Construction code opts out with `#[allow]` in clearly named `setup`/`new` functions.
   - `disallowed-macros`: `println`, `eprintln`, `format`, `vec`.
   - Unlike the post-monomorphization const assert, these lints show up in `cargo check` and rust-analyzer.
@@ -622,7 +622,7 @@ Facts checked in the nice-plug 0.4.2 sources (they differ from upstream nih-plug
 - Both wrappers hold the plugin in a `try_lock::TryLock` (an atomic swap that never blocks). The CLAP process callback returns `CLAP_PROCESS_ERROR` instead of waiting if the lock is taken. That is not a stall, but it does drop a block.
 - `set_state_inner` deserializes parameters (wrapped in `permit_alloc`) and schedules `Task::StateChanged` for the GUI. It does **not** re-run `activate()` while audio runs. The plugin therefore has to react to parameter changes inside `process()` (smoothers, table swaps) rather than relying on re-activation.
   - Persistent non-parameter fields are written on the main thread. Never read them from `process()`; publish their effect through `triple_buffer` or `SharedCell`.
-- `assert_process_allocs` (debug only) installs `nice_assert_no_alloc::AllocDisabler` as the crate's `#[global_allocator]`, so any binary that links `vocal_tune` with that feature cannot declare a second one (§5.8).
+- `assert_process_allocs` (debug only) installs `nice_assert_no_alloc::AllocDisabler` as the crate's `#[global_allocator]`, so any binary that links `skatotune` with that feature cannot declare a second one (§5.8).
 
 Rules:
 
@@ -694,7 +694,7 @@ Rules:
 let _rt = audio_thread_priority::promote_current_thread_to_real_time(hop_frames, sr as u32).ok();
 // 2. Own work interval (stable FFI; AudioToolbox + libSystem). ~0.55 ms once CoreAudio's HAL is up,
 //    68-91 ms in a process that never touched CoreAudio (e.g. a Bitwig sandbox): do it at pool start.
-let wg = unsafe { AudioWorkIntervalCreate(c"vt-assist".as_ptr(), OS_CLOCK_MACH_ABSOLUTE_TIME /*32*/, null_mut()) };
+let wg = unsafe { AudioWorkIntervalCreate(c"skato-assist".as_ptr(), OS_CLOCK_MACH_ABSOLUTE_TIME /*32*/, null_mut()) };
 let mut tok = WgToken { sig: 0, opaque: [0; 36] };          // LP64 os_workgroup_join_token_s
 let joined = unsafe { os_workgroup_join(wg, &mut tok) } == 0; // only RT threads may join; join+leave on this thread
 ready.store(true, Release);                                   // audio side posts nothing until ready (else 16-19 startup misses)
@@ -782,17 +782,17 @@ Rendering modes:
 - Every perf run records machine state (hw.model, macOS version, toolchain, `uptime` load average, power source). A run with a 1-minute load above 4 is marked "noisy" and is not a valid gate result.
 
 ```
-crates/vt_core/
+crates/skato_core/
   benches/kernels.rs        divan: every kernel × variant (reference, scalar, simd@Level::new, simd@fallback, neon?) × sizes
   benches/fft.rs            divan: realfft vs vDSP × N ∈ {512…8192} ∪ {3·2^k, 5·2^k}
   tests/equivalence.rs      all variants vs f64 oracle; levels {new, fallback}; lengths and offsets
   tests/numerics.rs         fast-math bounds, interpolator SNR, FFT backend agreement, FTZ guard and inheritance
   tests/no_alloc.rs         counting #[global_allocator] (Rust allocations), negative control
   tests/pipeline.rs         late-recovery, ring ownership, threaded smoke; cfg(loom) model of pool registration
-crates/vt_detect/benches/detect.rs   divan: per-hop verifier, E/H tracker, HMM per (voice range, rate)
-crates/vt_shift/benches/shift.rs     divan: grain read + OLA per block; Classic splice
-crates/vt_engine/
-  benches/block.rs          criterion: Engine::process per block, mode × tier × {32,64,128,512}; baselines; VT_SIMD A/B
+crates/skato_detect/benches/detect.rs   divan: per-hop verifier, E/H tracker, HMM per (voice range, rate)
+crates/skato_shift/benches/shift.rs     divan: grain read + OLA per block; Classic splice
+crates/skato_engine/
+  benches/block.rs          criterion: Engine::process per block, mode × tier × {32,64,128,512}; baselines; SKATO_SIMD A/B
   benches/iai.rs            gungraun (Linux CI): instruction counts for the same cells
   tests/latency.rs          sample-accurate latency matrix (§5.11)
   tests/invariance.rs       block-size invariance and offline/realtime determinism (§5.12)
@@ -801,7 +801,7 @@ crates/vt_engine/
   examples/rt_jitter.rs     paced WCET/jitter harness (hdrhistogram) → JSON, exit code = gate (§5.5)
   examples/rtf.rs           real-time-factor harness (§5.6)
   examples/pipeline_stress.rs  worker pool under the load matrix (§5.7)
-crates/vt_eval/src/bin/host_sim.rs   clack-host 0.2.0 harness that loads the built .clap (RTSan, wrapper coverage)
+crates/skato_eval/src/bin/host_sim.rs   clack-host 0.2.0 harness that loads the built .clap (RTSan, wrapper coverage)
 perf/gates.toml             committed pass/fail budgets (the tables below)
 perf/baselines/*.json       committed reference results per machine
 xtask: `cargo xtask perf [--quick]` runs T5-T7 and compares them with gates.toml and baselines
@@ -825,8 +825,8 @@ xtask: `cargo xtask perf [--quick]` runs T5-T7 and compares them with gates.toml
 ### 5.3 Scalar-vs-SIMD A/B micro-benchmarks (T1, divan 0.1.21)
 
 ```
-cargo bench -p vt_core --bench kernels -- --sample-count 300 --sample-size 200   # --sample-size 20 for >10 µs groups
-cargo bench -p vt_core --bench fft     -- --sample-count 300 --sample-size 200
+cargo bench -p skato_core --bench kernels -- --sample-count 300 --sample-size 200   # --sample-size 20 for >10 µs groups
+cargo bench -p skato_core --bench fft     -- --sample-count 300 --sample-size 200
 ```
 
 Each group lists `reference`, `scalar`, `simd_fallback`, `simd` (and `neon`, `vdsp` where present) side by side. Because the Fallback level may itself be auto-vectorized by LLVM, the explicit `scalar` variant stays as the true scalar baseline.
@@ -847,10 +847,10 @@ Pass thresholds on the M4 Max, derived from today's medians plus margin:
 ### 5.4 Block-level regression and A/B (T2, criterion 0.8.2; gungraun 0.20.0)
 
 ```
-cargo bench -p vt_engine --bench block -- --save-baseline main               # on main
-cargo bench -p vt_engine --bench block -- --baseline main                    # on the branch
-VT_SIMD=fallback cargo bench -p vt_engine --bench block -- --baseline main   # proves the SIMD gain at block level
-VT_FFT=realfft   cargo bench -p vt_engine --bench block -- --baseline main   # proves the vDSP gain (macOS)
+cargo bench -p skato_engine --bench block -- --save-baseline main               # on main
+cargo bench -p skato_engine --bench block -- --baseline main                    # on the branch
+SKATO_SIMD=fallback cargo bench -p skato_engine --bench block -- --baseline main   # proves the SIMD gain at block level
+SKATO_FFT=realfft   cargo bench -p skato_engine --bench block -- --baseline main   # proves the vDSP gain (macOS)
 ```
 
 - Configuration: `noise_threshold(0.03)`, `significance_level(0.01)`; cells for mode × tier × {32, 64, 128, 512} at 48 kHz, fed with looped vocal recordings.
@@ -860,7 +860,7 @@ VT_FFT=realfft   cargo bench -p vt_engine --bench block -- --baseline main   # p
 
 ### 5.5 Per-process() WCET and jitter histograms (T3)
 
-Harness `vt_engine/examples/rt_jitter.rs`:
+Harness `skato_engine/examples/rt_jitter.rs`:
 
 - A thread promoted with `audio_thread_priority` (period = block/sr), optionally joined to its own work interval to mimic a host I/O thread.
 - **Paced** with `mach_wait_until` on absolute deadlines. A hot loop is optimistic: the same job ran 1.6-2.4x slower at the median when paced.
@@ -897,7 +897,7 @@ Additional gates:
 
 ### 5.6 Real-time factor (T4)
 
-`vt_engine/examples/rtf.rs`: an unpaced offline render of the evaluation corpus (≥ 60 s of vocals, 48 kHz, block 128) through `Engine::process`, single thread. RTF = processing time / audio duration.
+`skato_engine/examples/rtf.rs`: an unpaced offline render of the evaluation corpus (≥ 60 s of vocals, 48 kHz, block 128) through `Engine::process`, single thread. RTF = processing time / audio duration.
 
 | Cell | M4 Max gate (initial) | Notes |
 |---|---|---|
@@ -926,10 +926,10 @@ Additional gates:
 
 ### 5.8 Allocation and page-fault tests (T6)
 
-- **DSP crates** (`vt_core` … `vt_engine`): a test binary with a counting `#[global_allocator]` armed by a thread-local flag around `process()` only. Construction happens outside the armed region. The negative control (one deliberate `vec!` must count exactly 1) runs first.
+- **DSP crates** (`skato_core` … `skato_engine`): a test binary with a counting `#[global_allocator]` armed by a thread-local flag around `process()` only. Construction happens outside the armed region. The negative control (one deliberate `vec!` must count exactly 1) runs first.
   - Coverage: 20k blocks of random size 1..=4096, every parameter swept, scale changes, Live/Studio toggles (rebuilding through `activate()` outside the armed region), preset swaps through `SharedCell`, GUI attach and detach.
   - Pass: 0 allocations. The prototype passed, and its negative control proved the counter works.
-- **Plugin crate**: debug builds with `--features assert_process_allocs` abort on any allocation inside the wrapped process call, wrapper included. Drive them with `host_sim` (clack-host loads the `.clap`), and use the same builds for manual DAW testing. Do **not** add a second `#[global_allocator]` to a binary that links `vocal_tune` with that feature; it will not link.
+- **Plugin crate**: debug builds with `--features assert_process_allocs` abort on any allocation inside the wrapped process call, wrapper included. Drive them with `host_sim` (clack-host loads the `.clap`), and use the same builds for manual DAW testing. Do **not** add a second `#[global_allocator]` to a binary that links `skatotune` with that feature; it will not link.
 - **C allocations** (Accelerate, BNNS, system libraries) are invisible to both of the above, so RTSan (§5.9) is the check for them.
 - **Page faults**: around 10 s of steady-state processing after warm-up, read `getrusage(RUSAGE_SELF).ru_minflt` (macOS "page reclaims") in a single-threaded harness. Pass: delta == 0. Negative control: an un-prefaulted 16 MB buffer must move the counter.
 
@@ -945,7 +945,7 @@ Additional gates:
 ```
 RTSAN_ENABLE=1 \
 RTSAN_LIB_PATH=/opt/homebrew/opt/llvm/lib/clang/20/lib/darwin/libclang_rt.rtsan_osx_dynamic.dylib \
-  cargo build -p vt_eval --bin host_sim --features rtsan
+  cargo build -p skato_eval --bin host_sim --features rtsan
 RTSAN_OPTIONS=halt_on_error=true \
 DYLD_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib/clang/20/lib/darwin \
   ./target/debug/host_sim --scenario full --secs 60
@@ -965,7 +965,7 @@ DYLD_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib/clang/20/lib/darwin \
 
 ### 5.11 Sample-accurate latency verification (T9)
 
-`vt_engine/tests/latency.rs` covers every latency mode × voice range × sample rate {44.1, 48, 88.2, 96 kHz} × 20 seeds × random host block sizes 1..=max:
+`skato_engine/tests/latency.rs` covers every latency mode × voice range × sample rate {44.1, 48, 88.2, 96 kHz} × 20 seeds × random host block sizes 1..=max:
 
 1. **Unvoiced / bypass path.** A white-noise burst at a random offset. The output must equal the input delayed by exactly D samples (bit-exact, residual ≤ −120 dBFS), and the cross-correlation argmax must equal D.
 2. **Voiced, correction off (β = 1).** A synthetic LF-pulse vowel with known glottal-closure instants: output pulse positions = input GCI + D within ±0.5 sample (fractional marks).
@@ -1008,7 +1008,7 @@ Pass: 0-sample tolerance on items 1, 4 and 5. In the DAW, run the research.md §
 
 - Record the load average before every run (it ranged from 5 to 62 during the research). Compare medians within a single run, and interleave A/B runs at least twice.
 - Pass `--sample-size` to divan. Use the paced harness, not hot loops, for tail numbers. Run on mains power, with Low Power Mode off.
-- Use `debug = "line-tables-only"` builds with samply or the Instruments Time Profiler on a headless `vt_eval` render to find glue code once the kernels are fast. Example: in the prototype, the vDSP even/odd split loop dominated until it was replaced by `vDSP_ctoz`.
+- Use `debug = "line-tables-only"` builds with samply or the Instruments Time Profiler on a headless `skato_eval` render to find glue code once the kernels are fast. Example: in the prototype, the vDSP even/odd split loop dominated until it was replaced by `vDSP_ctoz`.
 
 ### 5.16 What runs where
 
@@ -1027,7 +1027,7 @@ Pass: 0-sample tolerance on items 1, 4 and 5. In the DAW, run the research.md §
 
 ## 6. Local measurements (M4 Max)
 
-Unless noted, everything here is single-threaded, f32, built with fat LTO and codegen-units = 1. The reports used divan medians; the new probes use best-of-40 batch means. Load averages were 5-62 during the research and 8.9-13.4 during the new probes. The raw outputs came from scratch benchmark crates kept outside the repository (a SIMD kernel bench, a real-time threading probe, verifier probes and the documentation probes); the kernel benchmarks that matter were later rebuilt inside the repository (`crates/vt_core/benches/kernels.rs`, see `docs/PERFORMANCE.md`).
+Unless noted, everything here is single-threaded, f32, built with fat LTO and codegen-units = 1. The reports used divan medians; the new probes use best-of-40 batch means. Load averages were 5-62 during the research and 8.9-13.4 during the new probes. The raw outputs came from scratch benchmark crates kept outside the repository (a SIMD kernel bench, a real-time threading probe, verifier probes and the documentation probes); the kernel benchmarks that matter were later rebuilt inside the repository (`crates/skato_core/benches/kernels.rs`, see `docs/PERFORMANCE.md`).
 
 ### 6.1 Dot product, 2048 elements (256 elements in parentheses)
 
@@ -1184,12 +1184,12 @@ The verifier's rerun gave vDSP DFT 1.97-2.86x and phastft 1.36-1.51x faster than
 
 | Risk / question | Mitigation |
 |---|---|
-| fearless_simd 1.0 is 2-3 weeks old; minor-version churn | Pin `=1.1.0` in the lockfile and wrap it in `vt_core::simd` so an API change touches one module. The equivalence tests catch semantic drift. |
+| fearless_simd 1.0 is 2-3 weeks old; minor-version churn | Pin `=1.1.0` in the lockfile and wrap it in `skato_core::simd` so an API change touches one module. The equivalence tests catch semantic drift. |
 | Work-interval benefit is workload-dependent and undocumented in plugin contexts (Apple documents it for AU/app threads) | T5 runs with and without it under the RT-load matrix. It is a measured win at low load and under oversubscription and neutral otherwise, never a loss. Revisit if a CLAP workgroup extension appears. |
 | Process-wide RT threads in a DAW with many plugins | Pool size of 1-3, park every hop, governor sheds work, refcounted shutdown. The 16-instance soak in T12. |
 | Ableton VST3 exports may report real time | Faster-than-real-time detection plus the "wait for analysis" toggle (§4.5.4). Verify in Live 12 early. |
 | Accelerate (vDSP, BLAS, BNNS) internals are not documented as real-time safe | vDSP only on setups made in `activate()`. BLAS/BNNS on workers only. RTSan on all of them in `host_sim`. |
-| RTSan dylib interposition may not reach code inside a host-loaded plugin | The negative control in §5.9 proves coverage or exposes the gap. If there is a gap, fall back to RTSan on `vt_engine` directly plus assert_process_allocs in the bundle. |
+| RTSan dylib interposition may not reach code inside a host-loaded plugin | The negative control in §5.9 proves coverage or exposes the gap. If there is a gap, fall back to RTSan on `skato_engine` directly plus assert_process_allocs in the bundle. |
 | Base M1 numbers are unknown | Every gate has an M1 column; buy or borrow a base M1 for sign-off (research.md already treats it as the budget machine). |
 | Rosetta's general support ends after macOS 27 | Native x86 CI (Windows and Linux) plus Intel SDE are the permanent path. |
 | `algebraic_*` non-determinism vs bit-exact tests | Restricted to `#[inline(never)]` warm kernels with tolerance tests. |

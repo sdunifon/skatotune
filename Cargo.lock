@@ -2707,6 +2707,78 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "skato_control"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "skato_core",
+]
+
+[[package]]
+name = "skato_core"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "realfft",
+ "rustfft",
+]
+
+[[package]]
+name = "skato_detect"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "skato_core",
+]
+
+[[package]]
+name = "skato_engine"
+version = "0.1.0"
+dependencies = [
+ "rtrb",
+ "skato_control",
+ "skato_core",
+ "skato_detect",
+ "skato_shift",
+]
+
+[[package]]
+name = "skato_eval"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "hound",
+ "realfft",
+ "rtrb",
+ "skato_core",
+ "skato_engine",
+]
+
+[[package]]
+name = "skato_shift"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "realfft",
+ "skato_core",
+]
+
+[[package]]
+name = "skatotune"
+version = "0.1.0"
+dependencies = [
+ "atomic_float",
+ "cpal",
+ "egui",
+ "nice-plug",
+ "nice-plug-egui",
+ "rtrb",
+ "serde",
+ "skato_core",
+ "skato_engine",
+]
+
+[[package]]
 name = "skrifa"
 version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3112,84 +3184,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vocal_tune"
-version = "0.1.0"
-dependencies = [
- "atomic_float",
- "cpal",
- "egui",
- "nice-plug",
- "nice-plug-egui",
- "rtrb",
- "serde",
- "vt_core",
- "vt_engine",
-]
-
-[[package]]
 name = "vst3"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e31e3fe7a6f028ded8c5a9984cf283319e6dc63572c9b71da1d4ee9d71d3b6bf"
 dependencies = [
  "com-scrape-types",
-]
-
-[[package]]
-name = "vt_control"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "vt_core",
-]
-
-[[package]]
-name = "vt_core"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "realfft",
- "rustfft",
-]
-
-[[package]]
-name = "vt_detect"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "vt_core",
-]
-
-[[package]]
-name = "vt_engine"
-version = "0.1.0"
-dependencies = [
- "rtrb",
- "vt_control",
- "vt_core",
- "vt_detect",
- "vt_shift",
-]
-
-[[package]]
-name = "vt_eval"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "hound",
- "realfft",
- "rtrb",
- "vt_core",
- "vt_engine",
-]
-
-[[package]]
-name = "vt_shift"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "realfft",
- "vt_core",
 ]
 
 [[package]]

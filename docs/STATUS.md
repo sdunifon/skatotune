@@ -1,4 +1,4 @@
-# Vocal Tune: v1 status
+# Skatotune: v1 status
 
 State of the tree on 2026-10-09, after the hardening pass (onsets, sustained notes, CPU tail, plugin protocol) and its regression and integration check. Rust 1.99.0, nice-plug 0.4.2, Apple M4 Max. The binding contract is `docs/DESIGN.md`; the algorithms and their evidence are in `docs/research.md` (R§) and `docs/rust-performance.md` (P§); the performance evidence is in `docs/PERFORMANCE.md`.
 
@@ -14,31 +14,31 @@ State of the tree on 2026-10-09, after the hardening pass (onsets, sustained not
   - Studio: 20-50 ms, lookahead PSOLA.
 
   Eco, HQ and Max quality tiers run inside every mode and never change the latency.
-- **Detector** (`vt_detect`):
+- **Detector** (`skato_detect`):
   - Candidates: decimated pitch-synchronous E/H candidates; an FFT NSDF with a type-I CMNDF verifier and pYIN-style probabilities.
   - Octave checks: prime-harmonic score, rough-phonation veto, third-harmonic check and exact-lag re-measurement; in Eco (no harmonic score) a time-domain rough-voice rule.
   - Tracking: causal pitch HMM (fixed-lag smoothing in Studio), full-rate refinement, voicing/sibilance FSM and a mean-pitch Kalman filter.
   - Voicing at note starts: onset hops must agree within 50 c, onsets after silence start ≤ 20 c above the range and (above 150 Hz) take 3 hops, segments younger than 12 ms do not hold, release tails more than 18 dB under the segment's decaying peak are unvoiced, and steady-level segments hold through low-clarity legato leaps.
   - The per-hop analysis can run in four stages over later callbacks (`begin_analysis` / `step_analysis`), bit-identical to one `analyze()`.
-- **Shifter** (`vt_shift`):
+- **Shifter** (`skato_shift`):
   - Classic splicer (crossfaded in every tier).
   - Causal NCC mark tracker. HQ resolves competing peaks by period continuity.
   - PSOLA, Live and Studio: in HQ, grains are chosen by overlap correlation; Studio's nearest-mark choice is centred on D. A voiced onset may start on the newest known mark (no wait for one ahead), period decisions use the newest commanded ratio, and a late mark is replaced by the predicted one instead of falling a period behind.
   - Formant shift by grain resampling.
-- **Control law** (`vt_control`), all of R§7.6:
+- **Control law** (`skato_control`), all of R§7.6:
   - Note decision: rules in Eco; MonoNote-style HMM in HQ/Max, gated by Waves' OR tolerance rule. A phrase restart (a > 300 c jump early in a phrase or after a gap) is decided as a fresh note.
   - The correction follows the detector pitch (the PSOLA mark pitch is no longer mixed in).
   - Retune one-pole on the correction, transition τ, Humanize, Flex-Tune, Snap Min/Max.
   - Centre/vibrato split with Vibrato Depth, synthetic vibrato, Transpose/Detune.
   - MIDI Target, Learn and Auto, plus pitch bend.
   - Studio decides with up to 40 ms of lookahead, takes the pitch that sets the shift from a slightly newer frame (matching the shifter's ratio timing), and ignores note crossings that return within the lookahead.
-- **Engine** (`vt_engine`):
+- **Engine** (`skato_engine`):
   - Processing: block-size-invariant, allocation-free, NaN-safe.
   - Studio pipeline: each hop's analysis begins at the boundary and runs in stages at fixed points of the next hop, so host blocks smaller than a hop share the work out.
   - Voice-range changes that keep the latency are applied at runtime (`Engine::set_voice_range`).
   - Telemetry for the GUI.
 - **GUI** (egui): scrolling piano-roll pitch graph, cents meter, scale keyboard (with MIDI Learn, CLEAR and KEEP), knobs, mode/tier selectors, CPU readout and a latency readout ("X ms reported" plus "heard avg").
-- **Evaluation** (`vt_eval`):
+- **Evaluation** (`skato_eval`):
   - Synthetic singing with exact ground truth, two held-out scenarios, and real singing (vocadito).
   - Gates as tests (`tests/quality_gates.rs`).
   - CLI: `suite`, `vocadito`, `latency`, `rt-bench`, `render`, `synth`, `track`.
@@ -61,7 +61,7 @@ CPU time per block is a separate quantity again.
 | Live+ (10 ms) | 10.0 ms | 10.0 ms | 10.25 ms (was 10.44) |
 | Studio (40 ms) | 40.0 ms | 40.0 ms | 40.02 ms |
 
-- **Measured equals reported.** All 48 mode × range × rate rows of `vt_eval latency` match, and so do the 12 suite runs. On vocadito the amount-0 output delay equals D on 31/40 files in Live HQ and on all 40 in Studio HQ (38/40 before; the worst Studio file was 56 samples off, now 1). The Live misses are off by ≤ 10 samples, where the cross-correlation locks onto a neighbouring pitch cycle.
+- **Measured equals reported.** All 48 mode × range × rate rows of `skato_eval latency` match, and so do the 12 suite runs. On vocadito the amount-0 output delay equals D on 31/40 files in Live HQ and on all 40 in Studio HQ (38/40 before; the worst Studio file was 56 samples off, now 1). The Live misses are off by ≤ 10 samples, where the cross-correlation locks onto a neighbouring pitch cycle.
 - **How the heard column was measured.** The Natural engine ran with an ideal hard-chromatic correction computed from the vocadito F0 annotation (every voiced hop shifted to the nearest semitone, per-file voice range, 44.1 kHz). The column is the shifter's mean content delay over all PSOLA grains (`ShifterDiagnostics::mean_content_delay`), weighted by voiced time.
 - **Why Live is heard later than D.** Live grains can only use pitch marks already detected, so below about 250 Hz the voice trails D by about 0.45 periods (R§2.1, DSP-9, kept as a trade for formant quality). Studio is centred on D. The plugin header's "heard avg" readout estimates the same quantity live from the singer's pitch.
 - **Time until the correction acts** (vocadito, Live HQ; Studio HQ in parentheses):
@@ -72,7 +72,7 @@ CPU time per block is a separate quantity again.
 
 ## 3. Gates (DESIGN §4)
 
-"v1 close" is the state before this pass (`docs/STATUS.md` of the v1 integration). "Now" is this pass: `vt_eval suite`, `vt_eval rt-bench --seconds 5` (median of 3 runs), `cargo test -p vt_eval --release --test quality_gates`.
+"v1 close" is the state before this pass (`docs/STATUS.md` of the v1 integration). "Now" is this pass: `skato_eval suite`, `skato_eval rt-bench --seconds 5` (median of 3 runs), `cargo test -p skato_eval --release --test quality_gates`.
 
 | Gate | Target | v1 close | Now | Result |
 |---|---|---|---|---|
@@ -98,14 +98,14 @@ CPU time per block is a separate quantity again.
 
 **Where the former slow onsets now stand** (decision point → detected → target switch → settled, Live HQ, 128-sample blocks):
 
-- **low_male #0 and #2** (E2, 82 Hz, decidable at the onset): 26.0 and 27.0 ms (were 33.0 and 35.0). Detection is unchanged (15.0 / 14.9 ms); convergence after it fell from 18-20 ms to 11-12 ms, because a Live PSOLA onset now starts on the newest known mark instead of waiting up to a period (vt_shift ON-4), period decisions use the newest commanded ratio (ON-3), and a hard-tune shift is applied at once at a PSOLA onset (vt_control ON-9).
-- **melody_male #0** (C3 after a slow −75 c scoop): 15.6 ms (was 31.6). The 25 ms near-band persistence is dropped once a phrase's first note has scooped 20 c toward the next note (vt_control ON-5).
+- **low_male #0 and #2** (E2, 82 Hz, decidable at the onset): 26.0 and 27.0 ms (were 33.0 and 35.0). Detection is unchanged (15.0 / 14.9 ms); convergence after it fell from 18-20 ms to 11-12 ms, because a Live PSOLA onset now starts on the newest known mark instead of waiting up to a period (skato_shift ON-4), period decisions use the newest commanded ratio (ON-3), and a hard-tune shift is applied at once at a PSOLA onset (skato_control ON-9).
+- **melody_male #0** (C3 after a slow −75 c scoop): 15.6 ms (was 31.6). The 25 ms near-band persistence is dropped once a phrase's first note has scooped 20 c toward the next note (skato_control ON-5).
 
 The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not part of this gate) still takes 33-35 ms on them.
 
 ## 4. Real singing (vocadito: 40 tracks, 13.6 min, 29 singers, 44.1 kHz)
 
-`cargo run --release -p vt_eval -- vocadito` (≈ 190 s; the full report is `out/vocadito/report.md`, listening WAVs for tracks 1, 2, 9, 21, 26 and 34 in `out/vocadito/listen/`). "v1 close" is the run of 2026-10-09 00:47.
+`cargo run --release -p skato_eval -- vocadito` (≈ 190 s; the full report is `out/vocadito/report.md`, listening WAVs for tracks 1, 2, 9, 21, 26 and 34 in `out/vocadito/listen/`). "v1 close" is the run of 2026-10-09 00:47.
 
 | Measure | v1 close | Now |
 |---|---|---|
@@ -148,19 +148,19 @@ The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not p
 
 **Owner work** (details in each crate's docs and tests; every defect fix has a regression test that fails on the old code):
 
-- **vt_shift:**
+- **skato_shift:**
   - ON-4: a Live voiced onset may start on the newest known mark (gated: NCC ≥ 0.9, period within 25 c of the control's hint); low_male onsets 33/28/35 → 25/21/27 ms.
   - ON-3: period decisions use the newest commanded ratio, and long symmetric boundaries are committed lazily; Studio shifter ratio lag 8.1 → 2.1 ms at 82 Hz.
   - SN-9: a late next mark is replaced by the predicted one instead of falling back up to 1.25 periods.
   - PERF-5: the Live mark-tracker update after a voiced control runs at the start of the next `process()`; exact early exit in the seed guard; O(1) sliding energies in the mark search. Worst Studio shifter block at 192 kHz 92.6 → 62.7 µs.
   - PERF-6(1): the overlap-add iterates grains by reference (−7 to −14 %).
-- **vt_detect:**
+- **skato_detect:**
   - ON-2a-e: release-tail cut, no hold for segments younger than 12 ms, onset pitch consistency, no onset above the range, one more confirmation hop above 150 Hz.
   - SN-7: steady-level segments hold through low-clarity legato leaps.
   - Eco rough-voice octave rule (track 34: 23.9 → 5.9 % octave errors).
   - PERF-1-4: exact octave confirms from an interpolated FIR bank, newer-half E/H energies on demand, onset NSDF only when needed, split refinement loop.
   - PERF-7: the split analysis API (`begin_analysis`, `step_analysis`, `finish_analysis`, `ANALYSIS_STEPS`).
-- **vt_control:**
+- **skato_control:**
   - SN-2: the correction follows the detector pitch only.
   - ON-1: phrase restart as a fresh note.
   - ON-9: hard tune at a PSOLA onset applies the full shift at once.
@@ -168,10 +168,10 @@ The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not p
   - SN-3: Studio takes the pitch that sets the shift from the frame 0.5·hop + 0.25·T newer.
   - SN-1/SN-5 (Studio part): a switch needs the crossing to persist through the lookahead.
   - Live Max takes the pitch at the analysed sample (`f0_hz`).
-- **vt_engine:**
+- **skato_engine:**
   - PERF-5 (engine side): the Live shifter update lands before the first sample after the boundary.
   - HI-3: `Engine::set_voice_range` with prebuilt detector/shifter kits for every range that keeps D.
-- **vocal_tune (plugin), xtask:**
+- **skatotune (plugin), xtask:**
   - HI-1: a structural change is built off the audio thread, swapped in behind a 3 ms fade, and only then reported to a VST3 host (retries at 1, 3 and 7 s until it re-activates).
   - HI-4/CL-4: the learned scale applies in every MIDI mode until CLEAR, and is saved with the project.
   - LIC-1: repo `LICENSE`, `cargo xtask notices`, notices in every bundle.
@@ -180,7 +180,7 @@ The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not p
 
 **Integration fixes in this pass:**
 
-1. **Studio split analysis adopted** (vt_engine, PERF-7). The Studio pipeline calls `begin_analysis()` at the boundary that closes hop h, runs the four detector stages before samples hop/4, 3·hop/8, hop/2 and 3·hop/4 of hop h+1 and the control law before 7·hop/8, and pushes every sample to the detector as it arrives (the held-sample buffer is gone). The shifter update now lands before the first sample after the boundary in Studio too.
+1. **Studio split analysis adopted** (skato_engine, PERF-7). The Studio pipeline calls `begin_analysis()` at the boundary that closes hop h, runs the four detector stages before samples hop/4, 3·hop/8, hop/2 and 3·hop/4 of hop h+1 and the control law before 7·hop/8, and pushes every sample to the detector as it arrives (the held-sample buffer is gone). The shifter update now lands before the first sample after the boundary in Studio too.
    - **Bit-identical:** output and telemetry hashes of 336 configs (3 rates × 4 scenarios × 7 mode/tier/engine × 4 block patterns, with engine switches and MIDI) are identical to the pre-integration engine. A new unit test, `studio_split_analysis_matches_a_one_shot_analysis`, compares split and one-shot analyses bit for bit at 44.1-192 kHz over block sizes 1-1000 with tier changes landing mid-analysis; it fails if the analysis begins after newer samples were pushed.
    - **One semantic change:** a tier change that lands while an analysis is in flight now lets that analysis finish with the tier it began with (a tier change re-lays out the pitch HMM).
    - **CPU:** see PERFORMANCE §11. At 192 kHz/32 the Studio Max p99.9 block went from 30.1 % to 22.0 % of the deadline (worst block 52.9 → 47.1 µs, set by the mark re-seed); rt-bench Studio Max @32 (48 kHz) 8.84 → 7.33 %. Where the pipeline points sit was measured: the chosen ones keep the re-seed alone in its callback down to a quarter hop per block.
@@ -226,7 +226,7 @@ The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not p
   - Snap Min below 0.05 c is treated as off (RT-1).
   - `process_hop` ignores `mark_cents` (SN-2).
 - **§3.5:**
-  - Studio runs the detector at `Centered{D − k·hop}` with k from `vt_engine::studio_split`, and `lookahead_hops = ⌈D/hop⌉ − 1` when pipelined; a pipelined Studio engine emits `hops − 1` telemetry frames.
+  - Studio runs the detector at `Centered{D − k·hop}` with k from `skato_engine::studio_split`, and `lookahead_hops = ⌈D/hop⌉ − 1` when pipelined; a pipelined Studio engine emits `hops − 1` telemetry frames.
 - **§3.6:**
   - The MIDI buffer merges same-hop bends and reserves slots for note and sustain events instead of dropping (RT-3).
   - Structural changes settle for 0.25 s (HI-2) and are swapped in, not rebuilt in `activate()` (HI-1).
@@ -236,39 +236,39 @@ The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not p
 ## 7. Build, test, install
 
 ```sh
-cd vocal_tune   # the repository root
+cd skatotune   # the repository root
 cargo build --workspace
 cargo test --workspace --release            # 552 passed, 0 failed, 2 ignored (opt-in), ≈ 70 s
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p vocal_tune --release --features standalone,demo-telemetry   # 106 plugin tests incl. standalone
+cargo test -p skatotune --release --features standalone,demo-telemetry   # 106 plugin tests incl. standalone
 
 # Gates and evaluation
-cargo test -p vt_eval --release --test quality_gates -- --nocapture       # 11 gate tests, ≈ 7 s; prints per-onset breakdowns
-cargo test -p vt_eval --release --test vocadito -- --ignored --nocapture  # real-singing gates, ≈ 25 s
-cargo run --release -p vt_eval -- suite --out out                          # synthetic suite, 252 renders, ≈ 20 s → out/report.md
-cargo run --release -p vt_eval -- vocadito                                 # real singing, ≈ 3.2 min → out/vocadito/report.md
-cargo run --release -p vt_eval -- latency                                  # measured vs reported D + content-delay gauge
-cargo run --release -p vt_eval -- rt-bench --seconds 5                     # CPU tail latency (run on a quiet machine)
+cargo test -p skato_eval --release --test quality_gates -- --nocapture       # 11 gate tests, ≈ 7 s; prints per-onset breakdowns
+cargo test -p skato_eval --release --test vocadito -- --ignored --nocapture  # real-singing gates, ≈ 25 s
+cargo run --release -p skato_eval -- suite --out out                          # synthetic suite, 252 renders, ≈ 20 s → out/report.md
+cargo run --release -p skato_eval -- vocadito                                 # real singing, ≈ 3.2 min → out/vocadito/report.md
+cargo run --release -p skato_eval -- latency                                  # measured vs reported D + content-delay gauge
+cargo run --release -p skato_eval -- rt-bench --seconds 5                     # CPU tail latency (run on a quiet machine)
 
-# Plugin bundles → target/bundled/Vocal Tune.{vst3,clap} (with LICENSE.txt and THIRD-PARTY-NOTICES.txt)
-cargo xtask bundle vocal_tune --release
+# Plugin bundles → target/bundled/Skatotune.{vst3,clap} (with LICENSE.txt and THIRD-PARTY-NOTICES.txt)
+cargo xtask bundle skatotune --release
 cargo xtask notices --check                                                # THIRD-PARTY-NOTICES.txt up to date
-.tools/clap-validator/bin/clap-validator validate "target/bundled/Vocal Tune.clap"
-.tools/vst3sdk/build/bin/Release/validator "target/bundled/Vocal Tune.vst3"
-.tools/pluginval/pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --skip-gui-tests --validate-in-process --validate "target/bundled/Vocal Tune.vst3"
+.tools/clap-validator/bin/clap-validator validate "target/bundled/Skatotune.clap"
+.tools/vst3sdk/build/bin/Release/validator "target/bundled/Skatotune.vst3"
+.tools/pluginval/pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --skip-gui-tests --validate-in-process --validate "target/bundled/Skatotune.vst3"
 
 # Standalone (pick input/output devices interactively; use headphones)
 cargo standalone
 ```
 
-**Install:** copy `target/bundled/Vocal Tune.vst3` to `~/Library/Audio/Plug-Ins/VST3/` and `target/bundled/Vocal Tune.clap` to `~/Library/Audio/Plug-Ins/CLAP/`, then rescan in the DAW. The copies in those folders on this machine are this pass's bundles (2026-10-09 06:16).
+**Install:** copy `target/bundled/Skatotune.vst3` to `~/Library/Audio/Plug-Ins/VST3/` and `target/bundled/Skatotune.clap` to `~/Library/Audio/Plug-Ins/CLAP/`, then rescan in the DAW. The copies in those folders on this machine are this pass's bundles (2026-10-09 06:16).
 
 ## 8. Next steps
 
 1. **Real-DAW pass** with the installed bundles: Live 12 PDC after a mode switch and after reloading a Studio project, the VST3 latency re-request, a voice-range change mid-playback (in place, no restart), Bitwig CLAP sleep/wake with a learned scale, and the standalone with a mono microphone at 128-sample periods.
-2. **vt_control: Live note decisions on real singing** (SN-1). The data say causal decisions are bounded by the Tolerance trade-off; options are a note-level centre that does not slow legato onsets, or using Live+'s extra latency as a short lookahead. A/B with `vt_eval vocadito --modes live --tiers hq --conditions hard_chromatic,hard_key,natural_key`.
-3. **vt_eval: measure onsets from the decision point** (ON-7a) next to the annotated onset, report correction accuracy against the decided target (SN-4), and add an off-grid synthetic scenario that crosses semitone midpoints, so the synthetic gates exercise what dominates real singing.
-4. **vt_shift: the open trade-offs** DSP-3 (seed position) and DSP-9 (a user-selectable short rise for lower Live heard latency), and the octave re-seed disputes on rough voices (SN-10).
-5. **vt_detect: Studio onset backdating** (ON-6): forward-aligned observation frames at onsets, worth about 5 ms in Studio.
+2. **skato_control: Live note decisions on real singing** (SN-1). The data say causal decisions are bounded by the Tolerance trade-off; options are a note-level centre that does not slow legato onsets, or using Live+'s extra latency as a short lookahead. A/B with `skato_eval vocadito --modes live --tiers hq --conditions hard_chromatic,hard_key,natural_key`.
+3. **skato_eval: measure onsets from the decision point** (ON-7a) next to the annotated onset, report correction accuracy against the decided target (SN-4), and add an off-grid synthetic scenario that crosses semitone midpoints, so the synthetic gates exercise what dominates real singing.
+4. **skato_shift: the open trade-offs** DSP-3 (seed position) and DSP-9 (a user-selectable short rise for lower Live heard latency), and the octave re-seed disputes on rough voices (SN-10).
+5. **skato_detect: Studio onset backdating** (ON-6): forward-aligned observation frames at onsets, worth about 5 ms in Studio.
 6. **nice-plug: the CLAP double restart** (HI-8), as a `[patch.crates-io]` fork.
 7. **CPU at 192 kHz:** the Studio re-seed is now the worst block; splitting the seed's search over two callbacks, or a paced RT-priority rt-bench mode (P§5.5), are the next steps.

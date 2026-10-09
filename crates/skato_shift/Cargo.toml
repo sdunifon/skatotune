@@ -1,0 +1,20 @@
+[package]
+name = "skato_shift"
+description = "Pitch-mark tracking and pitch-shifting engines (Classic, PSOLA) for Skatotune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+skato_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+# Spectral measurements in the quality tests (click detector, LPC envelopes).
+realfft.workspace = true
+
+[[bench]]
+name = "shift"
+harness = false

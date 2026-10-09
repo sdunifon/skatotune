@@ -42,7 +42,7 @@ mod tests {
     #[test]
     fn identifiers_are_valid_reverse_dns() {
         assert_eq!(bundle_identifier("skatotune"), "com.skatotune.skatotune");
-        assert_eq!(bundle_identifier("vocal_tune"), "com.skatotune.vocal-tune");
+        assert_eq!(bundle_identifier("skatotune"), "com.skatotune.skatotune");
         assert!(bundle_identifier("a_b_c")
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'));

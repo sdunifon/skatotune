@@ -1,0 +1,18 @@
+[package]
+name = "skato_control"
+description = "Pitch-correction control law (scale, notes, retune, vibrato, MIDI) for Skatotune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+skato_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "control"
+harness = false

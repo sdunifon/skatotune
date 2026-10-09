@@ -1,0 +1,15 @@
+[package]
+name = "skato_engine"
+description = "Block-size-agnostic realtime engine that wires detection, control and shifting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+skato_core.workspace = true
+skato_detect.workspace = true
+skato_control.workspace = true
+skato_shift.workspace = true
+rtrb.workspace = true

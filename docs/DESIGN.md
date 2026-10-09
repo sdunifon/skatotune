@@ -1,4 +1,4 @@
-# Vocal Tune v1: build contract
+# Skatotune v1: build contract
 
 This is the **implementation contract** for v1. It turns `docs/research.md` (the evidence and the full algorithm details; cited below as **R§x.y**) and `docs/rust-performance.md` (Rust optimisation research; cited as **P§…**) into concrete crates, Rust APIs, tests and gates.
 
@@ -40,18 +40,18 @@ v1 closed on 2026-10-09; a hardening pass the same day fixed note onsets, the St
 ## 2. Workspace and conventions
 
 ```
-crates/vt_core     shared types (done: src/types.rs), math, ring, interp, filter, window, simd, fft
-crates/vt_detect   Detector
-crates/vt_control  Corrector (control law), scale + MIDI state
-crates/vt_shift    Shifter (Classic, PSOLA engines, mark tracker), latency formula
-crates/vt_engine   Engine: block-size agnostic orchestration, telemetry, stats
-crates/vocal_tune  nice-plug plugin + egui editor + standalone bin
-crates/vt_eval     synth signals, reference pitch tracker, metrics, render, CLI, suite tests, engine benches
+crates/skato_core     shared types (done: src/types.rs), math, ring, interp, filter, window, simd, fft
+crates/skato_detect   Detector
+crates/skato_control  Corrector (control law), scale + MIDI state
+crates/skato_shift    Shifter (Classic, PSOLA engines, mark tracker), latency formula
+crates/skato_engine   Engine: block-size agnostic orchestration, telemetry, stats
+crates/skatotune  nice-plug plugin + egui editor + standalone bin
+crates/skato_eval     synth signals, reference pitch tracker, metrics, render, CLI, suite tests, engine benches
 xtask              nice-plug-xtask bundler
 ```
 
 - Toolchain: Rust **1.99.0** (pinned in `rust-toolchain.toml`), edition 2024. Stable only.
-- Build: `cargo build`, `cargo test`, `cargo bench -p <crate>`, `cargo xtask bundle vocal_tune --release`.
+- Build: `cargo build`, `cargo test`, `cargo bench -p <crate>`, `cargo xtask bundle skatotune --release`.
 - **Parallel agents:** when several agents build at once, each uses its own target dir to avoid lock contention: `CARGO_TARGET_DIR=target/agent-<crate> cargo test -p <crate>`.
 - Style: match the existing code. Module-level `//!` docs explain *what and why*; item docs on public APIs; comments for non-obvious maths (cite R§ sections). No dead code, no `println!` in library code.
 
@@ -66,7 +66,7 @@ xtask              nice-plug-xtask bundler
 
 ### 2.2 Hop and timing
 
-- The **control hop** is `hop = 64` samples at 44.1/48 kHz, `128` at 88.2/96 kHz, `256` at 176.4/192 kHz (`vt_core::hop_for_rate(sr)`). It is the same for every tier and mode.
+- The **control hop** is `hop = 64` samples at 44.1/48 kHz, `128` at 88.2/96 kHz, `256` at 176.4/192 kHz (`skato_core::hop_for_rate(sr)`). It is the same for every tier and mode.
 - The engine splits every host block at hop boundaries. Per segment: push samples into the detector, run the shifter on the segment. At each hop boundary: `detector.analyze()` → `corrector.process_hop()` → `shifter.set_control()` (the ratio then ramps linearly across the next hop). This adds **no** latency; control just updates at hop boundaries. (Studio pipelines this over the next hop, §3.5.)
 - Absolute input sample index `n` counts from `reset()`. Output sample `n` carries input content from about `n − D` (plus PSOLA content wander, R§2.1).
 - Telemetry `PitchFrame::sample_pos` is **output time**: `estimate.sample_pos + D`.
@@ -77,7 +77,7 @@ xtask              nice-plug-xtask bundler
 
 All public signatures below are binding. Implementers may add private items and extra public helpers, but must not change these signatures without updating this file.
 
-### 3.1 `vt_core`
+### 3.1 `skato_core`
 
 `types` is written. Add these modules:
 
@@ -224,14 +224,14 @@ pub mod fft {
 
 Tests (in-crate): every SIMD backend vs an f64 reference at lengths {0,1,3,15,16,17,31,33,63,100,1024,2047,2048,4096}; fast-math error bounds over dense sweeps; ring wrap/`get` out-of-range; sinc interpolation of band-limited sines (error < -80 dB for Sinc16 at f < 0.4·fs); decimator stopband; Correlator vs direct O(n²) for both backends (rel error < 1e-4).
 
-Benches (`crates/vt_core/benches/kernels.rs`, criterion): scalar vs neon (vs avx2) for each kernel at 256/1024/4096; `diff_sq` direct vs `Correlator` path for W=1024/τ=512 and W=2048/τ=1024; RealFft vs Vdsp at n = 512..8192; fast vs std exp2/log2/tanh; cubic vs Sinc8 vs Sinc16 per 512 reads.
+Benches (`crates/skato_core/benches/kernels.rs`, criterion): scalar vs neon (vs avx2) for each kernel at 256/1024/4096; `diff_sq` direct vs `Correlator` path for W=1024/τ=512 and W=2048/τ=1024; RealFft vs Vdsp at n = 512..8192; fast vs std exp2/log2/tanh; cubic vs Sinc8 vs Sinc16 per 512 reads.
 
-### 3.2 `vt_detect`
+### 3.2 `skato_detect`
 
 Implements R§4.5 / R§7.3 / R§8.1-8.10 for v1 (no neural, no fastF0ArMl).
 
 ```rust
-use vt_core::{PitchEstimate, QualityTier, VoiceRange};
+use skato_core::{PitchEstimate, QualityTier, VoiceRange};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Alignment {
@@ -285,12 +285,12 @@ Tests: synthetic glottal vowels and pure/harmonic tones at 55-1400 Hz, all sampl
 
 Benches: `analyze()` + `push(hop)` per tier at 48 kHz, each voice range, both alignments.
 
-### 3.3 `vt_control`
+### 3.3 `skato_control`
 
 Implements R§7.6 completely (including MIDI R§7.6.3 and defaults R§7.6.4).
 
 ```rust
-use vt_core::{LatencyMode, MidiEvent, PitchEstimate, PitchFrame, Settings, ShiftControl};
+use skato_core::{LatencyMode, MidiEvent, PitchEstimate, PitchFrame, Settings, ShiftControl};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CorrectorConfig {
@@ -322,7 +322,7 @@ impl Corrector {
     /// correction follows the detector pitch (`f0_hz` at the analysed sample in Live Max).
     pub fn process_hop(&mut self, est: &PitchEstimate, mark_cents: Option<f32>) -> ControlOutput;
     /// Effective scale after MIDI Learn edits (for the GUI keyboard), one state per pitch class.
-    pub fn learned_states(&self) -> Option<[vt_core::NoteState; 12]>;
+    pub fn learned_states(&self) -> Option<[skato_core::NoteState; 12]>;
 }
 ```
 
@@ -330,12 +330,12 @@ Note decision: **Eco** = rules (fat1 bias + Waves OR-tolerance, R§7.6.2 F); **H
 
 Tests (pure control law, no audio): step response matches the one-pole definition (63% at τ); τ = 0 hard-snaps; residual vibrato ratio vs τ matches the R§7.6.2 H table within 0.03; PreserveVibrato + τ = 0 keeps a 6 Hz ±40 c vibrato around the corrected centre (extent within ±10% after engagement) while Depth 0 removes it; Flex-Tune weight curve; Humanize slows only sustained notes; hysteresis prevents flip-flop on a pitch hovering ±5 c around a midpoint; Bypass/Remove semantics; MIDI Target/Learn/Auto, all-octaves, bend, sustain, all-notes-off; transpose/detune; unvoiced hold/release/forget timings; octave guard.
 
-### 3.4 `vt_shift`
+### 3.4 `skato_shift`
 
 Implements R§5.3 / R§7.4 / R§8.13-8.19 for v1.
 
 ```rust
-use vt_core::{EngineKind, LatencyMode, QualityTier, ShiftControl, VoiceRange};
+use skato_core::{EngineKind, LatencyMode, QualityTier, ShiftControl, VoiceRange};
 
 /// Reported latency D in samples for a configuration. Single source of truth (the engine and
 /// plugin call this). Must satisfy every engine's lookahead needs at every tier in that mode
@@ -378,12 +378,12 @@ Tests: fixed-ratio shifts (±1, ±3, ±7, ±12 st) of synthetic vowels at 100/22
 
 Benches: `process()` of 64/128/512 samples per engine × tier × mode at 48 kHz.
 
-### 3.5 `vt_engine`
+### 3.5 `skato_engine`
 
 ```rust
-use vt_core::{EngineConfig, MidiEvent, PitchFrame, Settings};
+use skato_core::{EngineConfig, MidiEvent, PitchFrame, Settings};
 
-/// Reported latency for a config (delegates to vt_shift::latency_samples).
+/// Reported latency for a config (delegates to skato_shift::latency_samples).
 pub fn latency_samples(cfg: &EngineConfig) -> u32;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -410,7 +410,7 @@ impl Engine {
     pub fn set_telemetry_enabled(&mut self, on: bool);
     pub fn stats(&self) -> EngineStats;
     /// Effective scale after MIDI Learn (forwarded from Corrector).
-    pub fn learned_states(&self) -> Option<[vt_core::NoteState; 12]>;
+    pub fn learned_states(&self) -> Option<[skato_core::NoteState; 12]>;
     /// Switch the voice range at runtime when that keeps D (HI-3; RT-safe: `new` prebuilds a
     /// detector and shifter for every range with the same D and Studio pipeline shape). Returns
     /// false, changing nothing, when D would change: the host must then rebuild the engine. The
@@ -420,13 +420,13 @@ impl Engine {
 }
 ```
 
-Responsibilities: sanitize NaN/Inf; build the analysis signal from `Settings::analysis_channel`; split at hop boundaries and MIDI timings; per-hop pipeline (§2.2); fill `PitchFrame::sample_pos = est.sample_pos + D`; drop telemetry when the ring is full (count it). Studio splits D between the detector (`Alignment::Centered { delay: D − k·hop }`) and the control law's lookahead (`k` hops, `vt_engine::studio_split`, CL-3), and spreads each hop's work over the next hop (RT-2/PERF-7): `begin_analysis()` at the boundary, the four detector stages before samples hop/4, 3·hop/8, hop/2 and 3·hop/4, the control law before 7·hop/8, the control applied at the following boundary (one hop of the lookahead pays for this, so `lookahead_hops = ⌈D/hop⌉ − 1`). In every mode the shifter update decided at a boundary is applied before the first sample after it.
+Responsibilities: sanitize NaN/Inf; build the analysis signal from `Settings::analysis_channel`; split at hop boundaries and MIDI timings; per-hop pipeline (§2.2); fill `PitchFrame::sample_pos = est.sample_pos + D`; drop telemetry when the ring is full (count it). Studio splits D between the detector (`Alignment::Centered { delay: D − k·hop }`) and the control law's lookahead (`k` hops, `skato_engine::studio_split`, CL-3), and spreads each hop's work over the next hop (RT-2/PERF-7): `begin_analysis()` at the boundary, the four detector stages before samples hop/4, 3·hop/8, hop/2 and 3·hop/4, the control law before 7·hop/8, the control applied at the following boundary (one hop of the lookahead pays for this, so `lookahead_hops = ⌈D/hop⌉ − 1`). In every mode the shifter update decided at a boundary is applied before the first sample after it.
 
 Tests: zero allocations in `process()` after construction (separate test binary with a counting `#[global_allocator]`, including a negative control); block-size invariance over {1, 7, 32, 64, 128, 480, 4096, random}; measured latency == reported for every mode × range at 44.1/48/96 kHz (cross-correlation on unvoiced noise bursts); NaN input recovers.
 
-### 3.6 `vocal_tune` (plugin)
+### 3.6 `skatotune` (plugin)
 
-- nice-plug `Plugin` + `ClapPlugin` + `Vst3Plugin`, exported with `nice_export_clap!` / `nice_export_vst3!`. Stable `CLAP_ID = "com.vocaltune.vocal-tune"`, fixed `VST3_CLASS_ID`, stable param `#[id]`s from day one.
+- nice-plug `Plugin` + `ClapPlugin` + `Vst3Plugin`, exported with `nice_export_clap!` / `nice_export_vst3!`. Stable `CLAP_ID = "com.skatotune.skatotune"`, fixed `VST3_CLASS_ID`, stable param `#[id]`s from day one.
 - `AUDIO_IO_LAYOUTS`: stereo→stereo (first/default), mono→mono, mono→stereo (upmix). `MIDI_INPUT = MidiConfig::Basic`. `SAMPLE_ACCURATE_AUTOMATION = false`.
 - `activate()`: build `Engine` from `EngineConfig` (sample rate, max block, channels, latency mode, voice range, live+/studio ms), report `latency_samples`; an engine that already matches is kept.
 - Structural params (latency mode, voice range, live+/studio ms):
@@ -447,13 +447,13 @@ Tests: zero allocations in `process()` after construction (separate test binary 
   - The GUI never blocks the audio thread: telemetry via the engine's rtrb consumer handed over in `activate()` through a `triple_buffer`/`Mutex` on the **GUI side only**; scalar meters via atomics.
 - Standalone: `src/main.rs` behind feature `standalone` (`nice_export_standalone`), with a device picker like `~/code/aiudio/src/main.rs` if cpal is available through nice-plug's standalone deps; otherwise plain CLI flags.
 
-### 3.7 `vt_eval`
+### 3.7 `skato_eval`
 
 - `synth`: band-limited glottal source (Rosenberg/LF-like, f0 trajectory per sample, jitter, shimmer, aspiration noise) through formant resonators (vowel presets a/e/i/o/u, male and female sets) → `Signal { audio, f0_truth (Hz per sample, 0 = unvoiced), target_cents (intended in-tune note per sample, NaN if none) }`. Builders: `Melody` (notes, durations, per-note detune, scoops, overshoot, OU drift, vibrato rate/extent, legato/gaps), sibilant and breath bursts, silence, noise bursts, pulse trains, sweeps (A2-A3-A2), ±40 c steps.
 - `reference`: offline, non-causal, high-accuracy f0 tracker in f64 (centred NSDF with long window, parabolic + continuity) for measuring rendered output. Validated against `f0_truth` in its own tests (median < 0.5 c on clean synthetic vowels).
 - `render`: run `Engine` over a `Signal` with a block-size pattern; returns output + telemetry frames.
 - `metrics`: tuning error vs target on stable voiced frames (exclude ±30 ms around note boundaries; vibrato notes measured on the centre), % within 5/10/25 c, settling time, added jitter (>12 Hz), voicing F1 of telemetry vs truth, measured latency (xcorr on noise bursts), click detector, formant LSD.
-- CLI `vt_eval`: `synth <scenario> <out.wav>`, `render <in.wav> <out.wav> [--mode --range --tier --engine --retune --key --scale ...]`, `suite [--out out/]` (runs all scenarios × modes × tiers, writes WAVs + CSV + a Markdown table to `out/report.md`), `latency`, `rt-bench` (tail-latency histogram per mode/tier/buffer: p50/p99/p99.9/max, exit 1 if p99.9 > 10 % of the buffer period at 32/64/128).
+- CLI `skato_eval`: `synth <scenario> <out.wav>`, `render <in.wav> <out.wav> [--mode --range --tier --engine --retune --key --scale ...]`, `suite [--out out/]` (runs all scenarios × modes × tiers, writes WAVs + CSV + a Markdown table to `out/report.md`), `latency`, `rt-bench` (tail-latency histogram per mode/tier/buffer: p50/p99/p99.9/max, exit 1 if p99.9 > 10 % of the buffer period at 32/64/128).
 - Integration tests (`tests/`): the quality gates of §4 at a smaller scale so `cargo test` stays < ~60 s.
 - Benches (`benches/engine.rs`, criterion): `Engine::process` at 32/64/128/512 buffers × modes × tiers at 48 kHz.
 
@@ -476,7 +476,7 @@ Tests: zero allocations in `process()` after construction (separate test binary 
 | Perf proofs | each SIMD/FFT/fast-math optimisation shows a statistically significant speedup in criterion vs its scalar/std baseline (numbers recorded in `docs/PERFORMANCE.md`) |
 | Plugin | builds/bundles VST3 + CLAP; clap-validator passes; loads in Bitwig and Ableton |
 
-**How the gates are measured (fixed during v1 integration).** These definitions are binding for the rows above; `vt_eval suite` and `crates/vt_eval/tests/quality_gates.rs` implement them.
+**How the gates are measured (fixed during v1 integration).** These definitions are binding for the rows above; `skato_eval suite` and `crates/skato_eval/tests/quality_gates.rs` implement them.
 
 - **Tuning.** At retune > 0, frames within 2·τ of an input-centre movement (> 10 c in that window) are excluded as by-design convergence: an ideal R§7.6 corrector scores p95 19.3 c on `melody_male` at τ = 20 ms without the exclusion and 4.0 c with it. Retune 0 is scored on every stable frame. Frames are ambiguous only within the scale-aware limit (half the gap to the neighbouring *legal* note minus the Tolerance cents, never below 50 c).
 - **Settling.** Every onset must settle in < 30 ms; there is no median, and an onset that never settles fails. The clock starts at the note-decision point: the sung centre has passed the midpoint to the neighbouring legal note by the Tolerance cents (the HQ/Max capture region). Onsets that miss are listed by name in `KNOWN_SLOW_ONSETS` with a regression guard each, and the suite reports the gate as FAIL while that list is not empty.
@@ -489,5 +489,5 @@ Gates added during v1 integration (same evidence standard as the table):
 | Vibrato engagement (Live HQ, τ = 0, vibrato from the onset) | output reaches ≥ 80 % of the input extent ≤ 2.5 periods after the vibrato starts; first-two-period extent ratio ≤ 1.15. A flattened first cycle is the documented causal limit (R§8.11) |
 | Content delay (amount 0, voiced, `melody_male`; other scenarios reported in the latency gauge) | \|PSOLA wander\| ≤ one sung period (R§10.3); heard delay = D + wander |
 | Held-out scenarios (`heldout_pentatonic`, `heldout_room`; never used for tuning constants) | the Tuning, Settling and Voicing F1 targets above, reported as separate suite rows; known misses are listed with regression guards |
-| Real singing (vocadito, Live HQ) | detector within 2 points RPA50, +0.5 points octave errors, +1 point other gross errors and −0.015 voicing F1 of the offline reference tracker on the same frames; hard-tune output p95, settle p90 and onset glitches under per-range regression guards (`vt_eval::vocadito::gates`) |
+| Real singing (vocadito, Live HQ) | detector within 2 points RPA50, +0.5 points octave errors, +1 point other gross errors and −0.015 voicing F1 of the offline reference tracker on the same frames; hard-tune output p95, settle p90 and onset glitches under per-range regression guards (`skato_eval::vocadito::gates`) |
 | Plugin validators | VST3 SDK `validator` and pluginval (strictness 10, in process, GUI tests skipped) pass on the bundles, in addition to clap-validator |

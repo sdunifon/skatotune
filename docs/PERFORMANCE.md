@@ -1,4 +1,4 @@
-# Vocal Tune: performance evidence
+# Skatotune: performance evidence
 
 This file records the evidence behind DESIGN §4's two performance gates:
 
@@ -9,9 +9,9 @@ It also gives a quick view of plugin latency (§1), because "latency" can mean t
 
 All numbers come from fresh runs on 2026-10-08 (21:42-22:56 EDT). The machine was shared with other agents, so §2 explains how load was handled. P§ refers to `docs/rust-performance.md`, R§ to `docs/research.md`.
 
-**Final merged tree (2026-10-09, 00:05-00:36 EDT).** §10 re-measures the engine, the tail latency and the vt_detect exact-size adoption on the tree as shipped, with no other agent running. Where §10 and the sections below differ, §10 is the current state; §3-§7 remain the kernel-level evidence.
+**Final merged tree (2026-10-09, 00:05-00:36 EDT).** §10 re-measures the engine, the tail latency and the skato_detect exact-size adoption on the tree as shipped, with no other agent running. Where §10 and the sections below differ, §10 is the current state; §3-§7 remain the kernel-level evidence.
 
-**Hardening pass (2026-10-09, 05:47-06:03 EDT).** §11 re-measures the engine and the tail latency after the hardening pass (vt_shift PERF-5/6, vt_detect PERF-1-4, the Studio split analysis in vt_engine), and A/Bs the split analysis against the one-chunk Studio analysis on the same tree. **§11 is the current state**; the §0 summary below is updated to it.
+**Hardening pass (2026-10-09, 05:47-06:03 EDT).** §11 re-measures the engine and the tail latency after the hardening pass (skato_shift PERF-5/6, skato_detect PERF-1-4, the Studio split analysis in skato_engine), and A/Bs the split analysis against the one-chunk Studio analysis on the same tree. **§11 is the current state**; the §0 summary below is updated to it.
 
 ## 0. Summary
 
@@ -26,11 +26,11 @@ All numbers come from fresh runs on 2026-10-08 (21:42-22:56 EDT). The machine wa
 | Perf proofs | SIMD `dot`, `sum_sq`, `diff_sq`, the FFT difference function, vDSP and fast math are all significantly faster than their baselines (in every round, with disjoint 95 % CIs). NEON `axpy`/`mul_acc` gain only 0-8 % over the auto-vectorised scalar loop and nothing at 4096 (memory-bound; documented exception, §3.1) |
 | New: exact FFT sizes (`FftSizing::Fast`) | realfft is **25-27 % faster** at 768/1536/3072 than at the next power of two. vDSP gains −5 to −36 %, but is *slower* at 384 than at 512 (§3.4) |
 | New: vDSP backend fixes | Spectral product vectorised: vDSP difference function **−40 %** at n = 2048/4096. Split buffers 128-byte aligned: vDSP results are now **bit-identical across instances**, which they were not before (§3.5) |
-| Rosetta (x86_64) | vt_core 66 + 2 tests pass under Rosetta 2. With `ROSETTA_ADVERTISE_AVX=1` the dispatcher selects AVX2 and the same tests pass. No native-x86 run (§6) |
+| Rosetta (x86_64) | skato_core 66 + 2 tests pass under Rosetta 2. With `ROSETTA_ADVERTISE_AVX=1` the dispatcher selects AVX2 and the same tests pass. No native-x86 run (§6) |
 
 ## 1. Latency at a glance
 
-**Plugin latency D** is what the host compensates, and what a performer monitoring through the plugin hears. It is fixed per mode and voice range and never depends on CPU load or buffer size. `vt_eval latency` checks that the measured value equals the reported one for every row (all 48 rows pass, ±0 samples):
+**Plugin latency D** is what the host compensates, and what a performer monitoring through the plugin hears. It is fixed per mode and voice range and never depends on CPU load or buffer size. `skato_eval latency` checks that the measured value equals the reported one for every row (all 48 rows pass, ±0 samples):
 
 | Mode | Low Male / Wide | Alto/Tenor | Soprano |
 |---|---|---|---|
@@ -39,7 +39,7 @@ All numbers come from fresh runs on 2026-10-08 (21:42-22:56 EDT). The machine wa
 | Live+ (default 10 ms) | 480 = 10.0 ms | 10.0 ms | 10.0 ms |
 | Studio (default 40 ms) | 1920 = 40.0 ms | 40.0 ms | 40.0 ms |
 
-Values are at 48 kHz. At 44.1 kHz Live is 259 / 197 / 138 samples (5.87 / 4.47 / 3.13 ms); at 96 kHz the sample counts double and the times stay the same. `vt_shift/src/latency.rs` documents 4.6 ms and 3.2 ms for Live, but the formula gives 4.44 ms and 3.10 ms. That file belongs to the vt_shift owner.
+Values are at 48 kHz. At 44.1 kHz Live is 259 / 197 / 138 samples (5.87 / 4.47 / 3.13 ms); at 96 kHz the sample counts double and the times stay the same. `skato_shift/src/latency.rs` documents 4.6 ms and 3.2 ms for Live, but the formula gives 4.44 ms and 3.10 ms. That file belongs to the skato_shift owner.
 
 **On real singing** (vocadito, 40 tracks, voice range chosen per file; `out/vocadito/report.md`):
 
@@ -55,14 +55,14 @@ Values are at 48 kHz. At 44.1 kHz Live is 259 / 197 / 138 samples (5.87 / 4.47 /
 - **Build profile:** `bench` = `release` (opt-level 3, `lto = "fat"`, `codegen-units = 1`, `debug = "line-tables-only"`).
 - **Harnesses:**
   - criterion 0.8.2. Kernels use `--warm-up-time 1 --measurement-time 2`. The engine bench uses its own config: 30 samples, 0.5 s warm-up, 2 s measurement.
-  - `vt_eval rt-bench`: an unpaced loop over 10 s of sung material (`melody_male`, Alto/Tenor, stereo, retune 10 ms) that records the wall time of every `Engine::process` call.
+  - `skato_eval rt-bench`: an unpaced loop over 10 s of sung material (`melody_male`, Alto/Tenor, stereo, retune 10 ms) that records the wall time of every `Engine::process` call.
 - **Load:** other agents were building and running a 16-thread evaluation. The 1-minute load average ranged from 6.7 to 62 during the runs, against 16 cores. Mitigations:
   - **Repeated rounds, best median kept.** The kernel suites ran 3-5 times (`r1`-`r5`) and the engine suite twice (`e1`, `e2`). Each table shows the **lowest criterion median across rounds**, since load only adds time, together with the round count.
   - **Significance.** "k/n" in the tables is the number of rounds, out of n, in which the optimised variant B had the lower median *and* the two 95 % bootstrap CIs of the medians were disjoint. A result is called significant when B was faster in at least n − 1 rounds and k is a majority. This allows one round lost to a load spike; the losing rounds are the ones whose CIs were wider than about ±10 %.
   - **Tail runs gated on low load.** rt-bench was rerun 5 times, each run starting only when the load average was below 8. §5 reports the per-configuration **median across the 5 runs**. A single run's max is dominated by OS preemption on this shared machine (§5).
-  - **Fixed snapshot.** Other owners were editing vt_detect, vt_control, vt_shift, vt_engine and vt_eval during the session. The engine and rt-bench numbers come from a single build of the tree at **22:08**. vt_core matches the final state described here.
+  - **Fixed snapshot.** Other owners were editing skato_detect, skato_control, skato_shift, skato_engine and skato_eval during the session. The engine and rt-bench numbers come from a single build of the tree at **22:08**. skato_core matches the final state described here.
 
-## 3. Kernel evidence (`crates/vt_core/benches/kernels.rs`)
+## 3. Kernel evidence (`crates/skato_core/benches/kernels.rs`)
 
 Times are criterion medians: best across rounds r1, r2 and r4 for the SIMD, fast-math, interpolation and decimator groups, which did not change during the session. The FFT groups use r1-r5 for realfft and r3a-r5 for vDSP, because vDSP changed in this pass (§3.5).
 
@@ -126,7 +126,7 @@ vDSP was faster than realfft at every size, in every round after the fix (3/3).
 
 ### 3.4 Exact FFT sizes vs the next power of two (new: `FftSizing::Fast`)
 
-The cross-correlation the detector's verifier runs every hop, `Correlator::cross_correlate` of the W-sample head against the W + τ_max + 1 buffer, was timed at the 48 kHz detector cells. Geometry follows `vt_detect`: W = 2.2/f_min at 24 kHz (HQ) or 16 kHz (Eco), τ_max = ⌈1.06·rate/f_min⌉.
+The cross-correlation the detector's verifier runs every hop, `Correlator::cross_correlate` of the W-sample head against the W + τ_max + 1 buffer, was timed at the 48 kHz detector cells. Geometry follows `skato_detect`: W = 2.2/f_min at 24 kHz (HQ) or 16 kHz (Eco), τ_max = ⌈1.06·rate/f_min⌉.
 
 | Cell | Buffer | n: pow2 → fast | realfft pow2 | realfft fast | Δ | vDSP pow2 | vDSP fast | Δ |
 |---|---:|---|---:|---:|---|---:|---:|---|
@@ -144,7 +144,7 @@ The raw transforms (§3.3) show the same pattern:
 - **realfft:** every 3·2^k size is 26-29 % cheaper than the power of two above it. 5·2^7 = 640 gains almost nothing over 1024.
 - **vDSP:** −9 to −27 % from 768 up; the 768-point power spectrum is compared against the uncertain 1024 entry (¹). vDSP is slower at 384 (the cross-correlation table above).
 
-**API, for the vt_detect owner** (additive; `Correlator::new` keeps rounding up to a power of two):
+**API, for the skato_detect owner** (additive; `Correlator::new` keeps rounding up to a power of two):
 
 ```rust
 pub enum FftSizing { PowerOfTwo /* default, = Correlator::new */, Fast }
@@ -155,18 +155,18 @@ impl Correlator {
 }
 ```
 
-**Adopting it in vt_detect** is a one-line change per frame: `Correlator::with_sizing(len, FFT_BACKEND, FftSizing::Fast)` in `LongFrame::new` and `ShortFrame::new`.
+**Adopting it in skato_detect** is a one-line change per frame: `Correlator::with_sizing(len, FFT_BACKEND, FftSizing::Fast)` in `LongFrame::new` and `ShortFrame::new`.
 
 - The frames already size their spectra from `corr.len()`.
 - The short-frame trim in `Detector::new` uses `next_power_of_two`. Using `fast_len` there instead, and capping the Low Male `ts_max` at 287 rather than 288, keeps that buffer at 768 instead of 960.
 - **Estimated gain** on the current realfft backend, from the table: about 3 µs per hop for HQ Low Male (long frame plus its power spectrum plus two short-frame correlations), about 15 % of that cell's 22 µs, and about 0.7 µs for Eco Alto/Tenor. HQ Alto/Tenor is unchanged.
 - This is an estimate: it was not measured inside the detector. If vDSP is adopted, keep the power of two for buffers ≤ 512.
 
-**Adopted (final pass, §10.3).** vt_detect uses 3·2^k only (`verifier::correlation_len`): the 5·2^k and 15·2^k sizes gained nothing or lost inside the detector (Eco Low Male at 960 instead of 1024: +6 % per hop). The harmonic-score spectrum keeps its power-of-two plan, so its bin interpolation is unchanged.
+**Adopted (final pass, §10.3).** skato_detect uses 3·2^k only (`verifier::correlation_len`): the 5·2^k and 15·2^k sizes gained nothing or lost inside the detector (Eco Low Male at 960 instead of 1024: +6 % per hop). The harmonic-score spectrum keeps its power-of-two plan, so its bin interpolation is unchanged.
 
 ### 3.5 vDSP backend fixes made in this pass
 
-Two defects were found while measuring §3.3-3.4. Both are fixed in `crates/vt_core/src/fft/vdsp.rs`.
+Two defects were found while measuring §3.3-3.4. Both are fixed in `crates/skato_core/src/fft/vdsp.rs`.
 
 1. **The spectral product did not vectorise.** `conj(A)·B` and |A|² iterated `.skip(1)` over a nested `zip` of four slices, which LLVM left as a slow scalar loop. Run in isolation it took 1.7-2.3 µs at n = 1536-2048, against 0.13-0.14 µs over flat sub-slices: about a third of every vDSP correlation. Before the fix, vDSP was *slower* than realfft for `diff_sq` at n = 2048 (6.04 vs 5.85 µs).
 
@@ -180,11 +180,11 @@ Two defects were found while measuring §3.3-3.4. Both are fixed in `crates/vt_c
    | autocorrelate n = 2048 / 4096 | 2.37 / 4.75 µs | 2.01 / 3.83 µs | −15 % / −19 % |
 
 2. **The result depended on buffer alignment, which broke determinism.**
-   - **What failed:** Accelerate picks differently rounded code paths depending on the alignment of the split-complex buffers. Over 600 plans fed the same input, there were exactly two bit patterns, one per alignment class of the imaginary buffer (0 vs 32 mod 64). The `Box<[f32]>` buffers landed wherever the allocator put them, so two engine instances, or two sessions, could disagree in the last bits. That breaks DESIGN §2.1 rule 6. It is also why `vt_detect` pinned `FftBackend::RealFft` (see the `FFT_BACKEND` comment in `crates/vt_detect/src/verifier.rs`).
+   - **What failed:** Accelerate picks differently rounded code paths depending on the alignment of the split-complex buffers. Over 600 plans fed the same input, there were exactly two bit patterns, one per alignment class of the imaginary buffer (0 vs 32 mod 64). The `Box<[f32]>` buffers landed wherever the allocator put them, so two engine instances, or two sessions, could disagree in the last bits. That breaks DESIGN §2.1 rule 6. It is also why `skato_detect` pinned `FftBackend::RealFft` (see the `FFT_BACKEND` comment in `crates/skato_detect/src/verifier.rs`).
    - **Fix:** the split buffers are now `Aligned` blocks on 128-byte boundaries.
    - **Tests:** the new `split_buffers_are_line_aligned` failed 3/3 runs without the fix. `results_do_not_depend_on_the_instance` (200 instances per size, both backends) is a property test: in its final form it failed in 1 of 4 runs without the fix, because it depends on where the allocator places buffers. Both pass with the fix.
    - **Side effect:** aligned buffers are also faster at n ≥ 2048. Forward transform, best of 200: 508 vs 702-723 ns at 2048 and 1104 vs 1350-1440 ns at 4096. Below that they are equal.
-   - **What this means for vt_detect:** its stated reason for avoiding vDSP no longer holds. Its cross-correlation would run 1.95× faster on vDSP (HQ Low Male: 5.45 → 2.80 µs at 2048, 2.47 µs at 1536). Repeated calls on one instance were already bit-identical: 0 mismatches in 1.2 M calls across 12 threads at load 38. realfft gave identical bits across 2000 instances.
+   - **What this means for skato_detect:** its stated reason for avoiding vDSP no longer holds. Its cross-correlation would run 1.95× faster on vDSP (HQ Low Male: 5.45 → 2.80 µs at 2048, 2.47 µs at 1536). Repeated calls on one instance were already bit-identical: 0 mismatches in 1.2 M calls across 12 threads at load 38. realfft gave identical bits across 2000 instances.
 
 ### 3.6 Fast math vs std (1024 values per iteration)
 
@@ -201,7 +201,7 @@ Two defects were found while measuring §3.3-3.4. Both are fixed in `crates/vt_c
 | Cubic Hermite | 853 ns | 1.7 ns | no anti-aliasing |
 | Sinc8 (256 phases) | 1738 ns | 3.4 ns | – |
 | Sinc16 (512 phases) | 2670 ns | 5.2 ns | −90 dB up to 0.1·fs, −83 dB up to 0.3·fs (−44 dB at 0.35·fs: the 16-tap limit) |
-| Sinc16 at rate 1.5 (anti-alias table) | 2624 ns | 5.1 ns | cutoff table chosen by threshold compares (was 4.14 µs with a `log2` per read, vt_core report) |
+| Sinc16 at rate 1.5 (anti-alias table) | 2624 ns | 5.1 ns | cutoff table chosen by threshold compares (was 4.14 µs with a `log2` per read, skato_core report) |
 
 ### 3.8 Decimator: minimum-phase IIR vs linear-phase FIR
 
@@ -218,7 +218,7 @@ The detector's streams were timed per 1024 input samples. The baseline is a Kais
 - **It is a latency choice.** It saves 0.8-1.2 ms of detection lag, which adds directly to how late the correction acts (§1).
 - **Its cost is negligible:** about 0.67 µs per 64-sample hop for the ÷2 and ÷3 streams together, 0.05 % of the hop.
 
-## 4. Engine-level cost (`cargo bench -p vt_eval --bench engine`)
+## 4. Engine-level cost (`cargo bench -p skato_eval --bench engine`)
 
 `Engine::process` at 48 kHz, stereo, Alto/Tenor, `melody_male`, retune 10 ms. Each cell is the best of runs e1 and e2: the median time per call, with the share of the buffer period in parentheses (32 = 667 µs, 64 = 1333 µs, 128 = 2667 µs, 512 = 10667 µs). Runs e1 and e2 agreed within about 3 %, apart from a few loaded cells in e1.
 
@@ -239,11 +239,11 @@ The detector's streams were timed per 1024 input samples. The baseline is a Kais
 
 - Cost scales linearly with the buffer, so the share of real time is constant per configuration. The engine has no per-call overhead worth measuring.
 - **Live modes cost about 20-25 % more than in the v1 integration report.** Live HQ was 8.26 µs at 32, 33.0 µs at 128 and 131 µs at 512; it is now 10.0 / 41.4 / 163 µs. Studio is unchanged or cheaper (Studio HQ: 15.36 vs 15.5 µs; Studio Max: 22.4 vs 20.8 µs).
-  - The 22:08 snapshot contains other owners' in-flight changes to vt_detect, vt_control and vt_shift, made between 21:59 and 22:08.
+  - The 22:08 snapshot contains other owners' in-flight changes to skato_detect, skato_control and skato_shift, made between 21:59 and 22:08.
   - Two runs agree with each other. A quieter run of a 22:50 snapshot (§7.1) gave 9.66 µs at 32 and 38.5 µs at 128, so load explains about 4-7 % of the increase, not all of it.
   - **The regression agent should re-run `engine/live/*` after the merge** to see whether the increase is real.
 
-## 5. Tail latency (`vt_eval rt-bench`) against the DESIGN §4 CPU gate
+## 5. Tail latency (`skato_eval rt-bench`) against the DESIGN §4 CPU gate
 
 Wall time of every `process()` call over 10 s of audio, as a percentage of the buffer period. Each cell is the **median across 5 runs**, each started at a 1-minute load average below 8 (22:40-22:43). The max column shows the median and the worst of the 5 runs.
 
@@ -305,22 +305,22 @@ Wall time of every `process()` call over 10 s of audio, as a percentage of the b
 - **The rt-bench exit budget (p99.9 ≤ 10 % at 32/64/128, DESIGN §3.7) is marginal for Studio Max @32.** The median is 10.79 %. The 22:29 run at load 13 gave 9.48 %, and the v1 integration measured 9.63 %. The §4 gate for Max is 25 %, so that gate holds. The exit-code budget is the stricter of the two and sits right at the edge.
 - **p99 at 32 is about 7× p50** (Live HQ: 4.09 % vs 0.61 %). At 48 kHz the 64-sample hop analysis lands in every other 32-sample block. P§5.5's "work spreading" gate (p99.9 at 32 ≤ 0.75 × p99.9 at 64) fails here: 39.9 µs vs 46.0 µs = 0.87. That gate is informational.
 - **The `max` column is not a property of the engine.** rt-bench runs on a normal-priority thread, unpaced. Runs that overlapped the other agents' 16-thread jobs had the thread preempted for up to 126 ms. Those were 4 of the 5 quiet runs plus the three 60 s runs at 22:32-22:35 (load 6.7 → 59), whose p99.9 reached 412 % of the period. P§1.3 and §5.5 predicted exactly this.
-- **Real hosts run `process()` on a time-constraint thread.** A sign-off number needs P§5.5's paced harness with RT priority. That is a recommendation for the vt_eval owner: add an RT-promoted, paced mode to rt-bench.
+- **Real hosts run `process()` on a time-constraint thread.** A sign-off number needs P§5.5's paced harness with RT priority. That is a recommendation for the skato_eval owner: add an RT-promoted, paced mode to rt-bench.
 
 ## 6. x86_64 / Rosetta status
 
 - **Build.** The installed toolchain has no x86_64 standard library for 1.99.0, and adding it means a download. The tests were therefore built with the installed nightly 1.91 (2025-08-31) and `-Zbuild-std`, offline:
 
   ```
-  CARGO_TARGET_DIR=target/owner-core-perf-x86 cargo +nightly test -p vt_core \
+  CARGO_TARGET_DIR=target/owner-core-perf-x86 cargo +nightly test -p skato_core \
       --target x86_64-apple-darwin -Zbuild-std --offline --ignore-rust-version
   ```
 
 - **Default Rosetta 2** (no AVX advertised): the dispatcher reports `active_backend() = "scalar"`. All 66 unit tests and 2 integration tests pass, including vDSP (Accelerate exists on x86_64 macOS) and the zero-allocation proof.
 - **`ROSETTA_ADVERTISE_AVX=1`:** `is_x86_feature_detected!("avx2")` and `("fma")` are true, the dispatcher reports `"avx2"`, and the same 66 + 2 tests pass.
   - This is the first time the in-crate AVX2 equivalence tests (every contract length, against an f64 reference) have run through the real dispatcher.
-  - The vt_core implementer could only call the AVX2 kernels directly, because default Rosetta hides AVX2.
-- **vt_engine:** all 35 tests, including the MXCSR FTZ/DAZ guard, passed as x86_64 under Rosetta in the v1 integration. They were not re-run here.
+  - The skato_core implementer could only call the AVX2 kernels directly, because default Rosetta hides AVX2.
+- **skato_engine:** all 35 tests, including the MXCSR FTZ/DAZ guard, passed as x86_64 under Rosetta in the v1 integration. They were not re-run here.
 - **Not done:**
   - native x86 hardware, never tested;
   - x86 performance numbers: Rosetta is not representative (P§5.13), and translated AVX2 is slower than SSE;
@@ -339,7 +339,7 @@ Wall time of every `process()` call over 10 s of audio, as a percentage of the b
 | phastft (pure-Rust FFT) | P§2.1: 1.36-1.51× over realfft, but depends on fearless_simd 0.5 (a second SIMD stack), and its c2r helpers allocate | Rejected for now |
 | Legacy `vDSP_fft_zrip` | P§6.3: erratic (681 ns at 1024) | Rejected |
 | `panic = "abort"` | P§6.9: −5.8 % binary size, identical speed; `unwind` lets workers degrade gracefully | Rejected |
-| fearless_simd generic kernels (P§1.2's plan) | Not adopted by the implementation. vt_core uses hand `core::arch` NEON plus an auto-vectorised scalar backend plus AVX2. P§6.1 measured fearless `f32x16` equal to hand NEON on `dot` (80-82 vs 84 ns), so there is no speed case either way | Deviation from P§, recorded. No action |
+| fearless_simd generic kernels (P§1.2's plan) | Not adopted by the implementation. skato_core uses hand `core::arch` NEON plus an auto-vectorised scalar backend plus AVX2. P§6.1 measured fearless `f32x16` equal to hand NEON on `dot` (80-82 vs 84 ns), so there is no speed case either way | Deviation from P§, recorded. No action |
 
 ### 7.1 `target-cpu=native` A/B
 
@@ -372,25 +372,25 @@ This build is newer than the 22:08 snapshot of §4, and it ran at a lower load. 
 Use a private target dir when other agents share the machine. Check `sysctl -n vm.loadavg` before timing anything, and repeat any run whose load average exceeds about half the core count.
 
 ```sh
-cd vocal_tune   # the repository root
+cd skatotune   # the repository root
 export CARGO_TARGET_DIR=target/perf
 
 # Kernels: every group, saved as a named baseline (≈ 8 min)
-cargo bench -p vt_core --bench kernels -- --warm-up-time 1 --measurement-time 2 --noplot --save-baseline r1
+cargo bench -p skato_core --bench kernels -- --warm-up-time 1 --measurement-time 2 --noplot --save-baseline r1
 # Only the FFT / exact-size / difference-function groups (≈ 4.5 min)
-cargo bench -p vt_core --bench kernels -- --warm-up-time 1 --measurement-time 2 --noplot --save-baseline r2 \
+cargo bench -p skato_core --bench kernels -- --warm-up-time 1 --measurement-time 2 --noplot --save-baseline r2 \
     '^(fft|fft_exact_vs_pow2|diff_sq_direct_vs_fft)/'
 # Engine::process per mode × tier × buffer (≈ 2.5 min)
-cargo bench -p vt_eval --bench engine -- --noplot --save-baseline e1
+cargo bench -p skato_eval --bench engine -- --noplot --save-baseline e1
 # Tail latency (≈ 10 s per run; repeat 5×, only when the load is low)
-cargo run --release -p vt_eval -- rt-bench --buffers 32,64,128,512 --seconds 10
+cargo run --release -p skato_eval -- rt-bench --buffers 32,64,128,512 --seconds 10
 # Plugin latency D, measured vs reported, every mode × range × rate
-cargo run --release -p vt_eval -- latency
-# vt_core under Rosetta (scalar dispatch, then AVX2 dispatch)
-CARGO_TARGET_DIR=target/perf-x86 cargo +nightly test -p vt_core --target x86_64-apple-darwin -Zbuild-std --offline --ignore-rust-version
-ROSETTA_ADVERTISE_AVX=1 CARGO_TARGET_DIR=target/perf-x86 cargo +nightly test -p vt_core --target x86_64-apple-darwin -Zbuild-std --offline --ignore-rust-version
+cargo run --release -p skato_eval -- latency
+# skato_core under Rosetta (scalar dispatch, then AVX2 dispatch)
+CARGO_TARGET_DIR=target/perf-x86 cargo +nightly test -p skato_core --target x86_64-apple-darwin -Zbuild-std --offline --ignore-rust-version
+ROSETTA_ADVERTISE_AVX=1 CARGO_TARGET_DIR=target/perf-x86 cargo +nightly test -p skato_core --target x86_64-apple-darwin -Zbuild-std --offline --ignore-rust-version
 # target-cpu A/B: build both from the same tree, then run the two bench binaries alternately
-RUSTFLAGS="-C target-cpu=native" CARGO_TARGET_DIR=target/perf-native cargo bench -p vt_eval --bench engine --no-run
+RUSTFLAGS="-C target-cpu=native" CARGO_TARGET_DIR=target/perf-native cargo bench -p skato_eval --bench engine --no-run
 ```
 
 - **Where the numbers are.** Criterion stores each result in `$CARGO_TARGET_DIR/criterion/<group>/<bench>/<baseline>/estimates.json`; this file quotes `median.point_estimate` and its `confidence_interval`. To compare two saved runs, use `--baseline <name>` in place of `--save-baseline`.
@@ -398,21 +398,21 @@ RUSTFLAGS="-C target-cpu=native" CARGO_TARGET_DIR=target/perf-native cargo bench
 
 ## 9. Follow-ups for other owners
 
-1. **vt_detect:**
+1. **skato_detect:**
    - Adopt `FftSizing::Fast` (§3.4). Expect about −26 % per long-frame and short-frame correlation for Low Male, Soprano Eco and Alto/Tenor Eco; HQ Alto/Tenor is unchanged.
    - Re-evaluate `FftBackend::Vdsp` now that it is deterministic (§3.5): about 1.95× faster correlations. Keep the power of two for buffers ≤ 512.
    - The `FFT_BACKEND` comment in `verifier.rs` describes the alignment bug that §3.5 fixes.
-2. **vt_eval:** give rt-bench an RT-priority (time-constraint), paced mode (P§5.5), so that tails measure the engine rather than the scheduler. Studio Max @32 sits at the 10 % exit budget.
-3. **Regression agent:** re-run `cargo bench -p vt_eval --bench engine -- 'engine/live'` on the merged tree. Live modes are 20-25 % above the v1 integration figures (§4).
-4. **vt_shift:** the doc comment in `latency.rs` says 4.6 ms / 3.2 ms; the formula gives 4.44 / 3.10 ms (§1).
+2. **skato_eval:** give rt-bench an RT-priority (time-constraint), paced mode (P§5.5), so that tails measure the engine rather than the scheduler. Studio Max @32 sits at the 10 % exit budget.
+3. **Regression agent:** re-run `cargo bench -p skato_eval --bench engine -- 'engine/live'` on the merged tree. Live modes are 20-25 % above the v1 integration figures (§4).
+4. **skato_shift:** the doc comment in `latency.rs` says 4.6 ms / 3.2 ms; the formula gives 4.44 / 3.10 ms (§1).
 
-   *Status after the final pass (§10):* 1 adopted for realfft at 3·2^k sizes (vDSP still not adopted); 3 done (§10.1); 4 done by the vt_shift owner (`latency.rs` now says 3.10 / 4.44 / 5.85 ms). 2 is open.
+   *Status after the final pass (§10):* 1 adopted for realfft at 3·2^k sizes (vDSP still not adopted); 3 done (§10.1); 4 done by the skato_shift owner (`latency.rs` now says 3.10 / 4.44 / 5.85 ms). 2 is open.
 
 ## 10. Final merged tree (2026-10-09)
 
-Measured on the merged tree after every owner had finished, by the regression agent, with no other agent on the machine. The 1-minute load average was 4-10 during the timed runs (a DAW and desktop apps run in the background), except for a transient spike to 62 at the start of the final vt_detect bench run in §10.3; its unchanged cells show no effect from it. Same machine, toolchain and profile as §2.
+Measured on the merged tree after every owner had finished, by the regression agent, with no other agent on the machine. The 1-minute load average was 4-10 during the timed runs (a DAW and desktop apps run in the background), except for a transient spike to 62 at the start of the final skato_detect bench run in §10.3; its unchanged cells show no effect from it. Same machine, toolchain and profile as §2.
 
-### 10.1 Engine cost (`cargo bench -p vt_eval --bench engine -- 'engine/' --save-baseline final_merged`)
+### 10.1 Engine cost (`cargo bench -p skato_eval --bench engine -- 'engine/' --save-baseline final_merged`)
 
 Criterion median per `Engine::process` call (48 kHz, stereo, Alto/Tenor, `melody_male`, retune 10 ms) and its share of the buffer period.
 
@@ -431,9 +431,9 @@ Criterion median per `Engine::process` call (48 kHz, stereo, Alto/Tenor, `melody
 | Studio | HQ | 13.7 µs (2.06 %) | 27.6 µs | 55.1 µs | 219 µs |
 | Studio | Max | 18.8 µs (2.82 %) | 37.6 µs | 74.6 µs | 301 µs |
 
-Against the v1 integration report (Live HQ 8.26 / 33.0 / 131 µs at 32 / 128 / 512) the merged Live HQ costs **+8-9 %**, not the +20-25 % of the 22:08 mid-edit snapshot (§4). That matches the owners' own A/Bs of the features added since v1 (vt_detect: +0-15 % per hop for the octave and onset work, partly paid back by §10.3). Studio is cheaper than at v1 (HQ 15.36 → 13.7 µs, Max 22.4 → 18.8 µs at 32).
+Against the v1 integration report (Live HQ 8.26 / 33.0 / 131 µs at 32 / 128 / 512) the merged Live HQ costs **+8-9 %**, not the +20-25 % of the 22:08 mid-edit snapshot (§4). That matches the owners' own A/Bs of the features added since v1 (skato_detect: +0-15 % per hop for the octave and onset work, partly paid back by §10.3). Studio is cheaper than at v1 (HQ 15.36 → 13.7 µs, Max 22.4 → 18.8 µs at 32).
 
-### 10.2 Tail latency (`vt_eval rt-bench --seconds 5`, 5 runs, median)
+### 10.2 Tail latency (`skato_eval rt-bench --seconds 5`, 5 runs, median)
 
 | Config | p50 | p99.9 | p99.9 % of period (min-max over 5 runs) | DESIGN §4 gate |
 |---|---:|---:|---:|---|
@@ -443,9 +443,9 @@ Against the v1 integration report (Live HQ 8.26 / 33.0 / 131 µs at 32 / 128 / 5
 | Studio HQ @32 | 10.8 µs | 45.8 µs | 6.87 % (6.72-7.17) | |
 | Studio Max @32 (worst Max tier) | 19.5 µs | 59.0 µs | **8.84 %** (8.51-9.34) | < 25 %: PASS |
 
-Every configuration (4 modes × 3 tiers × 32-512) was inside the 10 % rt-bench exit budget in all 5 runs. Studio Max @32, which sat at 10.79 % in §5, is now 8.84 %: the Studio analysis no longer shares a host block with the hop-boundary control update (RT-2 pipeline, vt_engine).
+Every configuration (4 modes × 3 tiers × 32-512) was inside the 10 % rt-bench exit budget in all 5 runs. Studio Max @32, which sat at 10.79 % in §5, is now 8.84 %: the Studio analysis no longer shares a host block with the hop-boundary control update (RT-2 pipeline, skato_engine).
 
-### 10.3 vt_detect exact FFT sizes (`cargo bench -p vt_detect --bench detect -- hop_48k`)
+### 10.3 skato_detect exact FFT sizes (`cargo bench -p skato_detect --bench detect -- hop_48k`)
 
 `push(64) + analyze()` per 48 kHz hop, criterion median, before (power-of-two plans) → after (3·2^k plans where they fit, `verifier::correlation_len`). Run back to back on the same tree; the unchanged cells moved by +0.4 to +1.5 %, which is the noise floor of this comparison.
 
@@ -461,14 +461,14 @@ Every configuration (4 modes × 3 tiers × 32-512) was inside the 10 % rt-bench 
 | HQ Live Alto/Tenor (1024 either way) | 15.34 µs | 15.40 µs | +0.4 % (unchanged) |
 | Eco Live Low Male (1024 either way) | 10.45 µs | 10.61 µs | +1.5 % (unchanged) |
 
-Accuracy: on vocadito (`vt_eval vocadito --conditions detect`, 7 configs × 40 files, 44.1 kHz) every metric of every one of the 280 detector rows (all columns of `detector.csv` except render time) is identical before and after. The only geometry change is at 48/96/192 kHz for Low Male / Wide, whose short frame keeps lags up to 287 instead of 288 (24 kHz verifier rate); the quality gates are unchanged by it.
+Accuracy: on vocadito (`skato_eval vocadito --conditions detect`, 7 configs × 40 files, 44.1 kHz) every metric of every one of the 280 detector rows (all columns of `detector.csv` except render time) is identical before and after. The only geometry change is at 48/96/192 kHz for Low Male / Wide, whose short frame keeps lags up to 287 instead of 288 (24 kHz verifier rate); the quality gates are unchanged by it.
 
 
 ## 11. Hardening pass (2026-10-09)
 
-Measured by the regression agent after every owner of the hardening pass had finished, with no other agent running (1-minute load average 4.4-7.3: a DAW and desktop apps in the background). Same machine, toolchain and profile as §2. Owners' own A/Bs for their changes (vt_shift PERF-5/PERF-6(1), vt_detect PERF-1-4) are in their crates' docs; this section measures the merged result and the one engine change made at integration, the Studio split analysis.
+Measured by the regression agent after every owner of the hardening pass had finished, with no other agent running (1-minute load average 4.4-7.3: a DAW and desktop apps in the background). Same machine, toolchain and profile as §2. Owners' own A/Bs for their changes (skato_shift PERF-5/PERF-6(1), skato_detect PERF-1-4) are in their crates' docs; this section measures the merged result and the one engine change made at integration, the Studio split analysis.
 
-### 11.1 Engine cost (`cargo bench -p vt_eval --bench engine -- 'engine/' --baseline final_merged`)
+### 11.1 Engine cost (`cargo bench -p skato_eval --bench engine -- 'engine/' --baseline final_merged`)
 
 Criterion median per `Engine::process` call (48 kHz, stereo, Alto/Tenor, `melody_male`, retune 10 ms), against the §10.1 baseline. "sig." = criterion's change test p < 0.05.
 
@@ -489,7 +489,7 @@ Criterion median per `Engine::process` call (48 kHz, stereo, Alto/Tenor, `melody
 
 The hardening pass added work (onset rules, predicted grains, the Studio pitch-frame advance) and removed more (the shifter's per-grain copies, the detector's octave-confirm FIR design and E/H running sums): every cell is equal or cheaper than at v1 close. The split analysis does not change the mean cost per call (it moves work between calls).
 
-### 11.2 Tail latency (`vt_eval rt-bench --seconds 5`, 3 runs, median)
+### 11.2 Tail latency (`skato_eval rt-bench --seconds 5`, 3 runs, median)
 
 | Config | p50 | p99.9 | p99.9 % of period | v1 close (§10.2) | DESIGN §4 gate |
 |---|---:|---:|---:|---:|---|
@@ -503,11 +503,11 @@ The hardening pass added work (onset rules, predicted grains, the Studio pitch-f
 
 All 60 configurations (4 modes × 3 tiers × 32-512) were inside the 10 % rt-bench exit budget in all 3 runs. The Studio @32 p50 rose (HQ 10.8 → 13.4 µs) and its p99.9 fell: at 48 kHz with 32-sample blocks the analysis used to fill every other block, and now both blocks of a hop carry about half of it. P§5.5's informational work-spreading ratio, p99.9(32) / p99.9(64) in µs with target ≤ 0.75, is now met in Studio (HQ 0.68, Max 0.74; were 0.86 and 0.89) and still not in Live (0.85), whose analysis must finish at the boundary.
 
-### 11.3 Studio split analysis (vt_engine, PERF-7)
+### 11.3 Studio split analysis (skato_engine, PERF-7)
 
 Studio now begins each hop's detector analysis at the boundary (`Detector::begin_analysis`, a snapshot of the stream positions) and runs its four stages before samples hop/4, 3·hop/8, hop/2 and 3·hop/4 of the next hop, then the control law before 7·hop/8; the shifter update (which re-seeds the mark tracker at a voiced onset) lands before sample 0. Before, the whole analysis ran at hop/2 with the new samples held back, and the control law at 3·hop/4. Output is bit-identical (336 output + telemetry hashes, and the engine test `studio_split_analysis_matches_a_one_shot_analysis`).
 
-Method: a scratch tool replays a deterministic engine 9 times over 2.5 s of sung material (ten notes from 98 to 440 Hz, scoops and vibrato, stereo), keeps the minimum time per block (which removes OS noise; this is the per-block cost the engine itself needs), and reports the p99.9 and the maximum of those minima after the first 0.5 s. "Before" is the same tree with the pre-integration `vt_engine/src/lib.rs`, built with the same profile, measured right after. Studio, 40 ms:
+Method: a scratch tool replays a deterministic engine 9 times over 2.5 s of sung material (ten notes from 98 to 440 Hz, scoops and vibrato, stereo), keeps the minimum time per block (which removes OS noise; this is the per-block cost the engine itself needs), and reports the p99.9 and the maximum of those minima after the first 0.5 s. "Before" is the same tree with the pre-integration `skato_engine/src/lib.rs`, built with the same profile, measured right after. Studio, 40 ms:
 
 | Rate / block | Config | p99.9 of the block period | Worst block (share of the period) |
 |---|---|---|---|
@@ -535,12 +535,12 @@ Live is unchanged (its analysis stays at the boundary): Live HQ p99.9 2.8 / 6.5 
 - **Placement was measured**, in eighths of a hop for (Frames, Checks, Track, Output, control law):
   - [1, 2, 4, 6, 7] put Frames with the re-seed at four blocks per hop (192 kHz/64 worst block 59.5 µs).
   - [2, 4, 5, 6, 7] keeps the two-block case lighter (192 kHz/128 67.6 µs) but pairs Checks with Track at four blocks per hop (192 kHz/64 p99.9 13.1 % against 11.9 %) and is worse at 48 kHz/32 (Max Wide 40.8 µs).
-  - [2, 3, 4, 6, 7] was kept (`vt_engine::PIPELINE_EIGHTHS`).
-- **Determinism across builds:** the old and new engines, built separately, gave identical hashes on all 336 configurations, so the cross-build drift the vt_control/vt_engine owner saw in a detector-only hash (an unused padding field changed it) did not show up here.
+  - [2, 3, 4, 6, 7] was kept (`skato_engine::PIPELINE_EIGHTHS`).
+- **Determinism across builds:** the old and new engines, built separately, gave identical hashes on all 336 configurations, so the cross-build drift the skato_control/skato_engine owner saw in a detector-only hash (an unused padding field changed it) did not show up here.
 
 ## 12. End-to-end SIMD and FFT-backend A/B (2026-10-09)
 
-Kernel speedups (§3) do not say how much the whole plugin gains. Three builds of the same commit (`704d95d`) were benchmarked with `cargo bench -p vt_eval --bench engine`, 128-sample blocks, 48 kHz stereo, two interleaved rounds (load 7-12 on 16 cores), median of the two rounds:
+Kernel speedups (§3) do not say how much the whole plugin gains. Three builds of the same commit (`704d95d`) were benchmarked with `cargo bench -p skato_eval --bench engine`, 128-sample blocks, 48 kHz stereo, two interleaved rounds (load 7-12 on 16 cores), median of the two rounds:
 
 | Build | Live Eco | Live HQ | Studio Max |
 |---|---:|---:|---:|
@@ -549,5 +549,5 @@ Kernel speedups (§3) do not say how much the whole plugin gains. Three builds o
 | Detector FFT on vDSP instead of realfft (NEON kernels) | 24.4 µs (+13 %) | 37.9 µs (+3.6 %) | 90.1 µs (+10 %) |
 
 - **Hand-written NEON is worth 2-5 % of the whole engine.** The "scalar" backend is not SIMD-free: LLVM auto-vectorises its chunked accumulator loops into NEON, which is where most of the kernel gain over naive code (§3.1: 7-20×) comes from. On aarch64 a truly SIMD-free build is not possible (NEON is part of the base ABI).
-- **vDSP loses end to end** even though it wins every isolated FFT (§3.3). The detector's decimated-rate FFTs are small (exact sizes of a few hundred points), where vDSP is slower (§3.4), and vDSP once produced instance-dependent last bits. The detector therefore stays on realfft (`vt_detect/src/verifier.rs`, `FFT_BACKEND`).
+- **vDSP loses end to end** even though it wins every isolated FFT (§3.3). The detector's decimated-rate FFTs are small (exact sizes of a few hundred points), where vDSP is slower (§3.4), and vDSP once produced instance-dependent last bits. The detector therefore stays on realfft (`skato_detect/src/verifier.rs`, `FFT_BACKEND`).
 - The engine uses about 1.4 % of one M4 Max core in Live HQ, so the remaining CPU is better spent on quality (Max tier, worker threads) than on further kernel tuning.

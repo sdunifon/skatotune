@@ -1,7 +1,7 @@
 //! Third-party notices for the shipped binaries (LIC-1).
 //!
 //! The plugin bundles and the standalone app statically link every Rust
-//! package in `vocal_tune`'s normal-dependency closure. Most of them are
+//! package in `skatotune`'s normal-dependency closure. Most of them are
 //! MIT/Apache-2.0/BSD/ISC/Zlib, which require their copyright and license
 //! text to accompany binary distributions, and egui embeds fonts under the
 //! SIL Open Font License 1.1, the Ubuntu Font Licence and the Hack / Bitstream
@@ -39,7 +39,7 @@ pub const NOTICES_FILE: &str = "THIRD-PARTY-NOTICES.txt";
 /// The project's own license (ISC), copied into every bundle as `LICENSE.txt`.
 const LICENSE_FILE: &str = "LICENSE";
 /// Package whose shipped closure is listed when none is named.
-const DEFAULT_PACKAGE: &str = "vocal_tune";
+const DEFAULT_PACKAGE: &str = "skatotune";
 /// Optional features of the default package that ship (the standalone app).
 const SHIPPED_FEATURES: &[&str] = &["standalone"];
 /// Platforms the bundles are built for (a universal build contains both).
@@ -293,7 +293,7 @@ pub fn generate(package: &str) -> Result<String> {
     }
 
     let mut out = String::new();
-    let title = "THIRD-PARTY SOFTWARE NOTICES FOR VOCAL TUNE";
+    let title = "THIRD-PARTY SOFTWARE NOTICES FOR SKATOTUNE";
     let _ = writeln!(out, "{title}\n{}\n", "=".repeat(title.len()));
     let features = if package == DEFAULT_PACKAGE {
         format!(" (with the `{}` feature)", SHIPPED_FEATURES.join("`, `"))
@@ -302,7 +302,7 @@ pub fn generate(package: &str) -> Result<String> {
     };
     let _ = writeln!(
         out,
-        "Vocal Tune is licensed under the ISC license (LICENSE / LICENSE.txt).\n\
+        "Skatotune is licensed under the ISC license (LICENSE / LICENSE.txt).\n\
          Its VST3 and CLAP plugins and its standalone application also contain the\n\
          third-party software listed below, each used under the license shown.\n\
          The license texts follow the list; each names the packages it applies to.\n\
@@ -316,7 +316,7 @@ pub fn generate(package: &str) -> Result<String> {
     let _ = writeln!(out, "License choices\n---------------\n");
     let _ = writeln!(
         out,
-        "Where a package offers a choice of licenses (\"A OR B\"), Vocal Tune uses it\n\
+        "Where a package offers a choice of licenses (\"A OR B\"), Skatotune uses it\n\
          under a permissive one, and the texts the package ships are reproduced\n\
          below. Choices that include a copyleft license:\n"
     );
@@ -591,8 +591,8 @@ mod tests {
     fn bundle_arguments_name_the_packages() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            bundle_packages(&args(&["vocal_tune", "--release"])),
-            ["vocal_tune"]
+            bundle_packages(&args(&["skatotune", "--release"])),
+            ["skatotune"]
         );
         assert_eq!(
             bundle_packages(&args(&["-p", "a", "-p", "b", "--release"])),
