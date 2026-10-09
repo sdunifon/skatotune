@@ -1193,6 +1193,7 @@ impl SkatotuneParams {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::labs::CorrectionTheme;
     use skato_core::NoteState::{Bypass, On, Remove};
 
     #[test]
@@ -1458,6 +1459,7 @@ mod tests {
         let mine = LabsSettings {
             correction_ribbon: false,
             heat_line: true,
+            correction_theme: CorrectionTheme::Viridis,
         };
         p.set_labs(mine);
         p.learned_scale
@@ -1487,14 +1489,32 @@ mod tests {
         );
 
         // A save from before some switch existed gets that switch's default.
-        let mut older = saved;
+        let mut older = saved.clone();
         older.insert("labs".into(), r#"{"heat_line":true}"#.into());
         restored.deserialize_fields(&older);
         assert_eq!(
             restored.labs(),
             LabsSettings {
                 correction_ribbon: true,
-                heat_line: true
+                heat_line: true,
+                correction_theme: CorrectionTheme::Teal,
+            }
+        );
+
+        // A save from a newer version with a theme this one lacks: the
+        // switches load, the theme is Teal.
+        let mut newer = saved;
+        newer.insert(
+            "labs".into(),
+            r#"{"correction_ribbon":false,"heat_line":true,"correction_theme":"plasma"}"#.into(),
+        );
+        restored.deserialize_fields(&newer);
+        assert_eq!(
+            restored.labs(),
+            LabsSettings {
+                correction_ribbon: false,
+                heat_line: true,
+                correction_theme: CorrectionTheme::Teal,
             }
         );
     }

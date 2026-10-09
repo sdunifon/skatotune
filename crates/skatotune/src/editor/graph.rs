@@ -5,9 +5,10 @@
 //! vibrato band, the correction ribbon (Labs), the detected input (thin,
 //! alpha = confidence, broken where unvoiced), the vibrato-free centre, and
 //! the corrected output (thick, accent colour, or tinted by correction
-//! strength with the Labs heat line), then the legend on a translucent
-//! backing. Time runs right to left from the display clock's "now", in
-//! output samples, so the graph lines up with what is heard.
+//! strength with the Labs heat line; the ribbon, the heat line and the
+//! legend's key all take their colours from the chosen Labs theme), then the
+//! legend on a translucent backing. Time runs right to left from the display
+//! clock's "now", in output samples, so the graph lines up with what is heard.
 //!
 //! The history holds ~5-6 frames per pixel column, so the frames in view are
 //! first folded into one [`Column`] aggregate per pixel (min/max/first of the
@@ -34,8 +35,7 @@ use egui::{
 use skato_core::{NoteState, PitchFrame, frame_flags};
 
 use super::correction::{
-    self, HEAT_STEPS, correction_cents, heat_color, heat_step, heat_step_start, ramp_pos,
-    ribbon_color,
+    self, HEAT_STEPS, Palette, correction_cents, heat_step, heat_step_start, palette, ramp_pos,
 };
 use super::history::{GraphView, PitchHistory};
 use super::theme::{self, ACCENT, BYPASS, CENTRE, DETECTED, MIDI, TEXT, TEXT_DIM, TEXT_FAINT};
@@ -319,6 +319,7 @@ pub fn draw_pitch_roll(
     }
 
     let labs = ctx.labs;
+    let colors = palette(labs.correction_theme);
     if labs.shows_correction_colour() {
         // About one vibrato cycle, in pixel columns.
         let heat_half = 0.5 * (correction::HEAT_WINDOW_S * ctx.sample_rate * px_per_sample) as f32;
@@ -331,7 +332,7 @@ pub fn draw_pitch_roll(
     draw_vibrato_band(&painter, cols, ymap);
     if labs.correction_ribbon {
         let mesh = reusable_mesh(&mut scratch.ribbon);
-        build_ribbon(mesh, cols, ymap, feather);
+        build_ribbon(mesh, cols, ymap, colors, feather);
         if !mesh.indices.is_empty() {
             painter.add(Shape::Mesh(Arc::clone(&scratch.ribbon)));
         }
@@ -355,10 +356,11 @@ pub fn draw_pitch_roll(
     if labs.heat_line {
         let mesh = reusable_mesh(&mut scratch.heat);
         let path = &mut scratch.path;
+        let paint = HeatPaint { colors, feather };
         if glow {
-            build_heat_line(mesh, path, points, cols, ymap, OUTPUT_GLOW, feather);
+            build_heat_line(mesh, path, points, cols, ymap, OUTPUT_GLOW, paint);
         }
-        build_heat_line(mesh, path, points, cols, ymap, OUTPUT_LINE, feather);
+        build_heat_line(mesh, path, points, cols, ymap, OUTPUT_LINE, paint);
         if !mesh.indices.is_empty() {
             painter.add(Shape::Mesh(Arc::clone(&scratch.heat)));
         }
@@ -809,6 +811,13 @@ fn smooth_strengths(cols: &mut [Column], heat_half: f32) {
     }
 }
 
+/// What a heat-line layer is coloured and anti-aliased with.
+#[derive(Clone, Copy)]
+struct HeatPaint<'a> {
+    colors: &'a Palette,
+    feather: f32,
+}
+
 /// Tessellate the output trace into `mesh` (Labs: heat line) with egui's own
 /// path stroker, one stroke per voiced run, then recolour every new vertex
 /// by the heat step of the column under it. One mesh for the whole trace, so
@@ -821,7 +830,7 @@ fn build_heat_line(
     cols: &[Column],
     ymap: YMap,
     layer: OutputLayer,
-    feather: f32,
+    paint: HeatPaint,
 ) {
     // Opaque white: after tessellation a vertex's alpha is its coverage.
     let stroke = PathStroke::new(layer.width, Color32::WHITE);
@@ -843,7 +852,7 @@ fn build_heat_line(
         let first = mesh.vertices.len();
         path.clear();
         path.add_open_points(points);
-        path.stroke_open(feather, &stroke, mesh);
+        path.stroke_open(paint.feather, &stroke, mesh);
         for v in mesh.vertices.get_mut(first..).unwrap_or(&mut []) {
             // Nearest column by x (the run is sorted by x).
             let i = run.partition_point(|c| c.x + 0.5 < v.pos.x);
@@ -854,7 +863,7 @@ fn build_heat_line(
                 (None, None) => continue,
             };
             let coverage = f32::from(v.color.a()) / 255.0;
-            v.color = theme::alpha(heat_color(near.heat), layer.opacity * coverage);
+            v.color = theme::alpha(paint.colors.heat_color(near.heat), layer.opacity * coverage);
         }
     }
 }
@@ -866,7 +875,7 @@ fn build_heat_line(
 /// transparent one a pixel further out that anti-aliases the free edge.
 /// Neighbouring columns are joined by triangles; the strip breaks where the
 /// traces break (voicing gaps) and where a column has no strength.
-fn build_ribbon(mesh: &mut Mesh, cols: &[Column], ymap: YMap, feather: f32) {
+fn build_ribbon(mesh: &mut Mesh, cols: &[Column], ymap: YMap, colors: &Palette, feather: f32) {
     // Previous column's first vertex and the side its free edge faces.
     let mut prev: Option<(u32, bool)> = None;
     for c in cols {
@@ -885,7 +894,7 @@ fn build_ribbon(mesh: &mut Mesh, cols: &[Column], ymap: YMap, feather: f32) {
         let Ok(idx) = u32::try_from(mesh.vertices.len()) else {
             break;
         };
-        let col = ribbon_color(t);
+        let col = colors.ribbon_color(t);
         let x = c.x + 0.5;
         let (y_out, y_free) = (ymap.y(out), ymap.y(free));
         let below = y_free >= y_out;
@@ -934,7 +943,7 @@ fn draw_now_marker(
         // The dot continues the output line (the newest column), so it
         // takes the line's colour.
         let col = match cols.last() {
-            Some(c) if ctx.labs.heat_line => heat_color(c.heat),
+            Some(c) if ctx.labs.heat_line => palette(ctx.labs.correction_theme).heat_color(c.heat),
             _ => ACCENT,
         };
         if plot.contains(p) {
@@ -1008,17 +1017,17 @@ fn draw_legend(painter: &egui::Painter, plot: Rect, labs: LabsSettings, key: &mu
 
     let mesh = reusable_mesh(key);
     let style = BarStyle::for_labs(labs);
+    let colors = palette(labs.correction_theme);
     for (i, g) in labels.into_iter().enumerate() {
         let lx = label_x.get(i).copied().unwrap_or(right);
         let s1 = lx - SWATCH_GAP;
         let swatch = Rect::from_min_max(pos2(s1 - SWATCH_W, y - 3.0), pos2(s1, y + 3.0));
         match i {
             // Heat line: the swatch shows the line's own range.
-            0 if labs.heat_line => push_gradient(
+            0 if labs.heat_line => push_heat_swatch(
                 mesh,
                 Rect::from_center_size(swatch.center(), vec2(SWATCH_W, OUTPUT_LINE.width)),
-                heat_color(0),
-                heat_color(HEAT_STEPS - 1),
+                colors,
             ),
             0 => line_swatch(painter, swatch, OUTPUT_LINE.width, ACCENT),
             1 => line_swatch(painter, swatch, 1.4, theme::alpha(DETECTED, 0.75)),
@@ -1062,6 +1071,34 @@ fn line_swatch(painter: &egui::Painter, swatch: Rect, width: f32, color: Color32
     );
 }
 
+/// The Output swatch of a heat line, left to right: the line's own range,
+/// blended through every step unless the palette's steps lie on one hue
+/// ([`Palette::swatch_blends_ends`]).
+fn push_heat_swatch(mesh: &mut Mesh, rect: Rect, colors: &Palette) {
+    if colors.swatch_blends_ends {
+        push_gradient(
+            mesh,
+            rect,
+            colors.heat_color(0),
+            colors.heat_color(HEAT_STEPS - 1),
+        );
+        return;
+    }
+    let pieces = f32::from(HEAT_STEPS - 1);
+    for k in 0..HEAT_STEPS - 1 {
+        let (x0, x1) = (
+            rect.left() + rect.width() * f32::from(k) / pieces,
+            rect.left() + rect.width() * f32::from(k + 1) / pieces,
+        );
+        push_gradient(
+            mesh,
+            Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
+            colors.heat_color(k),
+            colors.heat_color(k + 1),
+        );
+    }
+}
+
 /// A left-to-right gradient quad.
 fn push_gradient(mesh: &mut Mesh, rect: Rect, from: Color32, to: Color32) {
     let Ok(i) = u32::try_from(mesh.vertices.len()) else {
@@ -1080,6 +1117,7 @@ fn push_gradient(mesh: &mut Mesh, rect: Rect, from: Color32, to: Color32) {
 /// four steps as blocks, through the middle when the ribbon is on as well,
 /// filling the bar when the line is the only colouring.
 fn draw_correction_key(painter: &egui::Painter, bar: Rect, labs: LabsSettings, mesh: &mut Mesh) {
+    let colors = palette(labs.correction_theme);
     painter.rect_filled(bar, CornerRadius::ZERO, theme::LANE_ON);
     let x_at = |t: f32| bar.left() + t * bar.width();
     if labs.correction_ribbon {
@@ -1091,8 +1129,8 @@ fn draw_correction_key(painter: &egui::Painter, bar: Rect, labs: LabsSettings, m
             push_gradient(
                 mesh,
                 Rect::from_x_y_ranges(x_at(t0)..=x_at(t1), bar.y_range()),
-                ribbon_color(t0),
-                ribbon_color(t1),
+                colors.ribbon_color(t0),
+                colors.ribbon_color(t1),
             );
         }
     }
@@ -1109,7 +1147,7 @@ fn draw_correction_key(painter: &egui::Painter, bar: Rect, labs: LabsSettings, m
             } else {
                 1.0
             };
-            let c = heat_color(step);
+            let c = colors.heat_color(step);
             push_gradient(
                 mesh,
                 Rect::from_x_y_ranges(x_at(t0)..=x_at(t1), band.y_range()),
@@ -1156,6 +1194,8 @@ fn draw_key_frame_and_ticks(painter: &egui::Painter, bar: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::correction::{TEAL, tests::oklab};
+    use crate::labs::CorrectionTheme;
 
     #[test]
     fn note_labels() {
@@ -1262,6 +1302,15 @@ mod tests {
         LabsSettings {
             correction_ribbon,
             heat_line,
+            ..LabsSettings::DEFAULT
+        }
+    }
+
+    /// The Labs settings `l` with `theme`'s colours.
+    fn themed(l: LabsSettings, theme: CorrectionTheme) -> LabsSettings {
+        LabsSettings {
+            correction_theme: theme,
+            ..l
         }
     }
 
@@ -1322,8 +1371,8 @@ mod tests {
         assert_eq!(mesh.indices.len(), 12 * (columns.len() - NOTES.len()));
         // The 120 c note is the most opaque (clamped at 100+ c), the in-tune
         // one the least; the strip is ordered like the notes.
-        let (lo, hi) = (ribbon_color(0.0).a(), ribbon_color(1.0).a());
-        let at = |c: f32| ribbon_color(ramp_pos(c).unwrap()).a();
+        let (lo, hi) = (TEAL.ribbon_color(0.0).a(), TEAL.ribbon_color(1.0).a());
+        let at = |c: f32| TEAL.ribbon_color(ramp_pos(c).unwrap()).a();
         let mut seen: Vec<u8> = columns.iter().map(|[a, _, _]| a.color.a()).collect();
         seen.dedup();
         assert_eq!(seen, vec![at(40.0), at(8.0), hi, lo], "one colour per note");
@@ -1398,7 +1447,7 @@ mod tests {
         let _ = frame(&ctx, &h, pos as f64, labs(true, false), &mut scratch);
         let columns = ribbon_columns(&scratch);
         assert!(columns.len() > 200);
-        let at40 = ribbon_color(ramp_pos(40.0).unwrap());
+        let at40 = TEAL.ribbon_color(ramp_pos(40.0).unwrap());
         let px40 = 40.0 * 400.0 / GraphView::default().span;
         for [out, free, _] in &columns {
             assert_eq!(out.color, at40);
@@ -1420,6 +1469,26 @@ mod tests {
             .filter(|s| matches!(s.shape, Shape::Mesh(_)))
             .count();
         assert_eq!(meshes, 0, "no ribbon, no heat line, no legend key");
+    }
+
+    /// One voiced note whose correction grows from 0 to 100 c, still sounding
+    /// at the newest sample. Returns the history and the newest position.
+    fn growing_correction() -> (PitchHistory, f64) {
+        let mut h = PitchHistory::default();
+        h.ensure_allocated();
+        let n = 4000u64;
+        for k in 0..n {
+            let c = 100.0 * k as f32 / n as f32;
+            h.push(PitchFrame {
+                sample_pos: k * HOP,
+                detected: 6200.0 - c,
+                output: 6200.0,
+                target: 6200.0,
+                flags: frame_flags::VOICED,
+                ..PitchFrame::default()
+            });
+        }
+        (h, (n * HOP) as f64)
     }
 
     /// Output polylines (width 2.4 or the 6 px glow) and their colours.
@@ -1482,7 +1551,7 @@ mod tests {
         let out = frame(&ctx, &h, now, labs(true, true), &mut scratch);
         assert!(output_paths(&out).is_empty(), "no output polylines");
         assert!(scratch.heat.is_valid() && !scratch.heat.indices.is_empty());
-        let step = |c: f32| heat_color(heat_step(c));
+        let step = |c: f32| TEAL.heat_color(heat_step(c));
         assert_eq!(
             heat_colours(&scratch),
             vec![step(40.0), step(8.0), step(120.0), step(0.0)]
@@ -1495,37 +1564,18 @@ mod tests {
 
         // A correction that grows through one note: every step in order,
         // lightness rising left to right.
-        let mut ramp = PitchHistory::default();
-        ramp.ensure_allocated();
-        let n = 4000u64;
-        for k in 0..n {
-            let c = 100.0 * k as f32 / n as f32;
-            ramp.push(PitchFrame {
-                sample_pos: k * HOP,
-                detected: 6200.0 - c,
-                output: 6200.0,
-                target: 6200.0,
-                flags: frame_flags::VOICED,
-                ..PitchFrame::default()
-            });
-        }
-        let _ = frame(
-            &ctx,
-            &ramp,
-            (n * HOP) as f64,
-            labs(false, true),
-            &mut scratch,
-        );
+        let (ramp, ramp_now) = growing_correction();
+        let _ = frame(&ctx, &ramp, ramp_now, labs(false, true), &mut scratch);
         // Opaque vertices carry exact step colours or a blend of two
         // neighbouring ones; the exact ones appear in order.
         let exact: Vec<Color32> = heat_colours(&scratch)
             .into_iter()
-            .filter(|c| correction::HEAT_COLORS.contains(c))
+            .filter(|c| TEAL.heat.contains(c))
             .collect();
-        assert_eq!(exact, correction::HEAT_COLORS.to_vec());
+        assert_eq!(exact, TEAL.heat.to_vec());
         let lights: Vec<f32> = heat_colours(&scratch)
             .iter()
-            .map(|c| correction::tests::oklab(*c)[0])
+            .map(|c| oklab(*c)[0])
             .collect();
         assert!(lights.windows(2).all(|p| p[1] >= p[0]), "{lights:?}");
     }
@@ -1541,7 +1591,10 @@ mod tests {
         let ctx = egui::Context::default();
         let mut scratch = RollScratch::default();
         let _ = frame(&ctx, &h, now, labs(true, true), &mut scratch);
-        assert_eq!(heat_colours(&scratch), vec![heat_color(HEAT_STEPS - 1)]);
+        assert_eq!(
+            heat_colours(&scratch),
+            vec![TEAL.heat_color(HEAT_STEPS - 1)]
+        );
         // The ribbon's colour is smoothed only lightly: it still follows
         // the swing (strong at the peaks, faint at the crossings).
         let alphas: Vec<u8> = ribbon_columns(&scratch)
@@ -1661,6 +1714,158 @@ mod tests {
         c.add(&f, None);
         assert_eq!(c.strength(), Some(20.0));
         assert_eq!(Column::new(0.0, false, &f, None).strength(), None);
+    }
+
+    /// Every theme colours all three displays: the ribbon strip (one colour
+    /// per note, the theme's ramp at that strength), the heat line (the
+    /// theme's step colours) and the legend (the key and the Output swatch).
+    #[test]
+    fn every_theme_colours_the_ribbon_the_heat_line_and_the_legend() {
+        let (h, now) = sung(0.0, &NOTES);
+        let ctx = egui::Context::default();
+        for theme in CorrectionTheme::ALL {
+            let p = palette(theme);
+            let mut scratch = RollScratch::default();
+            let settings = themed(labs(true, true), theme);
+            let out = frame(&ctx, &h, now, settings, &mut scratch);
+
+            // Ribbon: the 40 / 8 / 120 / 0 c notes, in the theme's ramp.
+            let at = |c: f32| p.ribbon_color(ramp_pos(c).unwrap());
+            let mut seen: Vec<Color32> = ribbon_columns(&scratch)
+                .iter()
+                .map(|[a, _, _]| a.color)
+                .collect();
+            seen.dedup();
+            assert_eq!(
+                seen,
+                vec![at(40.0), at(8.0), at(120.0), at(0.0)],
+                "{theme:?} ribbon"
+            );
+
+            // Heat line: one step colour per note.
+            let step = |c: f32| p.heat_color(heat_step(c));
+            assert_eq!(
+                heat_colours(&scratch),
+                vec![step(40.0), step(8.0), step(120.0), step(0.0)],
+                "{theme:?} heat line"
+            );
+
+            // Legend key: ribbon gradient slices and the heat steps' blocks,
+            // all in the theme's colours (the swatch's vertices come first).
+            let key: Vec<Color32> = scratch.key.vertices.iter().map(|v| v.color).collect();
+            for t in [0.0, 0.5, 1.0] {
+                assert!(key.contains(&p.ribbon_color(t)), "{theme:?} key at {t}");
+            }
+            for c in p.heat {
+                assert!(key.contains(&c), "{theme:?} key lacks {c:?}");
+            }
+            let swatch = &key[..if p.swatch_blends_ends { 4 } else { 12 }];
+            let steps: Vec<Color32> = swatch.chunks(4).flat_map(|q| [q[0], q[2]]).collect();
+            if p.swatch_blends_ends {
+                assert_eq!(steps, vec![p.heat[0], p.heat[3]], "{theme:?} swatch");
+            } else {
+                assert_eq!(
+                    steps,
+                    vec![
+                        p.heat[0], p.heat[1], p.heat[1], p.heat[2], p.heat[2], p.heat[3]
+                    ],
+                    "{theme:?} swatch passes through every step"
+                );
+            }
+            // The swatch is one continuous gradient across its width.
+            let xs: Vec<f32> = scratch.key.vertices[..swatch.len()]
+                .chunks(4)
+                .flat_map(|q| [q[0].pos.x, q[2].pos.x])
+                .collect();
+            assert!(xs.windows(2).all(|w| w[1] >= w[0] - 1e-3), "{xs:?}");
+            assert!((xs[xs.len() - 1] - xs[0] - SWATCH_W).abs() < 1e-3, "{xs:?}");
+
+            // No dot while nothing sounds at the newest sample.
+            assert_eq!(now_dot(&out), None);
+
+            // The dot at the newest sample takes the heat line's colour
+            // there: the top step once the correction has grown to 100 c.
+            let (growing, growing_now) = growing_correction();
+            let out = frame(&ctx, &growing, growing_now, settings, &mut scratch);
+            assert_eq!(now_dot(&out), Some(p.heat[3]), "{theme:?} now dot");
+        }
+    }
+
+    /// The fill of the dot on the newest sample (radius 3.5), if drawn.
+    fn now_dot(out: &egui::FullOutput) -> Option<Color32> {
+        out.shapes.iter().find_map(|s| match &s.shape {
+            Shape::Circle(c) if c.radius == 3.5 => Some(c.fill),
+            _ => None,
+        })
+    }
+
+    /// Chosen but unused, a theme changes nothing on screen; with the heat
+    /// line off the output (and its swatch) stays the accent colour whatever
+    /// the theme, and only the ribbon's colours follow it.
+    #[test]
+    fn a_theme_alone_changes_nothing_and_the_plain_line_stays_accent() {
+        let (h, now) = sung(0.0, &NOTES);
+        let ctx = egui::Context::default();
+        let shapes = |settings| {
+            let mut scratch = RollScratch::default();
+            frame(&ctx, &h, now, settings, &mut scratch).shapes
+        };
+        let plain = shapes(labs(false, false));
+        for theme in CorrectionTheme::ALL {
+            assert_eq!(
+                shapes(themed(labs(false, false), theme)),
+                plain,
+                "{theme:?}"
+            );
+        }
+        // Ribbon only: the plain line is the accent in every theme.
+        for theme in CorrectionTheme::ALL {
+            let mut scratch = RollScratch::default();
+            let out = frame(
+                &ctx,
+                &h,
+                now,
+                themed(labs(true, false), theme),
+                &mut scratch,
+            );
+            assert_eq!(output_paths(&out), vec![(2.4, ACCENT); 4], "{theme:?}");
+        }
+    }
+
+    /// Switching the theme between frames recolours the next frame at once
+    /// and reuses every buffer (a theme is not a new mesh).
+    #[test]
+    fn switching_theme_recolours_the_next_frame_in_place() {
+        let (h, now) = sung(0.0, &NOTES);
+        let ctx = egui::Context::default();
+        let mut scratch = RollScratch::default();
+        let tessellate = |out: egui::FullOutput| {
+            let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+        };
+        tessellate(frame(&ctx, &h, now, labs(true, true), &mut scratch));
+        let first_ribbon = ribbon_columns(&scratch)[0][0].color;
+        let ptrs = (Arc::as_ptr(&scratch.ribbon), Arc::as_ptr(&scratch.heat));
+        for theme in CorrectionTheme::ALL {
+            tessellate(frame(
+                &ctx,
+                &h,
+                now,
+                themed(labs(true, true), theme),
+                &mut scratch,
+            ));
+            assert_eq!(
+                ribbon_columns(&scratch)[0][0].color,
+                palette(theme).ribbon_color(ramp_pos(40.0).unwrap()),
+                "{theme:?}"
+            );
+            assert_eq!(
+                (Arc::as_ptr(&scratch.ribbon), Arc::as_ptr(&scratch.heat)),
+                ptrs
+            );
+        }
+        // Back on Teal it is the first frame's colour again.
+        tessellate(frame(&ctx, &h, now, labs(true, true), &mut scratch));
+        assert_eq!(ribbon_columns(&scratch)[0][0].color, first_ribbon);
     }
 
     #[test]

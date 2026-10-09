@@ -13,7 +13,9 @@
 //!          --transpose=ST, --vibdepth=PCT, --retune=MS (set those knobs, e.g. to
 //!          check the correction colouring under Transpose or flattened vibrato)
 //!   Labs:  --no-ribbon (correction ribbon off; it is on by default), --heat
-//!          (heat-tinted output line on), --labs (the LABS menu open)
+//!          (heat-tinted output line on), --labs (the LABS menu open),
+//!          --theme=<teal|green-red|viridis|inferno|blue-orange> (the
+//!          Correction colors theme; teal is the default)
 //! sips -s format png out.bmp --out out.png   # macOS, optional
 //! ```
 //!
@@ -34,6 +36,7 @@ use egui::{Color32, Pos2, RawInput, Rect, pos2, vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::*;
 use skatotune::editor::{HEIGHT, SkatotuneEditor, WIDTH};
+use skatotune::labs::CorrectionTheme;
 use skatotune::params::{
     KeyChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues, Preset, ScaleChoice,
     SkatotuneParams,
@@ -305,6 +308,12 @@ fn main() {
     }
     if flag("--heat") {
         labs.heat_line = true;
+    }
+    if let Some(id) = args.iter().find_map(|a| a.strip_prefix("--theme=")) {
+        labs.correction_theme = CorrectionTheme::from_id(id).unwrap_or_else(|| {
+            let ids: Vec<&str> = CorrectionTheme::ALL.iter().map(|t| t.id()).collect();
+            panic!("unknown --theme={id}; use one of: {}", ids.join(", "));
+        });
     }
     params.set_labs(labs);
 

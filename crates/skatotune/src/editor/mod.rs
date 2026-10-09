@@ -1672,6 +1672,7 @@ fn apply_values(setter: &ParamSetter, p: &SkatotuneParams, old: &ParamValues, ne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labs::CorrectionTheme;
 
     fn voiced(output: f32, detected: f32, centre: f32, target: f32) -> PitchFrame {
         PitchFrame {
@@ -1871,8 +1872,9 @@ mod tests {
     }
 
     /// The LABS button opens the experiments menu; a row flips its
-    /// experiment in the saved Labs settings (never a host parameter);
-    /// Escape, the button again, or a click elsewhere closes it.
+    /// experiment, a theme button chooses the Correction colors, both in the
+    /// saved Labs settings (never a host parameter); Escape, the button
+    /// again, or a click elsewhere closes it.
     #[test]
     fn labs_menu_toggles_experiments() {
         let params = Arc::new(SkatotuneParams::default());
@@ -1910,6 +1912,43 @@ mod tests {
         assert!(app.labs_open, "rows keep the menu open");
         assert_eq!(host.edits.load(Ordering::Relaxed), 0, "no host parameter");
 
+        // The Correction colors selector sits under the rows, inside the
+        // menu and the window: a click on a theme's button chooses it and
+        // changes nothing else.
+        assert!(origin.y + labs_menu::menu_height() < HEIGHT);
+        let theme_button = |theme: CorrectionTheme| {
+            let i = CorrectionTheme::ALL
+                .iter()
+                .position(|t| *t == theme)
+                .unwrap();
+            let rect = labs_menu::theme_button(origin, i);
+            assert!(
+                rect.min.y >= row(1.0).y + 0.5 * labs_menu::ROW_H,
+                "under the rows"
+            );
+            assert!(rect.max.y <= origin.y + labs_menu::menu_height());
+            rect.center()
+        };
+        assert_eq!(params.labs().correction_theme, CorrectionTheme::Teal);
+        for theme in [
+            CorrectionTheme::Viridis,
+            CorrectionTheme::BlueOrange,
+            CorrectionTheme::GreenRed,
+            CorrectionTheme::Inferno,
+        ] {
+            click(&ctx, &mut app, theme_button(theme));
+            assert_eq!(params.labs().correction_theme, theme);
+            assert!(app.labs_open, "choosing a theme keeps the menu open");
+        }
+        click(&ctx, &mut app, theme_button(CorrectionTheme::Inferno));
+        assert_eq!(
+            params.labs().correction_theme,
+            CorrectionTheme::Inferno,
+            "choosing the chosen theme again keeps it"
+        );
+        assert!(params.labs().heat_line && !params.labs().correction_ribbon);
+        assert_eq!(host.edits.load(Ordering::Relaxed), 0, "no host parameter");
+
         key_press(&ctx, &mut app, egui::Key::Escape);
         assert!(!app.labs_open, "Escape closes");
         click(&ctx, &mut app, button);
@@ -1923,7 +1962,8 @@ mod tests {
             params.labs(),
             crate::labs::LabsSettings {
                 correction_ribbon: false,
-                heat_line: true
+                heat_line: true,
+                correction_theme: CorrectionTheme::Inferno,
             }
         );
     }

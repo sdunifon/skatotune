@@ -6,9 +6,10 @@
 //! while the editor draws, with the experiments on and off over the same
 //! scrolling telemetry: notes with a steady correction each, and the worst
 //! case for a colour-per-run design, hard tune flattening a wide vibrato
-//! (the correction swings 0-50 c at 5.5 Hz). Separate binary because it
-//! replaces the global allocator; skipped with `assert_process_allocs`,
-//! which installs its own.
+//! (the correction swings 0-50 c at 5.5 Hz). Both experiments are also tried
+//! in every Correction colors theme: a theme only changes the colours the
+//! meshes are filled with. Separate binary because it replaces the global
+//! allocator; skipped with `assert_process_allocs`, which installs its own.
 
 #![cfg(not(feature = "assert_process_allocs"))]
 
@@ -20,11 +21,11 @@ use std::sync::atomic::Ordering;
 use egui::{Pos2, RawInput, Rect, vec2};
 use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::*;
+use skato_core::{PitchFrame, frame_flags};
 use skatotune::editor::{HEIGHT, SkatotuneEditor, WIDTH};
-use skatotune::labs::LabsSettings;
+use skatotune::labs::{CorrectionTheme, LabsSettings};
 use skatotune::params::SkatotuneParams;
 use skatotune::shared::SharedState;
-use skato_core::{PitchFrame, frame_flags};
 
 struct Counting;
 
@@ -208,24 +209,40 @@ fn median(v: &[usize]) -> usize {
 const OFF: LabsSettings = LabsSettings {
     correction_ribbon: false,
     heat_line: false,
+    ..LabsSettings::DEFAULT
 };
 const RIBBON: LabsSettings = LabsSettings {
     correction_ribbon: true,
     heat_line: false,
+    ..LabsSettings::DEFAULT
 };
 const HEAT: LabsSettings = LabsSettings {
     correction_ribbon: false,
     heat_line: true,
+    ..LabsSettings::DEFAULT
 };
 const BOTH: LabsSettings = LabsSettings {
     correction_ribbon: true,
     heat_line: true,
+    ..LabsSettings::DEFAULT
 };
+
+/// Both experiments on, in each theme: a theme changes which colours the
+/// meshes are filled with, never how many allocations drawing them takes.
+fn both_in(theme: CorrectionTheme) -> LabsSettings {
+    LabsSettings {
+        correction_theme: theme,
+        ..BOTH
+    }
+}
 
 /// Each setting against the experiments-off baseline measured in the same
 /// run (before and after, the larger): at most `extra` more allocations.
 fn assert_bounded(telemetry: fn(u64) -> PitchFrame, name: &str, extra: usize) {
-    let runs = allocations_per_frame(telemetry, &[OFF, RIBBON, HEAT, BOTH, OFF]);
+    let mut settings = vec![OFF, RIBBON, HEAT, BOTH];
+    settings.extend(CorrectionTheme::ALL.into_iter().map(both_in));
+    settings.push(OFF);
+    let runs = allocations_per_frame(telemetry, &settings);
     let base = runs
         .iter()
         .filter(|(l, _, _)| *l == OFF)
