@@ -4,7 +4,7 @@ Every technique the research has evaluated, with where it came from, how strong 
 
 **Status:** **Adopted** (in the plugin) · **Candidate** (promising, not built) · **Prototyped** (built in a scratch copy and measured) · **Rejected** (with the reason) · **Unknown** (research pending).
 
-Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performance.md`](../rust-performance.md), `PERF§` = [`../PERFORMANCE.md`](../PERFORMANCE.md), `KEY` = [`host-key-scale.md`](host-key-scale.md), `GRAPH` = [`graph-mode.md`](graph-mode.md), `NI` = note-intent deep dive (interim results on #7).
+Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performance.md`](../rust-performance.md), `PERF§` = [`../PERFORMANCE.md`](../PERFORMANCE.md), `KEY` = [`host-key-scale.md`](host-key-scale.md), `GRAPH` = [`graph-mode.md`](graph-mode.md), `NI` = [`note-intent.md`](note-intent.md) (audited).
 
 ## Pitch detection
 
@@ -48,11 +48,14 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 | MonoNote-style note HMM (HQ/Max) | R§8.12 | — | Adopted | #7, #10 |
 | Phrase restart on a > 300 c jump near a phrase start | STATUS (v1.1) | Onset glitches 13.9 % → 6.3 % (with the other v1.1 fixes) | Adopted | #7, #16 |
 | Studio decisions over the lookahead, pitch advance | STATUS (v1.1) | Studio settle 35/83 ms → 17/41 ms (median/p90) | Adopted | #7, #10 |
-| Adaptive singer tuning reference | NI proto A | No change on vocadito; +2.5-3.5 pts on a detuned-singer benchmark | Prototyped (off by default) | #7, #6 |
-| Musical note model: key/interval/duration priors, glide state | NI proto B | Warble −48 % (Live HQ chromatic), note-level −3.6 pts | Prototyped | #7, #6 |
-| Release/glide freeze | NI proto C | Warble −31 % to −45 %, note-level −1.8 pts | Prototyped | #7 |
+| Adaptive singer tuning reference | NI proto A | Hurts real singers as a default; on a detuned-singer benchmark it recovers most of the intent loss | Prototyped; recommended only as an opt-in "Follow singer's tuning" | #7, #6 |
+| Musical note model: key/interval/duration priors, glide state | NI proto B | No frontier gain (audit); its b_adapt preset trades note accuracy for warble | Prototyped, not adopted | #7, #6 |
+| Release freeze: no downward switch while the level falls > 4 dB in 40 ms | NI proto C, lead | Removes about a third more warble on top of the veto | Prototyped; recommended | #7, #16 |
 | Glide-endpoint extrapolation (Saitou-style) | NI proto C | Future pitch change uncorrelated with velocity (R² ≈ 0.05); worse in closed loop | Rejected | #7, #8 |
-| Onset cues that aren't pitch (energy dip + rise, voicing gaps) set the note-change hazard | NI literature | The only idea that moved the accuracy frontier offline (AUC 0.72) | Candidate (top) | #7, #16, #10, #17 |
+| Onset cues that aren't pitch (energy dip + rise, voicing gaps) set the note-change hazard | NI literature | Moved the frontier in an offline test (AUC 0.72); level dip/rise features feed the learned veto | Partly adopted via the veto | #7, #16, #10, #17 |
+| Learned switch veto ("rule proposes, model vetoes"): gradient-boosted trees, 300 trees, 82 causal features relative to the decided pitch, can only block a proposed switch | NI proto D, lead | Live HQ chromatic TEST: warble 50 → 24 /min, stable p95 25.6 → 20.1 c, frame accuracy +3.3 pts, but per-note accuracy 79.7 → 76.5 %; 10.6 µs per hop, no allocation; audited sound with caveats (Live HQ chromatic only) | Prototyped; recommended for Live HQ pending confirmation on new singers | #7, #14, #27, #16 |
+| Studio onset note read from the newest third of the lookahead | NI protos B, C | DEV onset glitches 1.1 → 0.5 %; not confirmed on TEST | Prototyped | #7, #10 |
+| Frontier yardstick: compare a change against the Pareto envelope of a Tolerance sweep | NI lead | Separates "better" from "a different setting of the same trade-off" | Prototyped (eval tool) | #26, #12, #7, #8 |
 | Uncertainty-scaled transition time | NI literature | Shrinks A→B→A swings without delaying confident switches | Candidate | #7 |
 | Key detection: profile matching on a stable-note histogram; optional sidechain chroma | R§6, KEY §5.3 | Vocal-only needs ~20-30 s of singing | Candidate | #6, #5, #7 |
 
@@ -97,4 +100,6 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 - **Envelope correction** from the latency work (#8) is the core of a throat model (#9) and of formant quality beyond ±3 st (#15).
 - **The worker pool** (#13) is the prerequisite for a neural arbiter (#14) and live neural tracking (#27); the Apple research (#28) decides where that inference runs.
 - **Key detection** (#6) feeds the musical note model's key prior (#7) and the DAW-key fallback (#5).
-- **The note-intent harness and detuned-singer benchmark** should become part of the perceptual test suite (#26) and the Auto-Tune A/B (#12).
+- **The note-intent harness, the detuned-singer benchmark and the frontier yardstick** should become part of the perceptual test suite (#26) and the Auto-Tune A/B (#12).
+- **"Rule proposes, model vetoes"** kept the synthetic gates passing where models that decided notes directly failed; the same pattern fits a neural octave/voicing arbiter (#14, #27) and other hysteresis decisions (voicing release, octave guard).
+- **Onset glitches are mostly shifter/output-path events** (note-decision proxy 1.1 % of the published 6.3 %), so they belong with the shifter and latency work (#8, #16).
