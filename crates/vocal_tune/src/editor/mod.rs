@@ -3,7 +3,7 @@
 //! Fixed 1100 × 720 logical-pixel layout:
 //!
 //! ```text
-//! ┌ header: name · mode · Live+/Studio ms · range · quality · engine · latency · CPU ┐
+//! ┌ header: name · mode · Live+/Studio ms · range · quality · engine · latency · CPU/LABS ┐
 //! ├ sidebar ─────────┬ readouts: target note · input/correction meters · vibrato · view ┤
 //! │ key + scale      │ pitch graph (6 s scrolling piano roll)                          │
 //! │ presets          │                                                                 │
@@ -18,10 +18,15 @@
 //! [`SharedState::take_telemetry`] whenever `activate()` installs a new one;
 //! the GUI never blocks the audio thread. Everything per frame works on
 //! preallocated buffers (history ring, graph columns).
+//!
+//! The LABS button (top right) opens a menu of opt-in experiments
+//! ([`crate::labs`]); they are GUI-only and saved with the project.
 
+mod correction;
 mod graph;
 mod history;
 mod keyboard;
+mod labs_menu;
 mod theme;
 mod widgets;
 
@@ -249,6 +254,8 @@ pub struct VocalTuneEditor {
     readouts: Readouts,
     avg: AvgDelay,
     advanced_open: bool,
+    /// The LABS menu is showing.
+    labs_open: bool,
     last_ui: Option<Instant>,
     pending: PendingSince,
     #[cfg(feature = "demo-telemetry")]
@@ -277,6 +284,7 @@ impl VocalTuneEditor {
             readouts: Readouts::default(),
             avg: AvgDelay::default(),
             advanced_open: false,
+            labs_open: false,
             last_ui: None,
             pending: PendingSince::default(),
             #[cfg(feature = "demo-telemetry")]
@@ -400,6 +408,8 @@ impl NiceEguiApp for VocalTuneEditor {
 
     fn editor_closed(&mut self) {
         self.gui = None;
+        // A menu does not outlive its window.
+        self.labs_open = false;
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut nice_plug_egui::Frame) {
@@ -421,6 +431,11 @@ impl VocalTuneEditor {
         self.advanced_open = open;
     }
 
+    /// Open or close the LABS menu.
+    pub fn set_labs_open(&mut self, open: bool) {
+        self.labs_open = open;
+    }
+
     /// Draw one editor frame into `ui` (the whole 1100 × 720 window).
     pub fn draw(&mut self, ui: &mut Ui) {
         let Some(gui) = self.gui.clone() else { return };
@@ -439,6 +454,8 @@ impl VocalTuneEditor {
         let states = learned.unwrap_or(settings.note_states);
         self.pending
             .update(self.shared.restart_pending.load(Ordering::Acquire), now);
+        // Frames arriving now were produced under the current Transpose.
+        self.history.set_transpose(settings.transpose_st);
         let voiced_seen = self.pump_telemetry(now);
         #[cfg(feature = "demo-telemetry")]
         self.pump_demo(now, voiced_seen, &values, &states);
@@ -515,6 +532,7 @@ impl VocalTuneEditor {
             highlight_note: recent
                 .filter(|f| f.target > 0.0)
                 .map(|f| (f.target / 100.0).round() as i32),
+            labs: self.params.labs(),
         };
         draw_pitch_roll(
             ui,
@@ -530,10 +548,25 @@ impl VocalTuneEditor {
             let drawer = Rect::from_min_max(pos2(main.left(), adv_bar.bottom() + 6.0), main.max);
             self.advanced_drawer(ui, drawer, &setter);
         }
+        // Last, so it floats over everything.
+        if self.labs_open {
+            self.labs_open =
+                labs_menu::menu(ui, labs_button_rect(header), header.bottom(), &self.params);
+        }
 
         // The graph scrolls continuously.
         ui.ctx().request_repaint();
     }
+}
+
+/// The LABS button in the header `header`: the top-right corner, on the
+/// caption line of the CPU column, right edge flush with the CPU meter.
+fn labs_button_rect(header: Rect) -> Rect {
+    const W: f32 = 50.0;
+    Rect::from_min_size(
+        pos2(header.left() + 1084.0 - W, header.top() + 5.0),
+        vec2(W, 16.0),
+    )
 }
 
 /// Rounded panel background.
@@ -723,6 +756,17 @@ impl VocalTuneEditor {
         let load = self.shared.cpu_load.load(Ordering::Relaxed);
         let peak = self.shared.cpu_peak.load(Ordering::Relaxed);
         widgets::caption(ui, pos2(x, rect.top() + 19.0), "CPU");
+        // LABS shares the CPU column's caption line, right-aligned; a
+        // hairline sets it apart from the CPU caption.
+        let labs = labs_button_rect(rect);
+        p.vline(
+            labs.left() - 7.5,
+            labs.y_range().shrink(2.0),
+            Stroke::new(1.0, BORDER),
+        );
+        if labs_menu::button(ui, labs, self.labs_open).clicked() {
+            self.labs_open = !self.labs_open;
+        }
         let bar = Rect::from_min_size(pos2(x, rect.top() + 28.0), vec2(80.0, 6.0));
         p.rect_filled(bar, CornerRadius::same(3), theme::PANEL_HI);
         let col = |l: f32| {
@@ -1797,8 +1841,91 @@ mod tests {
             vec![button(true)],
             vec![button(false)],
         ] {
-            let _ = ctx.run_ui(frame(events), |ui| app.draw(ui));
+            run_frame(ctx, app, frame(events));
         }
+    }
+
+    /// One editor frame; the texture updates are marked handled (nothing
+    /// renders here, and epaint asserts on dropped ones in debug builds).
+    fn run_frame(ctx: &egui::Context, app: &mut VocalTuneEditor, input: egui::RawInput) {
+        let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+        out.textures_delta.clear();
+    }
+
+    fn key_press(ctx: &egui::Context, app: &mut VocalTuneEditor, key: egui::Key) {
+        let event = |pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [vec![event(true)], vec![event(false)]] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDTH, HEIGHT))),
+                events,
+                ..Default::default()
+            };
+            run_frame(ctx, app, input);
+        }
+    }
+
+    /// The LABS button opens the experiments menu; a row flips its
+    /// experiment in the saved Labs settings (never a host parameter);
+    /// Escape, the button again, or a click elsewhere closes it.
+    #[test]
+    fn labs_menu_toggles_experiments() {
+        let params = Arc::new(VocalTuneParams::default());
+        let mut app = VocalTuneEditor::new(params.clone(), Arc::new(SharedState::default()));
+        let host = Arc::new(TestGui::default());
+        let ctx = egui::Context::default();
+        app.setup(&ctx, GuiContext::new(host.clone()));
+        run_frame(&ctx, &mut app, egui::RawInput::default());
+
+        let header = Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDTH, HEADER_H));
+        let button = labs_button_rect(header).center();
+        click(&ctx, &mut app, button);
+        assert!(app.labs_open, "the button opens the menu");
+
+        // The menu drops from the header's lower edge (never across it),
+        // right-aligned to the button; rows sit under its title: the ribbon
+        // row first, the heat line second.
+        let origin = labs_menu::menu_origin(labs_button_rect(header), header.bottom());
+        assert_eq!(origin.y, HEADER_H + labs_menu::MENU_GAP);
+        assert_eq!(
+            origin.x + labs_menu::MENU_W,
+            labs_button_rect(header).right()
+        );
+        let row = |i: f32| {
+            egui::pos2(
+                900.0,
+                origin.y + labs_menu::TITLE_H + labs_menu::ROW_H * (i + 0.5),
+            )
+        };
+        assert_eq!(params.labs(), crate::labs::LabsSettings::default());
+        click(&ctx, &mut app, row(1.0));
+        assert!(params.labs().heat_line, "heat line switched on");
+        click(&ctx, &mut app, row(0.0));
+        assert!(!params.labs().correction_ribbon, "ribbon switched off");
+        assert!(app.labs_open, "rows keep the menu open");
+        assert_eq!(host.edits.load(Ordering::Relaxed), 0, "no host parameter");
+
+        key_press(&ctx, &mut app, egui::Key::Escape);
+        assert!(!app.labs_open, "Escape closes");
+        click(&ctx, &mut app, button);
+        assert!(app.labs_open);
+        click(&ctx, &mut app, button);
+        assert!(!app.labs_open, "the button closes it again");
+        click(&ctx, &mut app, button);
+        click(&ctx, &mut app, egui::pos2(600.0, 400.0));
+        assert!(!app.labs_open, "a click elsewhere closes");
+        assert_eq!(
+            params.labs(),
+            crate::labs::LabsSettings {
+                correction_ribbon: false,
+                heat_line: true
+            }
+        );
     }
 
     /// HI-4 GUI: while a learned scale is in use the keyboard edits it (not
@@ -1813,7 +1940,7 @@ mod tests {
         let host = Arc::new(TestGui::default());
         let ctx = egui::Context::default();
         app.setup(&ctx, GuiContext::new(host.clone()));
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        run_frame(&ctx, &mut app, egui::RawInput::default());
 
         // Sidebar layout: keyboard rows of 24 px from y = 230, B at the top,
         // so D (pitch class 2) is row 9; the CLEAR button sits at (136, 218).

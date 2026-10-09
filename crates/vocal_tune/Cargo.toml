@@ -19,6 +19,9 @@ nice-plug.workspace = true
 nice-plug-egui.workspace = true
 rtrb.workspace = true
 atomic_float.workspace = true
+# Saved GUI state that is not a parameter (the Labs switches). Same version
+# nice-plug already pulls in for its persistent fields.
+serde = { version = "1.0.229", features = ["derive"] }
 # nice-plug-egui pulls egui in without fonts; enabling `default_fonts` here
 # (same exact version, so Cargo unifies the features) gives the editor text.
 egui = { version = "=0.36.2", default-features = false, features = ["default_fonts"] }

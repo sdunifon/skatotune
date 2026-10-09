@@ -11,6 +11,7 @@
 //! - [`swap`]: structural changes by swapping in an engine built off the
 //!   audio thread.
 //! - [`editor`]: the egui editor with the scrolling pitch graph.
+//! - [`labs`]: opt-in editor experiments (the header's LABS menu).
 //!
 //! # Threads and lifecycle
 //!
@@ -52,6 +53,7 @@ use vt_core::VoiceRange;
 use vt_engine::Engine;
 
 pub mod editor;
+pub mod labs;
 pub mod learn;
 pub mod midi;
 pub mod params;

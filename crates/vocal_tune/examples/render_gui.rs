@@ -10,6 +10,10 @@
 //!          --pending (show a pending latency restart), --learn (MIDI Learn with a
 //!          learned C-E-G scale), --learned (the learned C-E-G scale after leaving
 //!          Learn), --learn-empty (MIDI Learn before any note)
+//!          --transpose=ST, --vibdepth=PCT, --retune=MS (set those knobs, e.g. to
+//!          check the correction colouring under Transpose or flattened vibrato)
+//!   Labs:  --no-ribbon (correction ribbon off; it is on by default), --heat
+//!          (heat-tinted output line on), --labs (the LABS menu open)
 //! sips -s format png out.bmp --out out.png   # macOS, optional
 //! ```
 //!
@@ -260,6 +264,20 @@ fn main() {
     if flag("--learn") || flag("--learn-empty") {
         values.midi_mode = MidiModeChoice::Learn;
     }
+    let number = |name: &str| {
+        args.iter()
+            .find_map(|a| a.strip_prefix(name))
+            .map(|v| v.parse::<f32>().unwrap_or_else(|_| panic!("bad {name}{v}")))
+    };
+    if let Some(st) = number("--transpose=") {
+        values.transpose_st = st;
+    }
+    if let Some(pct) = number("--vibdepth=") {
+        values.vibrato_depth_pct = pct;
+    }
+    if let Some(ms) = number("--retune=") {
+        values.retune_ms = ms;
+    }
     let params = Arc::new(VocalTuneParams::with_values(&values));
     if flag("--learn") || flag("--learned") {
         params
@@ -281,8 +299,18 @@ fn main() {
             .store(1920, Ordering::Relaxed);
     }
 
+    let mut labs = params.labs();
+    if flag("--no-ribbon") {
+        labs.correction_ribbon = false;
+    }
+    if flag("--heat") {
+        labs.heat_line = true;
+    }
+    params.set_labs(labs);
+
     let mut app = VocalTuneEditor::new(params, shared);
     app.set_advanced_open(advanced);
+    app.set_labs_open(flag("--labs"));
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(scale);
     app.setup(&ctx, GuiContext::new(Arc::new(HeadlessHost)));

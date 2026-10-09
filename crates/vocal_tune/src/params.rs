@@ -21,14 +21,16 @@
 //! [`ParamValues::default`] feeds both the parameter objects and the tests so
 //! they cannot drift apart.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
 use nice_plug::prelude::*;
 use vt_core::{
     AnalysisChannel, EngineConfig, EngineKind, LatencyMode, MidiMode, NoteState, QualityTier,
     ScaleKind, Settings, SynthVibrato, VoiceRange,
 };
+
+use crate::labs::LabsSettings;
 
 /// Note names used for keys, note overrides and the GUI (sharps only: the
 /// default egui fonts have no `♯`/`♭` glyphs).
@@ -970,6 +972,10 @@ pub struct VocalTuneParams {
     /// with the project; engine resets and rebuilds never clear it.
     #[persist = "learned-scale"]
     pub learned_scale: AtomicU32,
+    /// Editor experiments switched in the LABS menu ([`crate::labs`]). Saved
+    /// with the project; GUI-only, never read on the audio thread.
+    #[persist = "labs"]
+    pub labs: RwLock<LabsSettings>,
 }
 
 impl Default for VocalTuneParams {
@@ -1087,6 +1093,7 @@ impl VocalTuneParams {
             bend_range: linear("Bend Range", d.bend_range_st, 0.0, 12.0, " st", 0)
                 .with_step_size(1.0),
             learned_scale: AtomicU32::new(0),
+            labs: RwLock::new(LabsSettings::default()),
         }
     }
 
@@ -1100,6 +1107,22 @@ impl VocalTuneParams {
     /// overrides. Atomic store; safe on any thread.
     pub fn clear_learned_scale(&self) {
         self.learned_scale.store(0, Ordering::Relaxed);
+    }
+
+    /// The current Labs switches (GUI thread; a short read lock).
+    pub fn labs(&self) -> LabsSettings {
+        match self.labs.read() {
+            Ok(l) => *l,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Change the Labs switches (GUI thread). Saved with the project.
+    pub fn set_labs(&self, labs: LabsSettings) {
+        match self.labs.write() {
+            Ok(mut l) => *l = labs,
+            Err(poisoned) => *poisoned.into_inner() = labs,
+        }
     }
 
     /// The override parameter of pitch class `pc` (0 = C; wraps modulo 12).
@@ -1424,5 +1447,55 @@ mod tests {
         hashes.sort_unstable();
         hashes.dedup();
         assert_eq!(hashes.len(), map.len(), "parameter id hash collision");
+    }
+
+    /// The Labs switches are saved with the project as the `labs` field and
+    /// come back on load; they are not host parameters.
+    #[test]
+    fn labs_are_saved_with_the_project() {
+        let p = VocalTuneParams::default();
+        assert_eq!(p.labs(), LabsSettings::default());
+        let mine = LabsSettings {
+            correction_ribbon: false,
+            heat_line: true,
+        };
+        p.set_labs(mine);
+        p.learned_scale
+            .store(crate::learn::pack(&[0, 4, 7]), Ordering::Relaxed);
+        let saved = p.serialize_fields();
+        assert!(saved.contains_key("labs"), "{saved:?}");
+        assert!(saved.contains_key("learned-scale"), "{saved:?}");
+        let restored = VocalTuneParams::default();
+        restored.deserialize_fields(&saved);
+        assert_eq!(restored.labs(), mine);
+        assert!(
+            !p.param_map().iter().any(|(id, _, _)| id.contains("lab")),
+            "never a host parameter"
+        );
+
+        // A project saved before Labs existed has no `labs` entry at all:
+        // it loads, and the switches keep their defaults.
+        let mut pre_labs = saved.clone();
+        pre_labs.remove("labs");
+        let old_project = VocalTuneParams::default();
+        old_project.deserialize_fields(&pre_labs);
+        assert_eq!(old_project.labs(), LabsSettings::default());
+        assert_eq!(
+            old_project.learned_scale.load(Ordering::Relaxed),
+            p.learned_scale.load(Ordering::Relaxed),
+            "the rest of the state still loads"
+        );
+
+        // A save from before some switch existed gets that switch's default.
+        let mut older = saved;
+        older.insert("labs".into(), r#"{"heat_line":true}"#.into());
+        restored.deserialize_fields(&older);
+        assert_eq!(
+            restored.labs(),
+            LabsSettings {
+                correction_ribbon: true,
+                heat_line: true
+            }
+        );
     }
 }

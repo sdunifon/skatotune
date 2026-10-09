@@ -3121,6 +3121,7 @@ dependencies = [
  "nice-plug",
  "nice-plug-egui",
  "rtrb",
+ "serde",
  "vt_core",
  "vt_engine",
 ]

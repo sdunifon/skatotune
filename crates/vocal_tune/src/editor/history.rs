@@ -21,12 +21,21 @@ pub fn control_hop(sample_rate: f32) -> u64 {
 pub const HISTORY_CAPACITY: usize = 16_384;
 
 /// Fixed-capacity ring of telemetry frames in arrival (= output time) order.
+///
+/// Each frame is stamped with the Transpose in effect when it arrived
+/// ([`Self::set_transpose`]): frames carry no transpose of their own, and the
+/// graph's correction colouring must not re-judge the shown history against a
+/// Transpose the user has just changed.
 #[derive(Default)]
 pub struct PitchHistory {
     buf: Vec<PitchFrame>,
+    /// Transpose (semitones) stamped on each frame, parallel to `buf`.
+    transpose: Vec<f32>,
     /// Index of the oldest frame.
     head: usize,
     len: usize,
+    /// Stamped on the frames pushed from now on.
+    current_transpose: f32,
 }
 
 impl PitchHistory {
@@ -34,9 +43,15 @@ impl PitchHistory {
     pub fn ensure_allocated(&mut self) {
         if self.buf.is_empty() {
             self.buf = vec![PitchFrame::default(); HISTORY_CAPACITY];
+            self.transpose = vec![0.0; HISTORY_CAPACITY];
             self.head = 0;
             self.len = 0;
         }
+    }
+
+    /// The Transpose (semitones) in effect for the frames pushed from now on.
+    pub fn set_transpose(&mut self, st: f32) {
+        self.current_transpose = st;
     }
 
     #[cfg(test)]
@@ -76,6 +91,9 @@ impl PitchHistory {
         if let Some(slot) = self.buf.get_mut(idx) {
             *slot = frame;
         }
+        if let Some(slot) = self.transpose.get_mut(idx) {
+            *slot = self.current_transpose;
+        }
         if self.len < cap {
             self.len += 1;
         } else {
@@ -112,6 +130,19 @@ impl PitchHistory {
     /// Iterate frames `from..to` (logical indices, clamped).
     pub fn iter_range(&self, from: usize, to: usize) -> impl Iterator<Item = &PitchFrame> + '_ {
         (from..to.min(self.len)).filter_map(move |i| self.get(i))
+    }
+
+    /// Like [`Self::iter_range`], with the Transpose each frame was stamped
+    /// with when it arrived.
+    pub fn iter_range_stamped(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> impl Iterator<Item = (&PitchFrame, f32)> + '_ {
+        (from..to.min(self.len)).filter_map(move |i| {
+            let slot = (self.head + i) % self.buf.len().max(1);
+            Some((self.get(i)?, self.transpose.get(slot).copied()?))
+        })
     }
 
     /// Whether any stored frame is voiced (drives the "No pitch" hint).
@@ -347,6 +378,28 @@ mod tests {
         assert_eq!(h.get(0).unwrap().sample_pos, 10 * 64);
         assert_eq!(h.last().unwrap().sample_pos, (cap as u64 + 9) * 64);
         assert!(h.get(cap).is_none());
+    }
+
+    /// Each frame keeps the Transpose it arrived under, through wrapping.
+    #[test]
+    fn frames_keep_their_transpose_stamp() {
+        let mut h = PitchHistory::default();
+        h.ensure_allocated();
+        let cap = h.capacity() as u64;
+        for i in 0..cap + 100 {
+            h.set_transpose(if i < cap { 0.0 } else { 7.0 });
+            h.push(frame(i * 64));
+        }
+        let stamps: Vec<f32> = h.iter_range_stamped(0, h.len()).map(|(_, t)| t).collect();
+        assert_eq!(stamps.len(), h.len());
+        assert!(stamps[..stamps.len() - 100].iter().all(|t| *t == 0.0));
+        assert!(stamps[stamps.len() - 100..].iter().all(|t| *t == 7.0));
+        let frames: Vec<u64> = h
+            .iter_range_stamped(5, 8)
+            .map(|(f, _)| f.sample_pos)
+            .collect();
+        assert_eq!(frames, vec![105 * 64, 106 * 64, 107 * 64]);
+        assert_eq!(PitchHistory::default().iter_range_stamped(0, 9).count(), 0);
     }
 
     #[test]
