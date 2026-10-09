@@ -11,16 +11,9 @@ use std::time::Instant;
 use vt_core::PitchFrame;
 
 /// Control hop in samples for a sample rate (DESIGN §2.2): the spacing of
-/// telemetry frames. Mirrors `vt_core::hop_for_rate`, which the core crate
-/// adds alongside its DSP modules.
+/// telemetry frames, exactly as the engine uses it.
 pub fn control_hop(sample_rate: f32) -> u64 {
-    if sample_rate <= 50_000.0 {
-        64
-    } else if sample_rate <= 100_000.0 {
-        128
-    } else {
-        256
-    }
+    vt_core::hop_for_rate(sample_rate) as u64
 }
 
 /// Frames kept: > 10 s at the densest telemetry rate (hop 64 at 48 kHz = 750

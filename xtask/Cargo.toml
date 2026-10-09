@@ -1,10 +1,15 @@
 [package]
 name = "xtask"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+license = "ISC"
 publish = false
 
 [dependencies]
 # nice-plug's bundler: turns the compiled cdylib into real .vst3/.clap bundles
 # with the correct macOS bundle layout and Info.plist.
 nice-plug-xtask = "=0.1.1"
+# Third-party notices (LIC-1): the dependency graph and error context. Both
+# are already in the lock file through nice-plug-xtask (same versions).
+cargo_metadata = "=0.23.1"
+anyhow = "=1.0.104"

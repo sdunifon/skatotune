@@ -221,3 +221,261 @@ fn out_of_contract_lengths_never_panic() {
         c.diff_sq(&x, 0, 0, &mut []);
     }
 }
+
+// --- Non-power-of-two ("fast") sizes -------------------------------------
+
+/// Every fast length that is not a power of two, up to 8192.
+fn fast_non_pow2_sizes() -> Vec<usize> {
+    let mut v: Vec<usize> =
+        [3usize, 5, 15].iter().flat_map(|&f| (4..12).map(move |k| f << k)).filter(|&n| n <= 8192).collect();
+    v.sort_unstable();
+    v
+}
+
+/// Brute force: is `n` of the form f·2^k, f ∈ {1,3,5,15}, k ≥ 4?
+fn is_fast(n: usize) -> bool {
+    [1usize, 3, 5, 15].iter().any(|&f| n.is_multiple_of(f) && n / f >= 16 && (n / f).is_power_of_two())
+}
+
+#[test]
+fn fast_len_picks_the_smallest_native_size() {
+    // The detector cells at 48 kHz (W + τ_max + 1) and the P§3.4.1 examples.
+    for (min_len, want) in [
+        (979, 1024),  // HQ Alto/Tenor: already a power of two
+        (1424, 1536), // HQ Low Male
+        (560, 640),   // HQ Soprano
+        (653, 768),   // Eco Alto/Tenor
+        (374, 384),   // Eco Soprano
+        (950, 960),   // Eco Low Male
+        (1536, 1536), // W=1024, τ=512
+        (3072, 3072), // W=2048, τ=1024
+        (1537, 1920),
+        (1056, 1280),
+        (0, 16),
+        (1, 16),
+        (16, 16),
+        (17, 32),
+        (33, 48),
+    ] {
+        assert_eq!(fast_len(min_len), want, "fast_len({min_len})");
+        assert_eq!(FftSizing::Fast.len_for(min_len), want);
+    }
+    // Exhaustive: covers the request, has the right form, never exceeds the
+    // power of two, and no smaller fast length covers it.
+    let mut prev = 0;
+    for m in 1..=20_000usize {
+        let n = fast_len(m);
+        assert!(n >= m && is_fast(n) && n <= m.max(16).next_power_of_two(), "m={m} n={n}");
+        assert!(n >= prev, "monotonic");
+        if m > 16 {
+            assert!(!(m..n).any(is_fast), "m={m}: a fast length below {n} covers it");
+        }
+        prev = n;
+    }
+    // Absurd requests do not panic.
+    let _ = fast_len(usize::MAX);
+    let _ = FftSizing::PowerOfTwo.len_for(usize::MAX);
+}
+
+#[test]
+fn sizing_policies_and_backends() {
+    // PowerOfTwo is exactly the `new` behaviour.
+    for n in [0usize, 1, 2, 3, 100, 979, 1024, 1424, 3072] {
+        for be in backends() {
+            let a = Correlator::new(n, be);
+            let b = Correlator::with_sizing(n, be, FftSizing::PowerOfTwo);
+            assert_eq!((a.len(), a.backend()), (b.len(), b.backend()), "n={n}");
+            assert_eq!(FftSizing::default(), FftSizing::PowerOfTwo);
+        }
+    }
+    // Fast sizes are planned exactly, and vDSP takes every one of them (no
+    // silent fallback to realfft on macOS).
+    for n in fast_non_pow2_sizes() {
+        let r = Correlator::with_sizing(n, FftBackend::RealFft, FftSizing::Fast);
+        assert_eq!((r.len(), r.backend()), (n, FftBackend::RealFft));
+        let v = Correlator::with_sizing(n - 1, FftBackend::Vdsp, FftSizing::Fast);
+        assert_eq!(v.len(), n);
+        let want = if cfg!(target_os = "macos") { FftBackend::Vdsp } else { FftBackend::RealFft };
+        assert_eq!(v.backend(), want, "n={n}");
+        // Clone keeps the exact size (it used to re-plan through `new`, which
+        // rounds up to a power of two).
+        let c = v.clone();
+        assert_eq!((c.len(), c.backend()), (v.len(), v.backend()));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn vdsp_accepts_every_documented_length() {
+    for n in 2..=8192usize {
+        let documented = super::vdsp::documented_len(n);
+        assert_eq!(documented, n.is_power_of_two() || (is_fast(n) && n >= 48), "n={n}");
+        if documented {
+            assert!(super::vdsp::Plan::new(n).is_some(), "vDSP rejected documented length {n}");
+        } else {
+            assert!(super::vdsp::Plan::new(n).is_none(), "n={n}");
+        }
+    }
+}
+
+#[test]
+fn fast_size_correlations_match_direct() {
+    for n in fast_non_pow2_sizes() {
+        for be in backends() {
+            let mut c = Correlator::with_sizing(n, be, FftSizing::Fast);
+            assert_eq!(c.len(), n);
+            let be = c.backend();
+            // Detector-shaped: a = W head, b = W + τ buffer, τ + 1 lags with
+            // W + τ + 1 = n (the tightest exact fit), plus looser shapes.
+            let w = (2 * n) / 3;
+            let tau = n - w - 1;
+            for &(la, lb, lags) in &[(w, w + tau, tau + 1), (n / 2, n, n / 2), (1, n, 3), (n / 4, n / 2, n / 4)] {
+                let a = signal(la, 3 + n as u64);
+                let b = signal(lb, 4 + n as u64);
+                let mut out = vec![f32::NAN; lags];
+                c.cross_correlate(&a, &b, &mut out);
+                let e = rel_err(&out, &direct_xcorr(&a, &b, lags), &a, &b);
+                assert!(e < 1e-4, "{be:?} n={n} la={la} lb={lb}: rel err {e:e}");
+            }
+            let x = signal(n / 2, 9 + n as u64);
+            let mut out = vec![0.0f32; n / 2 + 1];
+            c.autocorrelate(&x, &mut out);
+            let e = rel_err(&out, &direct_xcorr(&x, &x, n / 2 + 1), &x, &x);
+            assert!(e < 1e-4, "{be:?} n={n} acf: rel err {e:e}");
+            assert!((out[0] as f64 - energy(&x)).abs() / energy(&x) < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn fast_size_power_spectrum_matches_direct_dft() {
+    for n in [48usize, 80, 240, 384, 640, 768, 1280, 1536] {
+        for be in backends() {
+            let mut c = Correlator::with_sizing(n, be, FftSizing::Fast);
+            let be = c.backend();
+            let x = signal(n - 5, 13 + n as u64);
+            let mut out = vec![0.0f32; n / 2 + 1];
+            c.power_spectrum(&x, &mut out);
+            let e_tot = energy(&x) * n as f64;
+            for (k, &got) in out.iter().enumerate() {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (j, &v) in x.iter().enumerate() {
+                    let ph = -2.0 * core::f64::consts::PI * ((j * k) % n) as f64 / n as f64;
+                    re += v as f64 * ph.cos();
+                    im += v as f64 * ph.sin();
+                }
+                let r = re * re + im * im;
+                assert!((got as f64 - r).abs() / e_tot < 1e-6, "{be:?} n={n} k={k}: {got} vs {r}");
+            }
+        }
+        // Unit sine on bin 5 → |X|² = (n/2)², Nyquist and DC empty.
+        for be in backends() {
+            let mut c = Correlator::with_sizing(n, be, FftSizing::Fast);
+            let x: Vec<f32> = (0..n).map(|i| (2.0 * core::f32::consts::PI * 5.0 * i as f32 / n as f32).sin()).collect();
+            let mut out = vec![0.0f32; n / 2 + 1];
+            c.power_spectrum(&x, &mut out);
+            let h = (n / 2) as f32;
+            assert!((out[5] / (h * h) - 1.0).abs() < 1e-4, "{be:?} n={n}: {}", out[5]);
+            assert!(out[0] < 1e-3 * h && out[n / 2] < 1e-3 * h, "{be:?} n={n}");
+        }
+    }
+}
+
+#[test]
+fn fast_size_diff_sq_matches_direct_and_pow2() {
+    // Detector cells at 48 kHz (W, τ_max) plus the P§3.4.1 configurations.
+    for &(w, tmax) in &[(1024usize, 512usize), (2048, 1024), (960, 463), (377, 182), (440, 212), (480, 288)] {
+        let x = signal(w + tmax, 41 + w as u64);
+        let mut direct = vec![0.0f32; tmax + 1];
+        crate::simd::diff_sq(&x, w, 0, &mut direct);
+        for be in backends() {
+            let mut fast = Correlator::with_sizing(w + tmax + 1, be, FftSizing::Fast);
+            let mut pow2 = Correlator::new(w + tmax + 1, be);
+            assert!(fast.len() <= pow2.len() && fast.len() > w + tmax);
+            let (mut df, mut dp) = (vec![0.0f32; tmax + 1], vec![0.0f32; tmax + 1]);
+            fast.diff_sq(&x, w, 0, &mut df);
+            pow2.diff_sq(&x, w, 0, &mut dp);
+            let e0 = energy(&x[..w]);
+            for (k, ((&f, &p), &d)) in df.iter().zip(&dp).zip(&direct).enumerate() {
+                let scale = e0 + energy(x.get(k..(k + w).min(x.len())).unwrap_or(&[]));
+                assert!(((f - d) as f64).abs() / scale < 1e-5, "{be:?} w={w} n={} k={k}: {f} vs {d}", fast.len());
+                assert!(((f - p) as f64).abs() / scale < 1e-5, "{be:?} w={w} k={k}: fast {f} vs pow2 {p}");
+            }
+        }
+    }
+}
+
+#[test]
+fn fast_size_backends_agree_and_repeat() {
+    let n = 1536;
+    let mut r = Correlator::with_sizing(n, FftBackend::RealFft, FftSizing::Fast);
+    let mut v = Correlator::with_sizing(n, FftBackend::Vdsp, FftSizing::Fast);
+    let a = signal(1024, 51);
+    let b = signal(1535, 52);
+    let (mut o1, mut o2, mut o3) = (vec![0.0f32; 512], vec![0.0f32; 512], vec![0.0f32; 512]);
+    r.cross_correlate(&a, &b, &mut o1);
+    v.cross_correlate(&a, &b, &mut o2);
+    let norm = (energy(&a) * energy(&b)).sqrt();
+    for (x, y) in o1.iter().zip(&o2) {
+        assert!(((x - y) as f64).abs() / norm < 1e-5);
+    }
+    r.cross_correlate(&a, &b, &mut o3);
+    assert_eq!(o1, o3);
+    // Out-of-contract lengths at a fast size: truncation and zeroed tails.
+    let big = signal(4000, 53);
+    let mut out = vec![f32::NAN; 2000];
+    v.cross_correlate(&big, &big, &mut out);
+    assert!(out.iter().all(|x| x.is_finite()) && out[n..].iter().all(|&x| x == 0.0));
+    let mut spec = vec![f32::NAN; 1000];
+    v.power_spectrum(&big, &mut spec);
+    assert!(spec[n / 2 + 1..].iter().all(|&x| x == 0.0));
+}
+
+/// DESIGN §2.1 rule 6: identical input must give bit-identical output, also
+/// across separately constructed correlators (a new engine instance, a
+/// re-activated plugin, an offline render). vDSP selects differently rounded
+/// code paths by buffer alignment, so this failed for `Vdsp` whenever the
+/// allocator placed a plan's split buffers at a different offset mod 64.
+#[test]
+fn results_do_not_depend_on_the_instance() {
+    for be in backends() {
+        for (len, sizing) in [
+            (979usize, FftSizing::PowerOfTwo),
+            (1424, FftSizing::PowerOfTwo),
+            (1424, FftSizing::Fast),
+            (653, FftSizing::Fast),
+        ] {
+            let x = signal(len, 61 + len as u64);
+            let w = 2 * len / 3;
+            let lags = len - w;
+            let run = |c: &mut Correlator| {
+                let mut xc = vec![0.0f32; lags];
+                let mut ac = vec![0.0f32; lags];
+                let mut ps = vec![0.0f32; c.len() / 2 + 1];
+                c.cross_correlate(&x[..w], &x, &mut xc);
+                c.autocorrelate(&x[..w], &mut ac);
+                c.power_spectrum(&x, &mut ps);
+                [xc, ac, ps].concat().iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+            };
+            let mut first: Option<Vec<u32>> = None;
+            // Keep every instance (and odd-sized spacer allocations) alive so
+            // the allocator hands out buffers at varied addresses.
+            let (mut spacers, mut alive) = (Vec::new(), Vec::new());
+            for k in 0..200usize {
+                spacers.push(vec![0u8; 1 + (k * 37) % 4093]);
+                let mut c = Correlator::with_sizing(len, be, sizing);
+                let bits = run(&mut c);
+                match &first {
+                    None => first = Some(bits),
+                    Some(f) => assert!(
+                        *f == bits,
+                        "{:?} n={} instance {k} differs bitwise from instance 0",
+                        c.backend(),
+                        c.len()
+                    ),
+                }
+                alive.push(c);
+            }
+        }
+    }
+}

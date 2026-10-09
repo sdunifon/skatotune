@@ -88,7 +88,9 @@ impl RtBenchRow {
 pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<RtBenchRow> {
     let sr = opts.sample_rate;
     // Realistic material: the male melody (voiced/unvoiced changes, consonants).
-    let material = scenarios::build("melody_male", sr).map(|s| s.signal.audio).unwrap_or_else(|| vec![0.0; sr as usize]);
+    let material = scenarios::build("melody_male", sr)
+        .map(|s| s.signal.audio)
+        .unwrap_or_else(|| vec![0.0; sr as usize]);
     let warmup = (0.5 * sr as f64) as usize;
     let timed = (opts.seconds * sr as f64) as usize;
     let mut rows = Vec::new();
@@ -104,7 +106,12 @@ pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<
                     voice_range: VoiceRange::AltoTenor,
                     ..EngineConfig::default()
                 };
-                let settings = Settings { tier, engine: default_engine(mode), retune_ms: 10.0, ..scenarios::settings_for(0, vt_core::ScaleKind::Major) };
+                let settings = Settings {
+                    tier,
+                    engine: default_engine(mode),
+                    retune_ms: 10.0,
+                    ..scenarios::settings_for(0, vt_core::ScaleKind::Major)
+                };
                 let mut engine = Engine::new(cfg);
                 engine.set_settings(&settings);
                 let mut bufs: Vec<Vec<f32>> = vec![vec![0.0; buffer]; cfg.channels];
@@ -115,7 +122,10 @@ pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<
                 while done < warmup + timed {
                     for b in io.iter_mut() {
                         for (i, v) in b.iter_mut().enumerate() {
-                            *v = material.get((pos + i) % material.len().max(1)).copied().unwrap_or(0.0);
+                            *v = material
+                                .get((pos + i) % material.len().max(1))
+                                .copied()
+                                .unwrap_or(0.0);
                         }
                     }
                     let t0 = Instant::now();
@@ -172,7 +182,12 @@ mod tests {
         let rows = run(&opts, &mut |_| {});
         assert_eq!(rows.len(), 1);
         let r = rows[0];
-        assert!(r.blocks >= 30 && r.p50_us <= r.p99_us && r.p99_us <= r.p999_us && r.p999_us <= r.max_us);
+        assert!(
+            r.blocks >= 30
+                && r.p50_us <= r.p99_us
+                && r.p99_us <= r.p999_us
+                && r.p999_us <= r.max_us
+        );
         assert!((r.period_us - 1333.33).abs() < 0.1);
     }
 }

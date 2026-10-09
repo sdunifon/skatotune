@@ -7,7 +7,9 @@
 //! ```text
 //! cargo run -p vocal_tune --features demo-telemetry --example render_gui -- out.bmp [seconds] [scale] [flags]
 //!   flags: --advanced (open the drawer), --studio (Studio mode), --hard (Hard Tune preset),
-//!          --pending (show a pending latency restart)
+//!          --pending (show a pending latency restart), --learn (MIDI Learn with a
+//!          learned C-E-G scale), --learned (the learned C-E-G scale after leaving
+//!          Learn), --learn-empty (MIDI Learn before any note)
 //! sips -s format png out.bmp --out out.png   # macOS, optional
 //! ```
 //!
@@ -29,7 +31,8 @@ use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::*;
 use vocal_tune::editor::{HEIGHT, VocalTuneEditor, WIDTH};
 use vocal_tune::params::{
-    KeyChoice, LatencyModeChoice, NoteOverride, ParamValues, Preset, ScaleChoice, VocalTuneParams,
+    KeyChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues, Preset, ScaleChoice,
+    VocalTuneParams,
 };
 use vocal_tune::shared::SharedState;
 
@@ -254,15 +257,25 @@ fn main() {
     if flag("--hard") {
         values = Preset::HardTune.apply(&values);
     }
+    if flag("--learn") || flag("--learn-empty") {
+        values.midi_mode = MidiModeChoice::Learn;
+    }
     let params = Arc::new(VocalTuneParams::with_values(&values));
+    if flag("--learn") || flag("--learned") {
+        params
+            .learned_scale
+            .store(vocal_tune::learn::pack(&[0, 4, 7]), Ordering::Relaxed);
+    }
     let shared = Arc::new(SharedState::default());
     shared.sample_rate.store(48_000.0, Ordering::Relaxed);
-    shared.latency_samples.store(192, Ordering::Relaxed);
+    let d = if flag("--studio") { 1920 } else { 192 };
+    shared.latency_samples.store(d, Ordering::Relaxed);
     shared.cpu_load.store(0.014, Ordering::Relaxed);
     shared.cpu_peak.store(0.031, Ordering::Relaxed);
     if flag("--pending") {
         // A structural change waiting for the host restart.
         shared.restart_pending.store(true, Ordering::Relaxed);
+        shared.awaiting_host.store(true, Ordering::Relaxed);
         shared
             .pending_latency_samples
             .store(1920, Ordering::Relaxed);

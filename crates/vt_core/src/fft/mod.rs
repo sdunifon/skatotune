@@ -1,6 +1,6 @@
 //! FFT-based correlation and spectra for the pitch detector (R§8.4).
 //!
-//! [`Correlator`] wraps one fixed power-of-two real FFT size with all scratch
+//! [`Correlator`] wraps one fixed real FFT size with all scratch
 //! preallocated, exposing exactly what the NSDF / type-I CMNDF verifier needs:
 //! linear cross-correlation, autocorrelation, power spectra and the type-I
 //! difference function. Two backends:
@@ -8,19 +8,32 @@
 //! * [`FftBackend::RealFft`]: the `realfft` crate (rustfft underneath, NEON /
 //!   AVX kernels), portable.
 //! * [`FftBackend::Vdsp`]: Apple Accelerate `vDSP_DFT_zrop` through a small
-//!   hand-written FFI (macOS only). Measured on the M4 Max: r2c 2048 in
-//!   0.94 µs vs 1.73 µs for realfft, 26-31 % faster for the whole detector
-//!   block. Elsewhere, or for lengths vDSP does not implement, it silently
-//!   falls back to `RealFft` ([`Correlator::backend`] reports what is used).
+//!   hand-written FFI (macOS only), 1.4-2.4× faster than realfft per
+//!   transform on the M4 Max and bit-reproducible across instances (its split
+//!   buffers are cache-line aligned; see the `vdsp` module). Elsewhere, or for
+//!   lengths vDSP does not implement, it silently falls back to `RealFft`
+//!   ([`Correlator::backend`] reports what is used).
+//!
+//! Transform sizes ([`FftSizing`]): [`Correlator::new`] rounds up to a power
+//! of two; [`Correlator::with_sizing`] with [`FftSizing::Fast`] picks the
+//! smallest `f·2^k`, f ∈ {1, 3, 5, 15}, k ≥ 4, that covers the request
+//! ([`fast_len`]; P§3.4.1). Those lengths are native to both backends
+//! (vDSP's zrop DFT implements exactly 2^k and f·2^k; realfft runs them on
+//! radix-2/3/5 kernels), so a detector buffer of W + τ_max samples is
+//! transformed at e.g. 1536 instead of 2048 or 3072 instead of 4096. Linear
+//! correlation only needs `n ≥ a.len() + out.len() − 1`, so a smaller n is
+//! exact; see `docs/PERFORMANCE.md` for the measured gain per size.
 //!
 //! Both backends produce results on the same (true DFT) scale; tests check
-//! them against a direct O(n²) correlation.
+//! them against a direct O(n²) correlation at power-of-two and fast sizes.
 //!
-//! Measured on the M4 Max (`benches/kernels.rs`): autocorrelation (forward +
-//! inverse) at n = 2048: realfft 3.63 µs, vDSP 2.31 µs; power spectrum
-//! (forward only) at 2048: 1.84 µs vs 1.07 µs; type-I difference for
-//! W = 1024 / τ = 512: realfft 5.8 µs, vDSP 4.2 µs (direct NEON: 16.3 µs);
-//! W = 2048 / τ = 1024: 12.2 µs, 8.6 µs (direct NEON: 66.9 µs).
+//! Measured on the M4 Max (`benches/kernels.rs`, best-of-rounds medians;
+//! full tables in `docs/PERFORMANCE.md`): autocorrelation (forward + inverse)
+//! at n = 2048: realfft 3.56 µs, vDSP 2.02 µs; power spectrum (forward only)
+//! at 2048: 1.85 µs vs 1.07 µs; type-I difference for W = 1024 / τ = 512:
+//! realfft 5.85 µs at n = 2048 and 4.47 µs at n = 1536, vDSP 3.64 / 3.42 µs
+//! (direct NEON: 16.4 µs); W = 2048 / τ = 1024: realfft 12.7 / 9.7 µs at
+//! n = 4096 / 3072, vDSP 7.5 / 5.9 µs (direct NEON: 66.4 µs).
 
 #[cfg(target_os = "macos")]
 mod vdsp;
@@ -45,6 +58,59 @@ impl FftBackend {
     pub fn best() -> Self {
         if cfg!(target_os = "macos") { FftBackend::Vdsp } else { FftBackend::RealFft }
     }
+}
+
+/// How a [`Correlator`] turns a requested minimum length into its transform
+/// size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FftSizing {
+    /// The next power of two (minimum 2): the [`Correlator::new`] behaviour.
+    #[default]
+    PowerOfTwo,
+    /// The smallest `f·2^k ≥ min_len` with f ∈ {1, 3, 5, 15} and k ≥ 4
+    /// ([`fast_len`]): never larger than the power of two, native to vDSP and
+    /// fast in realfft. E.g. 1424 → 1536, 560 → 640, 3072 → 3072.
+    Fast,
+}
+
+impl FftSizing {
+    /// The transform size this policy picks for a request of `min_len`
+    /// samples. Always even and ≥ `min_len` (for any realistic length).
+    pub fn len_for(self, min_len: usize) -> usize {
+        match self {
+            FftSizing::PowerOfTwo => pow2_len(min_len),
+            FftSizing::Fast => fast_len(min_len),
+        }
+    }
+}
+
+/// Smallest power of two ≥ `min_len` (minimum 2), saturating at the largest
+/// representable power of two.
+fn pow2_len(min_len: usize) -> usize {
+    min_len.max(2).checked_next_power_of_two().unwrap_or(1 << (usize::BITS - 1))
+}
+
+/// Smallest length `f·2^k ≥ min_len` with f ∈ {1, 3, 5, 15} and k ≥ 4
+/// (minimum 16): the sizes Apple's `vDSP_DFT_zrop` implements, and ones
+/// realfft decomposes into radix-2/3/5 passes (P§3.4.1, P§3.5). Never larger
+/// than the next power of two. Examples: 979 → 1024, 1424 → 1536,
+/// 1536 → 1536, 653 → 768, 560 → 640, 1056 → 1280.
+///
+/// Requests beyond the largest representable candidate get the power-of-two
+/// answer of [`FftSizing::PowerOfTwo`].
+pub fn fast_len(min_len: usize) -> usize {
+    let pow2 = pow2_len(min_len.max(16));
+    [3usize, 5, 15]
+        .into_iter()
+        .filter_map(|f| {
+            // Smallest f·2^k ≥ min_len with k ≥ 4, if it fits in usize.
+            let mut n = f << 4;
+            while n < min_len {
+                n = n.checked_mul(2)?;
+            }
+            Some(n)
+        })
+        .fold(pow2, usize::min)
 }
 
 /// realfft plans and scratch.
@@ -91,12 +157,14 @@ impl RealPlan {
 
     /// Inverse of `spec_a` into `time`, then `out[τ] = time[τ] / n`.
     fn inverse_a_to(&mut self, out: &mut [f32]) -> bool {
-        // A real signal's spectrum has exactly real DC and Nyquist bins;
-        // enforce it so realfft does not report invalid input.
+        // A real signal's spectrum has exactly real DC and (for even n)
+        // Nyquist bins; enforce it so realfft does not report invalid input.
         if let Some(c) = self.spec_a.first_mut() {
             c.im = 0.0;
         }
-        if let Some(c) = self.spec_a.last_mut() {
+        if self.time.len().is_multiple_of(2)
+            && let Some(c) = self.spec_a.last_mut()
+        {
             c.im = 0.0;
         }
         if self.inv.process_with_scratch(&mut self.spec_a, &mut self.time, &mut self.scratch).is_err() {
@@ -147,10 +215,11 @@ enum Plan {
     Vdsp(vdsp::Plan),
 }
 
-/// FFT-based linear correlation and spectra for a fixed power-of-two size.
-/// All scratch is preallocated in [`Correlator::new`]; every method is
-/// allocation-free and never panics (out-of-contract lengths are truncated
-/// and unfilled outputs are zeroed).
+/// FFT-based linear correlation and spectra for a fixed transform size (a
+/// power of two from [`Correlator::new`], or any [`FftSizing`] from
+/// [`Correlator::with_sizing`]). All scratch is preallocated at construction;
+/// every method is allocation-free and never panics (out-of-contract lengths
+/// are truncated and unfilled outputs are zeroed).
 pub struct Correlator {
     n: usize,
     backend: FftBackend,
@@ -163,7 +232,20 @@ impl Correlator {
     /// with the requested backend. `Vdsp` falls back to `RealFft` off macOS or
     /// if vDSP rejects the length.
     pub fn new(n: usize, backend: FftBackend) -> Self {
-        let n = n.max(2).next_power_of_two();
+        Self::with_sizing(n, backend, FftSizing::PowerOfTwo)
+    }
+
+    /// Plans transforms of size `sizing.len_for(min_len)` with the requested
+    /// backend (same fallback rule as [`Correlator::new`]). For the detector's
+    /// type-I frame, `min_len = W + τ_max + 1` makes every lag exact;
+    /// [`FftSizing::Fast`] then gives e.g. 1536 where `new` gives 2048.
+    /// Allocates: call it off the audio thread.
+    pub fn with_sizing(min_len: usize, backend: FftBackend, sizing: FftSizing) -> Self {
+        Self::with_exact_len(sizing.len_for(min_len), backend)
+    }
+
+    /// Plans exactly `n` (an even length from [`FftSizing::len_for`]).
+    fn with_exact_len(n: usize, backend: FftBackend) -> Self {
         #[cfg(target_os = "macos")]
         if backend == FftBackend::Vdsp
             && let Some(p) = vdsp::Plan::new(n)
@@ -294,7 +376,7 @@ impl Clone for Correlator {
     /// never observable, so this is equivalent). Allocates: not for the audio
     /// thread.
     fn clone(&self) -> Self {
-        Self::new(self.n, self.backend)
+        Self::with_exact_len(self.n, self.backend)
     }
 }
 

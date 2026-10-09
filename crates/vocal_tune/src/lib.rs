@@ -6,7 +6,10 @@
 //! - [`params`]: every host parameter, the stable ids, and the pure mapping
 //!   from parameter values to the engine's `Settings` and structural config.
 //! - [`midi`]: host note events → the control law's MIDI vocabulary.
+//! - [`learn`]: MIDI Learn Scale, kept as saved user state.
 //! - [`shared`]: atomics and the telemetry mailbox shared with the editor.
+//! - [`swap`]: structural changes by swapping in an engine built off the
+//!   audio thread.
 //! - [`editor`]: the egui editor with the scrolling pitch graph.
 //!
 //! # Threads and lifecycle
@@ -18,14 +21,25 @@
 //!
 //! `process()` copies the parameters into `Settings` (atomic loads, no
 //! allocation), converts MIDI into a fixed array, runs the engine, applies the
-//! output gain and updates the CPU meter. When the user changes a structural
-//! parameter, `process()` tells the host exactly once and keeps running the
-//! old engine until the host re-activates the plugin: VST3 gets the new
-//! latency (nice-plug turns that into `restartComponent(kLatencyChanged)`),
-//! CLAP gets a restart request and learns the latency in `activate()` (the
-//! only place CLAP allows it to change). The standalone wrapper cannot
-//! restart plugins, so there the editor reloads the plugin state, which
-//! re-runs `activate()`.
+//! output gain and updates the CPU meter.
+//!
+//! When the user changes a structural parameter and leaves it alone for
+//! [`STRUCTURAL_SETTLE_S`] (so a drag or a burst of clicks costs one rebuild,
+//! not one per step), the new engine is built on nice-plug's background
+//! thread and `process()` swaps it in at a block boundary behind a 3 ms fade
+//! ([`swap`]); nothing is built or freed on the audio thread. A VST3 host
+//! hears about a new latency only after that swap (nice-plug turns it into
+//! `restartComponent(kLatencyChanged)`), so the latency it reads is always
+//! that of the running engine, whether it re-activates us promptly, late or
+//! not at all (HI-1); the request is repeated at 1, 3 and 7 s until it does
+//! re-activate, in case it dropped the first one (R§9.5). A change that keeps
+//! the latency needs no host involvement (HI-3): a voice-range change is
+//! applied by the running engine itself (`Engine::set_voice_range`, at once,
+//! behind its own fade), any other one is swapped. CLAP only allows a latency
+//! change inside `activate()`, so a CLAP change that moves the latency asks
+//! the host for a restart and the engine is rebuilt there; the editor offers
+//! the request again as a click if the host takes its time. The standalone
+//! has no host restart and always swaps.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -34,16 +48,37 @@ use std::time::Instant;
 
 use nice_plug::prelude::*;
 use nice_plug_egui::{EguiEditor, EguiEditorState, RepaintNotifier};
+use vt_core::VoiceRange;
 use vt_engine::Engine;
 
 pub mod editor;
+pub mod learn;
 pub mod midi;
 pub mod params;
 pub mod shared;
+pub mod swap;
 
+use learn::LearnTracker;
 use midi::MidiBuffer;
 use params::{ParamValues, Structural, VocalTuneParams};
 use shared::{CpuMeter, SharedState, pack_states};
+use swap::{EngineBuilder, EngineSwapAudio, EngineTask, SwapFade};
+
+/// A structural change must stay unchanged this long (seconds of audio)
+/// before the host is asked to restart. Dragging the Live+/Studio value or
+/// clicking through latency modes would otherwise restart once per step
+/// (R§9.5 warns about rapid latency toggling).
+pub const STRUCTURAL_SETTLE_S: f32 = 0.25;
+
+/// Input at or below this magnitude counts as silence for the CLAP sleep
+/// decision (−120 dBFS).
+const QUIET_LEVEL: f32 = 1e-6;
+
+/// VST3: seconds after a latency change at which `kLatencyChanged` is sent
+/// again while the host has not re-activated the plugin. A host may drop the
+/// first request (no component handler yet, e.g. a state restored during
+/// project load, R§9.5); a few spaced retries, never a stream.
+pub const LATENCY_RETRY_AT_S: [f32; 3] = [1.0, 3.0, 7.0];
 
 /// The plugin instance. `pub` so the standalone binary can export it.
 pub struct VocalTune {
@@ -55,16 +90,43 @@ pub struct VocalTune {
     /// The editor app until the wrapper asks for it (queried once).
     editor_app: Option<editor::VocalTuneEditor>,
 
-    engine: Option<Engine>,
+    /// Boxed so the standalone can swap engines by moving a pointer.
+    engine: Option<Box<Engine>>,
+    /// Input samples the engine has processed since it was built or reset
+    /// (mirrors its sample clock, so MIDI can be grouped by control hop).
+    engine_pos: u64,
     /// What the running engine was built for.
     active: Option<Active>,
-    /// Structural configuration already reported to the host and waiting for
-    /// a restart, so the request is made exactly once per change.
+    /// Structural configuration requested (engine build or host restart) and
+    /// not running yet, so the request is made exactly once per change.
     requested: Option<Structural>,
+    /// A structural change waiting to settle, and how long (samples) it has
+    /// been unchanged.
+    settling: Option<(Structural, u64)>,
     /// Latency last reported to the host.
     reported_latency: u32,
     midi: MidiBuffer,
+    learn: LearnTracker,
+    /// Consecutive quiet input samples (CLAP sleep decision).
+    quiet_run: u64,
+    /// Audio-thread half of the engine handoff.
+    swap: EngineSwapAudio,
+    /// Builds engines on the background thread (the task executor's state).
+    builder: Arc<EngineBuilder>,
+    /// Output fades around an engine swap.
+    fade: SwapFade,
+    /// VST3: a latency change the host has not re-activated us for yet.
+    latency_retry: Option<LatencyRetry>,
     cpu: CpuMeter,
+}
+
+/// Progress of the VST3 latency re-requests ([`LATENCY_RETRY_AT_S`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LatencyRetry {
+    /// Samples processed since the latency was reported.
+    waited: u64,
+    /// Re-requests sent so far.
+    sent: usize,
 }
 
 /// The configuration the running engine was built with.
@@ -75,12 +137,30 @@ struct Active {
     max_block: usize,
     engine_channels: usize,
     latency: u32,
+    /// Quiet input needed before the output is certainly silent: D plus the
+    /// worst content wander and the unvoiced fade.
+    quiet_tail: u64,
+}
+
+/// Samples of silent input after which the engine's output is silent too:
+/// the reported latency, plus two of the range's longest periods (PSOLA and
+/// Classic content wander stays within about one period, R§2.1), plus 10 ms
+/// for the voiced → dry crossfade.
+fn quiet_tail(latency: u32, sample_rate: f32, range: VoiceRange) -> u64 {
+    let sr = if sample_rate.is_finite() && sample_rate > 0.0 {
+        sample_rate
+    } else {
+        48_000.0
+    };
+    let t_max = sr / range.f_min().max(1.0);
+    u64::from(latency) + (2.0 * t_max + 0.01 * sr).ceil() as u64
 }
 
 impl Default for VocalTune {
     fn default() -> Self {
         let params = Arc::new(VocalTuneParams::default());
         let shared = Arc::new(SharedState::default());
+        let (swap_audio, swap_builder) = swap::engine_swap_channel();
         let editor_app = editor::VocalTuneEditor::new(params.clone(), shared.clone());
         Self {
             params,
@@ -89,10 +169,18 @@ impl Default for VocalTune {
             repaint: RepaintNotifier::new(),
             editor_app: Some(editor_app),
             engine: None,
+            engine_pos: 0,
             active: None,
             requested: None,
+            settling: None,
             reported_latency: 0,
             midi: MidiBuffer::default(),
+            learn: LearnTracker::default(),
+            quiet_run: 0,
+            swap: swap_audio,
+            builder: Arc::new(EngineBuilder::new(swap_builder)),
+            fade: SwapFade::new(48_000.0),
+            latency_retry: None,
             cpu: CpuMeter::new(48_000.0),
         }
     }
@@ -108,6 +196,9 @@ pub trait BlockHost {
     fn set_latency_samples(&mut self, samples: u32);
     /// Ask the host to deactivate and re-activate the plugin.
     fn request_restart(&mut self);
+    /// Run `task` on nice-plug's background thread (the plugin's task
+    /// executor, [`VocalTune::run_task`]).
+    fn execute_background(&mut self, task: EngineTask);
     /// Which wrapper is hosting us (the restart protocol differs per format).
     fn api(&self) -> PluginApi;
 }
@@ -125,6 +216,10 @@ impl<C: ProcessContext<VocalTune>> BlockHost for ContextHost<'_, C> {
 
     fn request_restart(&mut self) {
         self.0.request_restart();
+    }
+
+    fn execute_background(&mut self, task: EngineTask) {
+        self.0.execute_background(task);
     }
 
     fn api(&self) -> PluginApi {
@@ -151,14 +246,19 @@ impl VocalTune {
         // only rebuild when the configuration actually changed.
         let reuse = self.engine.as_ref().is_some_and(|e| *e.config() == cfg);
         if !reuse {
-            let mut engine = Engine::new(cfg);
+            // A fresh engine starts silent; no swap fade applies to it.
+            self.fade = SwapFade::new(sample_rate);
+            let mut engine = Box::new(Engine::new(cfg));
             if let Some(consumer) = engine.take_telemetry() {
                 self.shared.install_telemetry(consumer);
             }
-            // The previous engine (if any) is dropped here, off the audio thread.
+            // The previous engine (if any) is dropped here. In a DAW this is
+            // never the audio thread; the standalone never re-activates for a
+            // structural change (it swaps engines built on the GUI thread).
             self.engine = Some(engine);
+            self.engine_pos = 0;
         }
-        let latency = self.engine.as_ref().map_or(0, Engine::latency_samples);
+        let latency = self.engine.as_ref().map_or(0, |e| e.latency_samples());
 
         self.active = Some(Active {
             structural,
@@ -166,13 +266,25 @@ impl VocalTune {
             max_block: cfg.max_block,
             engine_channels,
             latency,
+            quiet_tail: quiet_tail(latency, sample_rate, structural.voice_range),
         });
         self.requested = None;
+        self.settling = None;
+        self.quiet_run = 0;
         self.reported_latency = latency;
+        // The host re-activated us: any latency change has reached it.
+        self.latency_retry = None;
         self.cpu = CpuMeter::new(sample_rate);
         self.shared
             .sample_rate
             .store(sample_rate, Ordering::Relaxed);
+        self.shared.max_block.store(
+            u32::try_from(cfg.max_block).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        self.shared
+            .engine_channels
+            .store(engine_channels as u32, Ordering::Relaxed);
         self.shared
             .latency_samples
             .store(latency, Ordering::Relaxed);
@@ -180,6 +292,7 @@ impl VocalTune {
             .pending_latency_samples
             .store(latency, Ordering::Relaxed);
         self.shared.restart_pending.store(false, Ordering::Release);
+        self.shared.awaiting_host.store(false, Ordering::Relaxed);
         latency
     }
 
@@ -188,9 +301,36 @@ impl VocalTune {
         self.active.map(|a| a.latency)
     }
 
-    /// Whether a structural change is waiting for the host to restart us.
+    /// Whether a structural change is requested but not running yet.
     pub fn restart_pending(&self) -> bool {
         self.requested.is_some()
+    }
+
+    /// The background-task executor's work: build an engine, or free
+    /// returned ones and pass telemetry to the editor ([`swap`]). Runs on
+    /// nice-plug's background thread; allocates. `pub` so tests and tools
+    /// can play the background thread's part.
+    pub fn run_task(&self, task: EngineTask) {
+        self.builder.run(task, &self.shared);
+    }
+
+    /// Test seam: replace the engine handoff with a fresh one and return its
+    /// builder half, so a test can hand engines over itself. The plugin's own
+    /// builder stops reaching the audio thread.
+    pub fn take_engine_swap(&mut self) -> swap::EngineSwapBuilder {
+        let (audio, gui) = swap::engine_swap_channel();
+        self.swap = audio;
+        gui
+    }
+
+    /// The shared state the editor reads (meters, latency, restart flag).
+    pub fn shared(&self) -> &Arc<SharedState> {
+        &self.shared
+    }
+
+    /// The plugin's parameters (including the saved learned scale).
+    pub fn params_ref(&self) -> &Arc<VocalTuneParams> {
+        &self.params
     }
 
     /// One host block: `values` is this block's parameter snapshot, `io` the
@@ -204,11 +344,33 @@ impl VocalTune {
     ) -> ProcessStatus {
         let started = Instant::now();
         let samples = io.first().map_or(0, |c| c.len());
+        let api = host.api();
+        self.shared.block_samples.store(
+            u32::try_from(samples).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
 
-        self.midi.clear();
+        // Structural changes first, so a swapped-in engine already runs (and
+        // its clock groups the MIDI) in this block.
+        if let Some(active) = self.active {
+            self.check_structural(values, &active, samples, host);
+            self.adopt_handed_engine(values, host);
+        }
+
+        // MIDI: group bends by the engine's control hop, learn scales.
+        let (hop, phase) = match self.active {
+            Some(a) => {
+                let hop = vt_core::hop_for_rate(a.sample_rate).max(1);
+                (hop as u32, (self.engine_pos % hop as u64) as u32)
+            }
+            None => (1, 0),
+        };
+        self.midi.begin_block(hop, phase);
+        self.learn.begin_block(values.midi_mode);
         let block_len = u32::try_from(samples).unwrap_or(u32::MAX);
         while let Some(ev) = host.next_event() {
             if let Some(m) = midi::convert_event(&ev, block_len) {
+                self.learn.event(&m.event, &self.params.learned_scale);
                 self.midi.push(m);
             }
         }
@@ -217,18 +379,36 @@ impl VocalTune {
             // Not activated: leave the audio untouched.
             return ProcessStatus::Normal;
         };
-        self.check_structural(values, &active, host);
 
         let Some(engine) = self.engine.as_mut() else {
             return ProcessStatus::Normal;
         };
         let editor_open = self.editor_state.is_open();
-        engine.set_settings(&values.to_settings());
+        let learned_word = self.params.learned_scale.load(Ordering::Relaxed);
+        let mut settings = values.to_settings();
+        learn::apply(&mut settings, values.midi_mode, learned_word);
+        engine.set_settings(&settings);
         engine.set_telemetry_enabled(editor_open);
+
+        // CLAP may put the plugin to sleep once its output is quiet; track
+        // how long the input has been silent so we only allow that when the
+        // delay line has emptied too.
+        if api == PluginApi::Clap {
+            let quiet = io
+                .iter()
+                .all(|ch| ch.iter().all(|x| x.abs() <= QUIET_LEVEL));
+            self.quiet_run = if quiet {
+                self.quiet_run.saturating_add(samples as u64)
+            } else {
+                0
+            };
+        }
 
         let channels = active.engine_channels.min(io.len());
         if let Some(engine_io) = io.get_mut(..channels) {
+            let processed = engine_io.iter().map(|c| c.len()).min().unwrap_or(0);
             engine.process(engine_io, self.midi.as_slice());
+            self.engine_pos = self.engine_pos.wrapping_add(processed as u64);
         }
         // Mono engine feeding a stereo output (the mono → stereo layout).
         if channels == 1
@@ -240,6 +420,9 @@ impl VocalTune {
                 }
             }
         }
+
+        // Fades around an engine swap (idle otherwise).
+        self.fade.apply(io, samples);
 
         // Output gain, smoothed in dB. Skipped entirely at a steady 0 dB.
         let gain = &self.params.output_gain_db;
@@ -254,53 +437,168 @@ impl VocalTune {
             }
         }
 
+        // A learned scale is in effect in every MIDI mode until cleared.
         self.shared
             .learned_states
-            .store(pack_states(engine.learned_states()), Ordering::Relaxed);
+            .store(pack_states(learn::unpack(learned_word)), Ordering::Relaxed);
         self.shared
             .telemetry_dropped
             .store(engine.stats().telemetry_dropped, Ordering::Relaxed);
         if editor_open {
             self.repaint.request_repaint();
         }
+        if api == PluginApi::Vst3 {
+            self.retry_latency_report(&active, samples, host);
+        }
         let (avg, peak) = self.cpu.update(started.elapsed().as_secs_f32(), samples);
         self.shared.cpu_load.store(avg, Ordering::Relaxed);
         self.shared.cpu_peak.store(peak, Ordering::Relaxed);
 
         // The engine delays the signal by its latency, so audio keeps coming
-        // out for that long after the input goes silent.
-        if active.latency > 0 {
+        // out for that long after the input goes silent. nice-plug maps Tail
+        // to VST3 getTailSamples = D, but to CLAP_PROCESS_CONTINUE ("never
+        // sleep"); under CLAP, Normal (CONTINUE_IF_NOT_QUIET) is returned once
+        // the input has been silent long enough for the output to be silent.
+        if api == PluginApi::Clap && self.quiet_run >= active.quiet_tail {
+            ProcessStatus::Normal
+        } else if active.latency > 0 {
             ProcessStatus::Tail(active.latency)
         } else {
             ProcessStatus::Normal
         }
     }
 
-    /// Detect structural parameter changes and tell the host exactly once.
+    /// Swap in an engine built off the audio thread for the pending
+    /// structural change ([`swap`]): fade the running engine out, swap at a
+    /// block boundary once it is silent, and hand the old engine back to be
+    /// freed. An engine that no longer matches what is wanted goes straight
+    /// back. Only then does a VST3 host hear about a new latency. Nothing is
+    /// allocated or freed here.
+    fn adopt_handed_engine(&mut self, values: &ParamValues, host: &mut impl BlockHost) {
+        let Some(active) = self.active else { return };
+        let Ok((id, offered)) = self.swap.incoming.peek().map(|(id, e)| (*id, *e.config())) else {
+            // Nothing waiting: a called-off fade comes back (no-op otherwise).
+            self.fade.fade_in();
+            return;
+        };
+        // Room to send an engine back is required before taking one.
+        if self.swap.retired.slots() == 0 {
+            return;
+        }
+        let api = host.api();
+        let wanted = values.structural();
+        let cfg =
+            wanted.engine_config(active.sample_rate, active.max_block, active.engine_channels);
+        let latency = vt_engine::latency_samples(&offered);
+        let useful = self.requested.is_some_and(|r| r.same_engine(&wanted))
+            && offered == cfg
+            // CLAP latency may only change inside activate().
+            && (api != PluginApi::Clap || latency == active.latency);
+        if !useful {
+            if let Ok((_, stale)) = self.swap.incoming.pop() {
+                self.retire(stale);
+            }
+            self.fade.fade_in();
+            host.execute_background(EngineTask::Collect);
+            return;
+        }
+        if !self.fade.silent() {
+            self.fade.fade_out(); // swap once the running engine is silent
+            return;
+        }
+        // Publish the id before taking the engine: the builder pairs the
+        // telemetry ring with it once it sees the slot free.
+        self.shared.adopted_engine.store(id, Ordering::Release);
+        let Ok((_, engine)) = self.swap.incoming.pop() else {
+            return;
+        };
+        let latency = engine.latency_samples();
+        let old = self.engine.replace(engine);
+        self.engine_pos = 0;
+        self.active = Some(Active {
+            structural: wanted,
+            latency,
+            quiet_tail: quiet_tail(latency, active.sample_rate, wanted.voice_range),
+            ..active
+        });
+        self.requested = None;
+        self.settling = None;
+        self.fade.swapped(latency);
+        self.shared
+            .latency_samples
+            .store(latency, Ordering::Relaxed);
+        self.shared
+            .pending_latency_samples
+            .store(latency, Ordering::Relaxed);
+        self.shared.restart_pending.store(false, Ordering::Release);
+        self.shared.awaiting_host.store(false, Ordering::Relaxed);
+        if let Some(old) = old {
+            self.retire(old);
+        }
+        host.execute_background(EngineTask::Collect);
+        if api == PluginApi::Vst3 && latency != self.reported_latency {
+            host.set_latency_samples(latency);
+            self.reported_latency = latency;
+            self.latency_retry = Some(LatencyRetry::default());
+        }
+    }
+
+    /// Send an engine back to the background thread to be freed.
+    fn retire(&mut self, engine: Box<Engine>) {
+        if let Err(rtrb::PushError::Full(engine)) = self.swap.retired.push(engine) {
+            // Unreachable (callers check for a free slot). Leaking beats
+            // freeing a whole engine on the audio thread.
+            std::mem::forget(engine);
+        }
+    }
+
+    /// VST3: repeat `kLatencyChanged` at [`LATENCY_RETRY_AT_S`] while the
+    /// host has not re-activated us since a latency change.
+    fn retry_latency_report(&mut self, active: &Active, samples: usize, host: &mut impl BlockHost) {
+        let Some(retry) = self.latency_retry.as_mut() else {
+            return;
+        };
+        retry.waited = retry.waited.saturating_add(samples as u64);
+        match LATENCY_RETRY_AT_S.get(retry.sent) {
+            Some(at) if retry.waited >= (at * active.sample_rate.max(1.0)) as u64 => {
+                retry.sent += 1;
+                host.request_restart();
+            }
+            Some(_) => {}
+            None => self.latency_retry = None,
+        }
+    }
+
+    /// Detect structural parameter changes and request the new engine exactly
+    /// once, after the new value has been left alone for
+    /// [`STRUCTURAL_SETTLE_S`].
     ///
-    /// The protocol differs per format (R§9.5):
-    /// - VST3: report the new latency; nice-plug turns a change into
-    ///   `restartComponent(kLatencyChanged)`. Unchanged latency → plain restart.
-    /// - CLAP: latency may only change inside `activate()`, so only a restart
-    ///   is requested here (`host.request_restart()` is thread-safe) and the
-    ///   new latency is reported by `activate()`. Reporting it from here would
-    ///   make nice-plug call `latency.changed()` from the main thread, possibly
-    ///   while deactivated (clap-validator rejects that).
-    /// - Standalone: no restart exists; the editor reloads the plugin state,
-    ///   which re-runs `activate()`.
+    /// - VST3, standalone, and CLAP when the latency stays the same: build it
+    ///   on the background thread and swap it in (`adopt_handed_engine`); a
+    ///   VST3 host is told the new latency after the swap.
+    /// - CLAP with a new latency: latency may only change inside
+    ///   `activate()`, so a restart is requested (`host.request_restart()` is
+    ///   thread-safe) and `activate()` builds the engine and reports it.
+    ///   Reporting it from here would make nice-plug call `latency.changed()`
+    ///   from the main thread, possibly while deactivated (clap-validator
+    ///   rejects that).
     fn check_structural(
         &mut self,
         values: &ParamValues,
         active: &Active,
+        samples: usize,
         host: &mut impl BlockHost,
     ) {
         let wanted = values.structural();
         let api = host.api();
         if wanted.same_engine(&active.structural) {
+            self.settling = None;
             if self.requested.take().is_some() {
-                // Reverted before the host restarted us: re-report the latency
-                // of the engine that is actually running.
+                // Reverted before the new engine arrived: nothing to apply.
+                // (A VST3 host was never told another latency; re-reporting
+                // the running one is a safety net.)
                 self.shared.restart_pending.store(false, Ordering::Release);
+                self.shared.awaiting_host.store(false, Ordering::Relaxed);
                 self.shared
                     .pending_latency_samples
                     .store(active.latency, Ordering::Relaxed);
@@ -312,8 +610,43 @@ impl VocalTune {
             return;
         }
         if self.requested.is_some_and(|r| r.same_engine(&wanted)) {
-            return; // already reported, waiting for the host
+            self.settling = None;
+            return; // already requested: building, or waiting for the host
         }
+
+        // HI-3: a voice-range change that keeps the latency is applied by
+        // the running engine itself (`Engine::set_voice_range`: RT-safe, a
+        // 5 ms fade, the new range's detector and shifter at the next hop,
+        // back in after D samples; notes, MIDI and telemetry carry on). No
+        // build, no swap, nothing for the host to do, and no settle delay.
+        let in_place = Structural {
+            voice_range: wanted.voice_range,
+            ..active.structural
+        };
+        if in_place.same_engine(&wanted)
+            && self
+                .engine
+                .as_mut()
+                .is_some_and(|e| e.set_voice_range(wanted.voice_range))
+        {
+            self.voice_range_switched(active, in_place, host);
+            return;
+        }
+
+        // Debounce: count how long this exact configuration has been wanted.
+        let settle_samples = (STRUCTURAL_SETTLE_S * active.sample_rate.max(1.0)) as u64;
+        let waited = match self.settling {
+            Some((candidate, waited)) if candidate.same_engine(&wanted) => {
+                waited.saturating_add(samples as u64)
+            }
+            _ => samples as u64,
+        };
+        if waited < settle_samples {
+            self.settling = Some((wanted, waited));
+            return;
+        }
+        self.settling = None;
+
         self.requested = Some(wanted);
         let cfg =
             wanted.engine_config(active.sample_rate, active.max_block, active.engine_channels);
@@ -322,13 +655,46 @@ impl VocalTune {
             .pending_latency_samples
             .store(latency, Ordering::Relaxed);
         self.shared.restart_pending.store(true, Ordering::Release);
-        match api {
-            PluginApi::Standalone => {}
-            PluginApi::Vst3 if latency != self.reported_latency => {
-                host.set_latency_samples(latency);
-                self.reported_latency = latency;
-            }
-            PluginApi::Vst3 | PluginApi::Clap => host.request_restart(),
+        let host_restart = api == PluginApi::Clap && latency != active.latency;
+        self.shared
+            .awaiting_host
+            .store(host_restart, Ordering::Relaxed);
+        if host_restart {
+            host.request_restart();
+        } else {
+            host.execute_background(EngineTask::Build(cfg));
+        }
+    }
+
+    /// Bookkeeping after the running engine accepted a voice-range change
+    /// (`check_structural`): it now runs `structural` with the same latency.
+    /// A build or restart requested for an earlier change is void (a handed
+    /// engine for it is sent back by `adopt_handed_engine`; a CLAP host that
+    /// restarts anyway re-activates with a matching engine).
+    fn voice_range_switched(
+        &mut self,
+        active: &Active,
+        structural: Structural,
+        host: &mut impl BlockHost,
+    ) {
+        self.active = Some(Active {
+            structural,
+            quiet_tail: quiet_tail(active.latency, active.sample_rate, structural.voice_range),
+            ..*active
+        });
+        self.requested = None;
+        self.settling = None;
+        self.shared.restart_pending.store(false, Ordering::Release);
+        self.shared.awaiting_host.store(false, Ordering::Relaxed);
+        self.shared
+            .pending_latency_samples
+            .store(active.latency, Ordering::Relaxed);
+        // A VST3 host is only ever told the running engine's latency; this
+        // re-reports it if an earlier request had moved it (safety net, as
+        // for a reverted change).
+        if host.api() == PluginApi::Vst3 && self.reported_latency != active.latency {
+            host.set_latency_samples(active.latency);
+            self.reported_latency = active.latency;
         }
     }
 }
@@ -383,10 +749,16 @@ impl Plugin for VocalTune {
 
     type Editor = EguiEditor<editor::VocalTuneEditor>;
     type SysExMessage = ();
-    type BackgroundTask = ();
+    type BackgroundTask = EngineTask;
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn task_executor(&mut self) -> TaskExecutor<Self> {
+        let builder = self.builder.clone();
+        let shared = self.shared.clone();
+        Box::new(move |task| builder.run(task, &shared))
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
@@ -422,9 +794,13 @@ impl Plugin for VocalTune {
     }
 
     fn reset(&mut self) {
+        // Signal state only: the learned scale is user state and lives in the
+        // parameters (`learn`), so it survives this.
         if let Some(engine) = self.engine.as_mut() {
             engine.reset();
         }
+        self.engine_pos = 0;
+        self.quiet_run = 0;
     }
 
     fn process(
@@ -495,7 +871,7 @@ mod tests {
     use super::*;
     use nice_plug::midi::{Channel, Key, VoiceID};
     use params::{LatencyModeChoice, VoiceRangeChoice};
-    use vt_core::{EngineConfig, LatencyMode};
+    use vt_core::EngineConfig;
 
     /// Records what the plugin asks of the host.
     #[derive(Default)]
@@ -503,6 +879,8 @@ mod tests {
         events: Vec<NoteEvent<()>>,
         latency_calls: Vec<u32>,
         restarts: usize,
+        /// Background tasks posted and not run yet ([`run_background`]).
+        tasks: Vec<EngineTask>,
         api: Option<PluginApi>,
     }
 
@@ -520,6 +898,9 @@ mod tests {
         fn request_restart(&mut self) {
             self.restarts += 1;
         }
+        fn execute_background(&mut self, task: EngineTask) {
+            self.tasks.push(task);
+        }
         fn api(&self) -> PluginApi {
             self.api.unwrap_or(PluginApi::Vst3)
         }
@@ -531,13 +912,33 @@ mod tests {
         host: &mut FakeHost,
         n: usize,
     ) -> Vec<Vec<f32>> {
-        let mut l: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        run_signal(p, values, host, &input)
+    }
+
+    /// One stereo block of `input` (both channels).
+    fn run_signal(
+        p: &mut VocalTune,
+        values: &ParamValues,
+        host: &mut FakeHost,
+        input: &[f32],
+    ) -> Vec<Vec<f32>> {
+        let mut l = input.to_vec();
         let mut r = l.clone();
         {
             let mut io: [&mut [f32]; 2] = [&mut l, &mut r];
             p.process_block(values, &mut io, host);
         }
         vec![l, r]
+    }
+
+    /// Run 64-sample blocks until a structural change has had time to
+    /// settle (just over `STRUCTURAL_SETTLE_S` at 48 kHz).
+    fn settle(p: &mut VocalTune, values: &ParamValues, host: &mut FakeHost) {
+        let blocks = (STRUCTURAL_SETTLE_S * 48_000.0 / 64.0) as usize + 2;
+        for _ in 0..blocks {
+            run(p, values, host, 64);
+        }
     }
 
     #[test]
@@ -575,7 +976,9 @@ mod tests {
 
     #[test]
     fn output_is_input_delayed_by_the_reported_latency() {
-        // The stub engine is a pure delay; the plugin must not add anything.
+        // A 76 Hz sine is below the Alto/Tenor range, so the engine treats it
+        // as unvoiced and passes it as an exact delay; the plugin must not
+        // add anything.
         let mut p = VocalTune::default();
         let d = p.activate_with(&ParamValues::default(), 48_000.0, 4096, 2) as usize;
         let mut host = FakeHost::default();
@@ -589,44 +992,56 @@ mod tests {
     }
 
     #[test]
-    fn structural_change_requests_one_restart() {
+    fn structural_change_is_built_off_thread_then_reported_once() {
         let mut p = VocalTune::default();
         let live = p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
         let mut host = FakeHost::default();
         let mut v = ParamValues::default();
         run(&mut p, &v, &mut host, 64);
         assert!(host.latency_calls.is_empty() && host.restarts == 0);
+        assert!(host.tasks.is_empty());
 
         v.latency_mode = LatencyModeChoice::Studio;
-        for _ in 0..5 {
-            run(&mut p, &v, &mut host, 64);
-        }
-        let studio_cfg = EngineConfig {
-            latency_mode: LatencyMode::Studio,
-            max_block: 512,
-            ..EngineConfig::default()
-        };
+        run(&mut p, &v, &mut host, 64);
+        assert!(host.tasks.is_empty(), "nothing before it settles");
+        settle(&mut p, &v, &mut host);
+        let studio_cfg = v.structural().engine_config(48_000.0, 512, 2);
         let studio = vt_engine::latency_samples(&studio_cfg);
         assert_ne!(studio, live);
-        assert_eq!(
-            host.latency_calls,
-            vec![studio],
-            "latency reported exactly once"
+        assert_eq!(host.tasks, vec![EngineTask::Build(studio_cfg)]);
+        assert!(
+            host.latency_calls.is_empty(),
+            "no new latency before its engine runs"
         );
         assert!(p.restart_pending());
         assert!(p.shared.restart_pending.load(Ordering::Acquire));
+        assert!(!p.shared.awaiting_host.load(Ordering::Relaxed));
 
-        // The host restarts us: the engine is rebuilt with the new latency.
+        until_swapped(&mut p, &v, &mut host);
+        assert_eq!(p.latency(), Some(studio));
+        assert_eq!(host.latency_calls, vec![studio], "reported exactly once");
+        assert_eq!(
+            host.restarts, 0,
+            "nice-plug's kLatencyChanged is the request"
+        );
+
+        // The host restarts us: the running engine is kept.
+        let generation = p.shared.engine_generation.load(Ordering::Relaxed);
         assert_eq!(p.activate_with(&v, 48_000.0, 512, 2), studio);
+        assert_eq!(
+            p.shared.engine_generation.load(Ordering::Relaxed),
+            generation
+        );
         assert!(!p.restart_pending());
         run(&mut p, &v, &mut host, 64);
         assert_eq!(host.latency_calls.len(), 1);
     }
 
     #[test]
-    fn clap_structural_change_only_requests_a_restart() {
+    fn clap_latency_change_only_requests_a_restart() {
         // CLAP: latency may only change inside activate(), so process() must
-        // not report it; activate() does after the restart.
+        // neither report it nor swap in an engine with another latency;
+        // activate() does both after the restart.
         let mut p = VocalTune::default();
         p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
         let mut host = FakeHost {
@@ -635,51 +1050,43 @@ mod tests {
         };
         let mut v = ParamValues::default();
         v.latency_mode = LatencyModeChoice::Studio;
-        for _ in 0..4 {
-            run(&mut p, &v, &mut host, 64);
-        }
+        settle(&mut p, &v, &mut host);
         assert!(host.latency_calls.is_empty());
+        assert!(host.tasks.is_empty(), "no engine is built for a swap");
         assert_eq!(host.restarts, 1);
+        assert!(p.shared.awaiting_host.load(Ordering::Relaxed));
         // Reverting needs no host call either.
         v.latency_mode = LatencyModeChoice::Live;
         run(&mut p, &v, &mut host, 64);
         assert!(host.latency_calls.is_empty());
         assert_eq!(host.restarts, 1);
         assert!(!p.restart_pending());
+        assert!(!p.shared.awaiting_host.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn same_latency_structural_change_uses_a_plain_restart() {
-        let mut p = VocalTune::default();
-        let mut v = ParamValues::default();
-        v.latency_mode = LatencyModeChoice::Studio;
-        p.activate_with(&v, 48_000.0, 512, 2);
-        let mut host = FakeHost::default();
-        // Studio latency does not depend on the voice range in the current
-        // engine, but the engine still has to be rebuilt.
-        v.voice_range = VoiceRangeChoice::Soprano;
-        run(&mut p, &v, &mut host, 64);
-        run(&mut p, &v, &mut host, 64);
-        let cfg = v.structural().engine_config(48_000.0, 512, 2);
-        if vt_engine::latency_samples(&cfg) == p.latency().unwrap_or(0) {
-            assert_eq!(host.restarts, 1);
-            assert!(host.latency_calls.is_empty());
-        } else {
-            assert_eq!(host.latency_calls.len(), 1);
-        }
-    }
-
-    #[test]
-    fn reverting_a_structural_change_restores_the_latency() {
+    fn reverting_before_the_swap_keeps_the_running_engine() {
         let mut p = VocalTune::default();
         let live = p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
+        let live_cfg = p.engine.as_ref().map(|e| *e.config());
         let mut host = FakeHost::default();
         let mut v = ParamValues::default();
         v.latency_mode = LatencyModeChoice::Studio;
-        run(&mut p, &v, &mut host, 64);
+        settle(&mut p, &v, &mut host);
+        run_background(&mut p, &mut host); // the Studio engine is waiting
         v.latency_mode = LatencyModeChoice::Live;
-        run(&mut p, &v, &mut host, 64);
-        assert_eq!(host.latency_calls.last(), Some(&live));
+        for _ in 0..20 {
+            run(&mut p, &v, &mut host, 64);
+            run_background(&mut p, &mut host);
+        }
+        assert!(
+            host.latency_calls.is_empty(),
+            "the host never heard of Studio"
+        );
+        assert_eq!(p.latency(), Some(live));
+        assert_eq!(p.engine.as_ref().map(|e| *e.config()), live_cfg);
+        assert!(p.swap.incoming.peek().is_err(), "stale engine sent back");
+        assert_eq!(p.swap.retired.slots(), 4, "and freed off the audio thread");
         assert!(!p.restart_pending());
         assert!(!p.shared.restart_pending.load(Ordering::Acquire));
     }
@@ -706,13 +1113,13 @@ mod tests {
         };
         let mut v = ParamValues::default();
         v.latency_mode = LatencyModeChoice::Studio;
-        run(&mut p, &v, &mut host, 64);
+        settle(&mut p, &v, &mut host);
+        assert!(p.shared.restart_pending.load(Ordering::Acquire));
+        until_swapped(&mut p, &v, &mut host);
         assert!(host.latency_calls.is_empty());
         assert_eq!(host.restarts, 0);
-        assert!(
-            p.shared.restart_pending.load(Ordering::Acquire),
-            "editor must see the pending restart"
-        );
+        let cfg = v.structural().engine_config(48_000.0, 512, 2);
+        assert_eq!(p.latency(), Some(vt_engine::latency_samples(&cfg)));
     }
 
     #[test]
@@ -784,5 +1191,677 @@ mod tests {
         let load = p.shared.cpu_load.load(Ordering::Relaxed);
         assert!(load.is_finite() && load >= 0.0);
         assert!(p.shared.cpu_peak.load(Ordering::Relaxed) >= load);
+    }
+
+    // ---------------------------------------------------------------------
+    // Review regression tests
+    // ---------------------------------------------------------------------
+
+    /// Harmonic test voice (1/k partials) at `hz`, starting at phase `t0`.
+    fn voice(n: usize, hz: f32, sr: f32, t0: usize) -> Vec<f32> {
+        (t0..t0 + n)
+            .map(|i| {
+                let ph = std::f32::consts::TAU * hz * i as f32 / sr;
+                (1..=8)
+                    .map(|k| (ph * k as f32).sin() / k as f32)
+                    .sum::<f32>()
+                    * 0.3
+            })
+            .collect()
+    }
+
+    /// Fundamental of `x` by the YIN difference function, searched in
+    /// `lo..hi` Hz (accurate to well under 5 c on these signals).
+    fn pitch_hz(x: &[f32], sr: f32, lo: f32, hi: f32) -> f32 {
+        let tau_min = (sr / hi) as usize;
+        let tau_max = (sr / lo) as usize + 1;
+        let w = x.len() - tau_max - 1;
+        let d: Vec<f32> = (0..=tau_max)
+            .map(|tau| (0..w).map(|i| (x[i] - x[i + tau]).powi(2)).sum())
+            .collect();
+        let mut cum = 0.0;
+        let mut cmnd = vec![1.0f32; tau_max + 1];
+        for tau in 1..=tau_max {
+            cum += d[tau];
+            cmnd[tau] = d[tau] * tau as f32 / cum.max(1e-12);
+        }
+        let mut best = tau_min;
+        for tau in tau_min..tau_max {
+            if cmnd[tau] < 0.15 {
+                best = tau;
+                while best + 1 < tau_max && cmnd[best + 1] < cmnd[best] {
+                    best += 1;
+                }
+                break;
+            }
+            if cmnd[tau] < cmnd[best] {
+                best = tau;
+            }
+        }
+        let (a, b, c) = (cmnd[best - 1], cmnd[best], cmnd[best + 1]);
+        let den = a - 2.0 * b + c;
+        let shift = if den.abs() > 1e-12 {
+            0.5 * (a - c) / den
+        } else {
+            0.0
+        };
+        sr / (best as f32 + shift)
+    }
+
+    fn cents(a: f32, b: f32) -> f32 {
+        1200.0 * (a / b).log2()
+    }
+
+    /// Feed `seconds` of the voice through the plugin in `block`-sample
+    /// blocks (events go with the first block) and return the mono output.
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        p: &mut VocalTune,
+        v: &ParamValues,
+        host: &mut FakeHost,
+        hz: f32,
+        seconds: f32,
+        block: usize,
+        t0: &mut usize,
+    ) -> Vec<f32> {
+        let n = (seconds * 48_000.0) as usize;
+        let mut out = Vec::with_capacity(n);
+        let mut done = 0;
+        while done < n {
+            let len = block.min(n - done);
+            let mut l = voice(len, hz, 48_000.0, *t0);
+            let mut r = l.clone();
+            {
+                let mut io: [&mut [f32]; 2] = [&mut l, &mut r];
+                p.process_block(v, &mut io, host);
+            }
+            out.extend_from_slice(&l);
+            *t0 += len;
+            done += len;
+        }
+        out
+    }
+
+    fn note_on(timing: u32, key: u8) -> NoteEvent<()> {
+        NoteEvent::NoteOn {
+            timing,
+            voice_id: VoiceID::Wildcard,
+            channel: Channel::Number(0),
+            key: Key::Number(key),
+            velocity: 1.0,
+        }
+    }
+
+    fn tail_pitch(y: &[f32]) -> f32 {
+        pitch_hz(&y[y.len() - 4096..], 48_000.0, 120.0, 900.0)
+    }
+
+    /// RT-3: a pitch-bend flood before a note-off must not leave the note
+    /// held (MIDI Target would keep pulling the voice to it).
+    #[test]
+    fn bend_flood_does_not_leave_a_target_note_stuck() {
+        let mut p = VocalTune::default();
+        let mut v = ParamValues::default();
+        v.midi_mode = params::MidiModeChoice::Target;
+        p.activate_with(&v, 48_000.0, 2048, 2);
+        let mut host = FakeHost::default();
+        let a3_35 = 220.0 * 2f32.powf(35.0 / 1200.0);
+        let mut t0 = 0;
+        host.events.push(note_on(0, 60));
+        let held = render(&mut p, &v, &mut host, a3_35, 0.5, 2048, &mut t0);
+        let c4 = 261.626;
+        assert!(
+            cents(tail_pitch(&held), c4).abs() < 15.0,
+            "held C4 pulls the voice: {} Hz",
+            tail_pitch(&held)
+        );
+        // One block: 1000 bends (ending centred), then the note-off.
+        for i in 0..1000u32 {
+            let value = if i == 999 {
+                0.5
+            } else {
+                0.5 + 0.3 * ((i as f32) * 0.1).sin()
+            };
+            host.events.push(NoteEvent::MidiPitchBend {
+                timing: i * 2,
+                channel: 0,
+                value,
+            });
+        }
+        host.events.push(NoteEvent::NoteOff {
+            timing: 2040,
+            voice_id: VoiceID::Wildcard,
+            channel: Channel::Number(0),
+            key: Key::Number(60),
+            velocity: 0.0,
+        });
+        let released = render(&mut p, &v, &mut host, a3_35, 0.6, 2048, &mut t0);
+        let got = tail_pitch(&released);
+        assert!(
+            cents(got, a3_35).abs() < 15.0,
+            "released: the voice must pass through at A3+35 c, got {got} Hz ({:+.0} c from C4)",
+            cents(got, c4)
+        );
+    }
+
+    /// HI-4 / CL-4: the learned scale survives a host reset and an engine
+    /// rebuild while MIDI Mode stays Learn.
+    #[test]
+    fn learned_scale_survives_reset_and_rebuild() {
+        let mut p = VocalTune::default();
+        let mut v = ParamValues::default();
+        p.activate_with(&v, 48_000.0, 512, 2);
+        let mut host = FakeHost::default();
+        let mut t0 = 0;
+        // Enter Learn (from Off), then play C, E, G.
+        render(&mut p, &v, &mut host, 450.0, 0.05, 512, &mut t0);
+        v.midi_mode = params::MidiModeChoice::Learn;
+        for k in [60, 64, 67] {
+            host.events.push(note_on(0, k));
+        }
+        let learned = render(&mut p, &v, &mut host, 450.0, 0.5, 512, &mut t0);
+        let g4 = 391.995;
+        assert!(
+            cents(tail_pitch(&learned), g4).abs() < 15.0,
+            "450 Hz snaps to G4 of the learned C-E-G: {} Hz",
+            tail_pitch(&learned)
+        );
+
+        <VocalTune as Plugin>::reset(&mut p);
+        let after_reset = render(&mut p, &v, &mut host, 450.0, 0.5, 512, &mut t0);
+        assert!(
+            cents(tail_pitch(&after_reset), g4).abs() < 15.0,
+            "after reset: {} Hz (A4 = 440 means the scale was lost)",
+            tail_pitch(&after_reset)
+        );
+
+        // A different host block size rebuilds the engine.
+        let generation = p.shared.engine_generation.load(Ordering::Relaxed);
+        p.activate_with(&v, 48_000.0, 1024, 2);
+        assert_ne!(
+            p.shared.engine_generation.load(Ordering::Relaxed),
+            generation
+        );
+        let rebuilt = render(&mut p, &v, &mut host, 450.0, 0.5, 512, &mut t0);
+        assert!(cents(tail_pitch(&rebuilt), g4).abs() < 15.0);
+        assert_eq!(
+            p.shared.learned(),
+            learn::unpack(learn::pack(&[0, 4, 7])),
+            "the editor sees the learned scale"
+        );
+    }
+
+    /// HI-4 / CL-4: Learn edits the scale (R§7.6.3), so the learned scale
+    /// stays in effect after leaving Learn (Off, and Auto with no notes held)
+    /// until the user clears it; the editor keeps showing it meanwhile.
+    #[test]
+    fn learned_scale_survives_leaving_learn_until_cleared() {
+        let mut p = VocalTune::default();
+        let mut v = ParamValues::default();
+        p.activate_with(&v, 48_000.0, 512, 2);
+        let mut host = FakeHost::default();
+        let mut t0 = 0;
+        render(&mut p, &v, &mut host, 450.0, 0.05, 512, &mut t0);
+        v.midi_mode = params::MidiModeChoice::Learn;
+        for k in [60, 64, 67] {
+            host.events.push(note_on(0, k));
+        }
+        render(&mut p, &v, &mut host, 450.0, 0.3, 512, &mut t0);
+        // Keys released: Auto then has no held notes and uses the scale.
+        for k in [60, 64, 67] {
+            host.events.push(NoteEvent::NoteOff {
+                timing: 0,
+                voice_id: VoiceID::Wildcard,
+                channel: Channel::Number(0),
+                key: Key::Number(k),
+                velocity: 0.0,
+            });
+        }
+        render(&mut p, &v, &mut host, 450.0, 0.05, 512, &mut t0);
+        let g4 = 391.995;
+        let learned = learn::unpack(learn::pack(&[0, 4, 7]));
+
+        for mode in [params::MidiModeChoice::Off, params::MidiModeChoice::Auto] {
+            v.midi_mode = mode;
+            let y = render(&mut p, &v, &mut host, 450.0, 0.5, 512, &mut t0);
+            assert!(
+                cents(tail_pitch(&y), g4).abs() < 15.0,
+                "{mode:?}: 450 Hz must still snap to G4 of the learned C-E-G, got {} Hz",
+                tail_pitch(&y)
+            );
+            assert_eq!(p.shared.learned(), learned, "{mode:?}: editor sees it");
+        }
+
+        // Clearing it returns to the Key/Scale parameters (Chromatic: A4 for
+        // the next note; G is still legal, so the running note may be kept).
+        p.params.clear_learned_scale();
+        for _ in 0..20 {
+            let mut l = vec![0.0f32; 480];
+            let mut r = l.clone();
+            let mut io: [&mut [f32]; 2] = [&mut l, &mut r];
+            p.process_block(&v, &mut io, &mut host);
+        }
+        let y = render(&mut p, &v, &mut host, 450.0, 0.5, 512, &mut t0);
+        assert!(
+            cents(tail_pitch(&y), 440.0).abs() < 15.0,
+            "cleared: chromatic A4, got {} Hz",
+            tail_pitch(&y)
+        );
+        assert_eq!(p.shared.learned(), None);
+    }
+
+    /// HI-4: loading a project (or preset) saved without a learned scale
+    /// clears the one in memory: the field is always part of the state.
+    #[test]
+    fn loading_a_state_without_a_learned_scale_clears_it() {
+        let p = VocalTune::default();
+        p.params
+            .learned_scale
+            .store(learn::pack(&[2, 9]), Ordering::Relaxed);
+        let plain = VocalTune::default().params.serialize_fields();
+        assert!(plain.contains_key("learned-scale"), "{plain:?}");
+        p.params.deserialize_fields(&plain);
+        assert_eq!(p.params.learned_states(), None);
+    }
+
+    /// HI-4: the learned scale is part of the saved plugin state.
+    #[test]
+    fn learned_scale_is_saved_with_the_project() {
+        let mut p = VocalTune::default();
+        let mut v = ParamValues::default();
+        p.activate_with(&v, 48_000.0, 512, 2);
+        let mut host = FakeHost::default();
+        run(&mut p, &v, &mut host, 64);
+        v.midi_mode = params::MidiModeChoice::Learn;
+        host.events.push(note_on(0, 62));
+        host.events.push(note_on(1, 69));
+        run(&mut p, &v, &mut host, 64);
+
+        let saved = p.params.serialize_fields();
+        assert!(saved.contains_key("learned-scale"), "{saved:?}");
+        let restored = VocalTune::default();
+        restored.params.deserialize_fields(&saved);
+        assert_eq!(
+            restored.params.learned_states(),
+            learn::unpack(learn::pack(&[2, 9]))
+        );
+    }
+
+    #[test]
+    fn dragging_a_structural_value_restarts_once() {
+        for api in [PluginApi::Vst3, PluginApi::Clap] {
+            let mut p = VocalTune::default();
+            let mut v = ParamValues::default();
+            v.latency_mode = LatencyModeChoice::Studio;
+            p.activate_with(&v, 48_000.0, 512, 2);
+            let mut host = FakeHost {
+                api: Some(api),
+                ..FakeHost::default()
+            };
+            for step in 0..20 {
+                v.studio_ms = 39.0 - step as f32;
+                // A 60 Hz GUI frame of 64-sample blocks.
+                for _ in 0..13 {
+                    run(&mut p, &v, &mut host, 64);
+                }
+            }
+            settle(&mut p, &v, &mut host);
+            let cfg = v.structural().engine_config(48_000.0, 512, 2);
+            match api {
+                PluginApi::Vst3 => {
+                    assert_eq!(host.tasks, vec![EngineTask::Build(cfg)], "one build");
+                    until_swapped(&mut p, &v, &mut host);
+                    assert_eq!(host.latency_calls, vec![vt_engine::latency_samples(&cfg)]);
+                }
+                _ => {
+                    assert!(host.latency_calls.is_empty());
+                    assert_eq!(host.restarts, 1, "{api:?}");
+                }
+            }
+        }
+    }
+
+    /// HI-7: under CLAP the plugin lets the host sleep once the input has
+    /// been silent long enough for the delayed output to be silent too;
+    /// VST3 keeps reporting its tail.
+    #[test]
+    fn clap_can_sleep_after_silence() {
+        for api in [PluginApi::Clap, PluginApi::Vst3] {
+            let mut p = VocalTune::default();
+            let d = p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
+            let mut host = FakeHost {
+                api: Some(api),
+                ..FakeHost::default()
+            };
+            let mut status = |p: &mut VocalTune, loud: bool| {
+                let mut l = if loud {
+                    voice(256, 220.0, 48_000.0, 0)
+                } else {
+                    vec![0.0; 256]
+                };
+                let mut r = l.clone();
+                let mut io: [&mut [f32]; 2] = [&mut l, &mut r];
+                p.process_block(&ParamValues::default(), &mut io, &mut host)
+            };
+            assert_eq!(status(&mut p, true), ProcessStatus::Tail(d));
+            // Just after the input stops, audio is still in the delay line.
+            assert_eq!(status(&mut p, false), ProcessStatus::Tail(d));
+            let tail = p.active.map_or(0, |a| a.quiet_tail);
+            assert!(tail >= u64::from(d));
+            let mut last = ProcessStatus::Tail(d);
+            for _ in 0..tail / 256 + 2 {
+                last = status(&mut p, false);
+            }
+            let expect = if api == PluginApi::Clap {
+                ProcessStatus::Normal
+            } else {
+                ProcessStatus::Tail(d)
+            };
+            assert_eq!(last, expect, "{api:?}");
+            // Sound again: back to keeping the plugin awake.
+            assert_eq!(status(&mut p, true), ProcessStatus::Tail(d));
+        }
+    }
+
+    /// Run the background tasks the plugin posted (nice-plug's background
+    /// thread in a real host).
+    fn run_background(p: &mut VocalTune, host: &mut FakeHost) {
+        for task in std::mem::take(&mut host.tasks) {
+            p.run_task(task);
+        }
+    }
+
+    /// 64-sample blocks with the background thread keeping up, until the
+    /// pending structural change has been swapped in (bounded).
+    fn until_swapped(p: &mut VocalTune, v: &ParamValues, host: &mut FakeHost) {
+        for _ in 0..200 {
+            run(p, v, host, 64);
+            run_background(p, host);
+            if !p.restart_pending() {
+                return;
+            }
+        }
+        panic!("the new engine was never swapped in");
+    }
+
+    /// A 76.4 Hz sine (below every range but Low Male/Wide, so the engine
+    /// passes it through as an exact delay), continuing from sample `t0`.
+    fn sine_block(t0: &mut usize, n: usize) -> Vec<f32> {
+        let x = (*t0..*t0 + n).map(|i| (i as f32 * 0.01).sin()).collect();
+        *t0 += n;
+        x
+    }
+
+    /// HI-1: a VST3 host never reads a latency that differs from the running
+    /// engine's, whatever it does with the restart request (here: nothing,
+    /// it never re-activates). The new engine is built off the audio thread
+    /// and swapped in first; only then is the new latency reported. Checked
+    /// on the audio itself afterwards.
+    #[test]
+    fn vst3_reported_latency_always_matches_the_running_engine() {
+        let mut p = VocalTune::default();
+        let live = p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
+        let mut host = FakeHost::default();
+        // Classic at amount 0 passes the voice through at the reported delay
+        // (to within a fraction of a sample), so the audio shows which latency
+        // is running.
+        let mut v = ParamValues {
+            amount_pct: 0.0,
+            engine: params::EngineChoice::Classic,
+            ..ParamValues::default()
+        };
+        v.latency_mode = LatencyModeChoice::Studio;
+        let studio = vt_engine::latency_samples(&v.structural().engine_config(48_000.0, 512, 2));
+        let mut reported = live;
+        let mut t0 = 0;
+        for block in 0..750 {
+            let mut l = sine_block(&mut t0, 64);
+            let mut r = l.clone();
+            let mut io: [&mut [f32]; 2] = [&mut l, &mut r];
+            p.process_block(&v, &mut io, &mut host);
+            run_background(&mut p, &mut host);
+            if let Some(&l) = host.latency_calls.last() {
+                reported = l;
+            }
+            assert_eq!(
+                Some(reported),
+                p.latency(),
+                "block {block}: host told {reported}, the engine runs {:?}",
+                p.latency()
+            );
+        }
+        assert_eq!(p.latency(), Some(studio), "the switch happened");
+        assert_eq!(host.latency_calls, vec![studio], "reported once");
+        assert!(!p.restart_pending());
+
+        // The audio is the input delayed by the new latency.
+        let d = studio as usize;
+        let input: Vec<f32> = (0..t0 + 2048).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut l = sine_block(&mut t0, 2048);
+        let mut r = l.clone();
+        let mut io: [&mut [f32]; 2] = [&mut l, &mut r];
+        p.process_block(&v, &mut io, &mut host);
+        let start = t0 - 2048;
+        for (k, y) in l.iter().enumerate() {
+            let x = input[start + k - d];
+            // 3e-3 is 0.3 samples of this sine's steepest slope.
+            assert!((y - x).abs() < 3e-3, "sample {k}: {y} vs {x}");
+        }
+
+        // A host that re-activates later finds the engine already built.
+        let generation = p.shared.engine_generation.load(Ordering::Relaxed);
+        assert_eq!(p.activate_with(&v, 48_000.0, 512, 2), studio);
+        assert_eq!(
+            p.shared.engine_generation.load(Ordering::Relaxed),
+            generation
+        );
+    }
+
+    /// HI-3: a voice-range change that keeps the latency (any range in
+    /// Studio, Live+ or Live-Min; Low Male and Wide in Live) is applied by the
+    /// running engine itself (`Engine::set_voice_range`), at once: no host
+    /// restart, no latency report, no engine build or swap, in VST3, CLAP and
+    /// the standalone. A change that moves the latency still takes the swap
+    /// (VST3) or restart (CLAP) path.
+    #[test]
+    fn same_latency_voice_range_change_is_applied_in_place() {
+        for api in [PluginApi::Vst3, PluginApi::Clap, PluginApi::Standalone] {
+            for (mode, from, to) in [
+                (
+                    LatencyModeChoice::Studio,
+                    VoiceRangeChoice::AltoTenor,
+                    VoiceRangeChoice::LowMale,
+                ),
+                (
+                    LatencyModeChoice::Live,
+                    VoiceRangeChoice::LowMale,
+                    VoiceRangeChoice::Wide,
+                ),
+            ] {
+                let mut p = VocalTune::default();
+                let mut v = ParamValues::default();
+                v.latency_mode = mode;
+                v.voice_range = from;
+                let d = p.activate_with(&v, 48_000.0, 512, 2);
+                let mut host = FakeHost {
+                    api: Some(api),
+                    ..FakeHost::default()
+                };
+                run(&mut p, &v, &mut host, 64);
+                let before = p.engine.as_deref().map(std::ptr::from_ref);
+                v.voice_range = to;
+                let cfg = v.structural().engine_config(48_000.0, 512, 2);
+                assert_eq!(vt_engine::latency_samples(&cfg), d, "same latency");
+                // Requested from the very next block (no settle delay); the
+                // engine switches after its 5 ms fade-out, at a hop boundary.
+                run(&mut p, &v, &mut host, 64);
+                assert_eq!(
+                    p.active.map(|a| a.structural.voice_range),
+                    Some(cfg.voice_range)
+                );
+                for _ in 0..5 {
+                    run(&mut p, &v, &mut host, 64);
+                }
+                assert_eq!(
+                    p.engine.as_ref().map(|e| e.config().voice_range),
+                    Some(cfg.voice_range),
+                    "{api:?} {mode:?}: the running engine took the new range"
+                );
+                for _ in 0..300 {
+                    run(&mut p, &v, &mut host, 64);
+                }
+                assert_eq!(host.restarts, 0, "{api:?} {mode:?}");
+                assert!(host.latency_calls.is_empty(), "{api:?} {mode:?}");
+                assert!(host.tasks.is_empty(), "{api:?} {mode:?}: nothing built");
+                assert_eq!(
+                    p.engine.as_deref().map(std::ptr::from_ref),
+                    before,
+                    "{api:?} {mode:?}: the same engine instance"
+                );
+                assert!(!p.restart_pending());
+                assert!(!p.shared.restart_pending.load(Ordering::Acquire));
+            }
+        }
+        // Live Alto/Tenor → Soprano moves the latency: VST3 builds a new
+        // engine off-thread, CLAP asks for a restart.
+        for api in [PluginApi::Vst3, PluginApi::Clap] {
+            let mut p = VocalTune::default();
+            let mut v = ParamValues::default();
+            v.latency_mode = LatencyModeChoice::Live;
+            let d = p.activate_with(&v, 48_000.0, 512, 2);
+            let mut host = FakeHost {
+                api: Some(api),
+                ..FakeHost::default()
+            };
+            v.voice_range = VoiceRangeChoice::Soprano;
+            let cfg = v.structural().engine_config(48_000.0, 512, 2);
+            assert_ne!(vt_engine::latency_samples(&cfg), d);
+            for _ in 0..300 {
+                run(&mut p, &v, &mut host, 64);
+            }
+            match api {
+                PluginApi::Clap => assert_eq!((host.restarts, host.tasks.len()), (1, 0)),
+                _ => assert_eq!(host.tasks, vec![EngineTask::Build(cfg)]),
+            }
+        }
+    }
+
+    /// RT-3 support: the plugin's copy of the engine's sample clock (used to
+    /// group bends by hop) stays exact across odd block sizes and resets.
+    #[test]
+    fn engine_clock_mirror_tracks_the_hops() {
+        let mut p = VocalTune::default();
+        p.activate_with(&ParamValues::default(), 48_000.0, 4096, 2);
+        let mut host = FakeHost::default();
+        let hop = vt_core::hop_for_rate(48_000.0) as u64;
+        for (i, n) in [1usize, 7, 63, 64, 65, 480, 1000, 3]
+            .iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            run(&mut p, &ParamValues::default(), &mut host, *n);
+            let hops = p.engine.as_ref().map_or(0, |e| e.stats().hops);
+            assert_eq!(hops, p.engine_pos / hop, "block {i}");
+            if i == 20 {
+                <VocalTune as Plugin>::reset(&mut p);
+                assert_eq!(p.engine_pos, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_swaps_in_a_handed_engine() {
+        let mut p = VocalTune::default();
+        let live = p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
+        let mut gui = p.take_engine_swap();
+        let mut host = FakeHost {
+            api: Some(PluginApi::Standalone),
+            ..FakeHost::default()
+        };
+        let mut v = ParamValues::default();
+        v.latency_mode = LatencyModeChoice::Studio;
+        settle(&mut p, &v, &mut host);
+        assert!(p.shared.restart_pending.load(Ordering::Acquire));
+
+        // A stale engine (wrong config) is rejected and sent back at once.
+        let stale = ParamValues::default()
+            .structural()
+            .engine_config(48_000.0, 512, 2);
+        assert!(gui.outgoing.push((1, Box::new(Engine::new(stale)))).is_ok());
+        run(&mut p, &v, &mut host, 64);
+        assert!(gui.retired.pop().is_ok(), "stale engine returned");
+        assert_eq!(p.latency(), Some(live));
+
+        let cfg = v.structural().engine_config(48_000.0, 512, 2);
+        let studio = vt_engine::latency_samples(&cfg);
+        assert!(gui.outgoing.push((2, Box::new(Engine::new(cfg)))).is_ok());
+        // 3 ms fade-out of the running engine first, then the swap.
+        run(&mut p, &v, &mut host, 64);
+        assert_eq!(p.latency(), Some(live), "still fading out");
+        for _ in 0..3 {
+            run(&mut p, &v, &mut host, 64);
+        }
+        assert_eq!(p.latency(), Some(studio));
+        assert!(!p.restart_pending());
+        assert!(!p.shared.restart_pending.load(Ordering::Acquire));
+        assert_eq!(p.shared.latency_samples.load(Ordering::Relaxed), studio);
+        assert_eq!(p.shared.adopted_engine.load(Ordering::Acquire), 2);
+        let old = gui.retired.pop().expect("old engine handed back");
+        assert_eq!(old.latency_samples(), live);
+        assert!(host.latency_calls.is_empty() && host.restarts == 0);
+        // The new engine really runs: once its delay line has filled and the
+        // 3 ms fade-in is over, the output is the input delayed by D. (A
+        // 38 Hz tone, below every voice range, so nothing is pitch-shifted;
+        // the 76 Hz tone of `run` is inside Alto/Tenor's search margin and
+        // gets corrected once the detector has voiced it.)
+        let n = 4096;
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 * 0.005).sin()).collect();
+        let out = run_signal(&mut p, &v, &mut host, &input);
+        let d = studio as usize;
+        // The swap came at most three 64-sample blocks ago.
+        assert!(
+            out[0][..d - 192].iter().all(|&y| y == 0.0),
+            "muted while D fills"
+        );
+        let settled = d + 200;
+        assert!((settled..n).all(|i| (out[0][i] - input[i - d]).abs() < 1e-6));
+    }
+
+    /// HI-1: if a VST3 host has not re-activated the plugin after a latency
+    /// change (it may have dropped the request), `kLatencyChanged` is sent
+    /// again at 1, 3 and 7 s from the audio thread, editor open or not, and
+    /// a re-activation stops it.
+    #[test]
+    fn vst3_latency_change_is_re_requested_until_the_host_reactivates() {
+        let mut p = VocalTune::default();
+        p.activate_with(&ParamValues::default(), 48_000.0, 512, 2);
+        let mut host = FakeHost::default();
+        let mut v = ParamValues::default();
+        v.latency_mode = LatencyModeChoice::Studio;
+        settle(&mut p, &v, &mut host);
+        until_swapped(&mut p, &v, &mut host);
+        assert_eq!(host.latency_calls.len(), 1);
+        let mut at = Vec::new();
+        for block in 0..(10 * 48_000 / 480) {
+            run(&mut p, &v, &mut host, 480);
+            if host.restarts > at.len() {
+                at.push(block as f32 * 0.01);
+            }
+        }
+        assert_eq!(at.len(), 3, "{at:?}");
+        assert!((at[0] - 1.0).abs() < 0.02 && (at[1] - 3.0).abs() < 0.02);
+        assert!((at[2] - 7.0).abs() < 0.02, "{at:?}");
+
+        // A host that does re-activate stops the retries at once.
+        v.latency_mode = LatencyModeChoice::Live;
+        settle(&mut p, &v, &mut host);
+        until_swapped(&mut p, &v, &mut host);
+        let restarts = host.restarts;
+        p.activate_with(&v, 48_000.0, 512, 2);
+        for _ in 0..(10 * 48_000 / 480) {
+            run(&mut p, &v, &mut host, 480);
+        }
+        assert_eq!(host.restarts, restarts);
     }
 }

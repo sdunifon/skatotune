@@ -21,7 +21,8 @@
 //! `sum_sq` scalar 170 ns, NEON 91 ns; `axpy`/`mul_acc` scalar = NEON (memory
 //! bound, LLVM already vectorises the scalar loop); `diff_sq` with W = 1024
 //! and 512 lags: scalar 25.7 µs, NEON 16.3 µs. For W ≳ 512 the FFT route
-//! ([`crate::fft::Correlator::diff_sq`], 4.2 µs with vDSP at W = 1024) is
+//! ([`crate::fft::Correlator::diff_sq`], 3.4 µs with vDSP and 4.5 µs with
+//! realfft at W = 1024, n = 1536) is
 //! faster; the direct kernel stays exact for near-periodic frames, where the
 //! FFT route's `E₀ + E_τ − 2r` loses relative precision to cancellation.
 //!

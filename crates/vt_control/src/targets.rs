@@ -90,11 +90,6 @@ impl TargetSet {
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    #[inline]
     pub fn is_allowed(&self, n: usize) -> bool {
         self.allowed.get(n).copied().unwrap_or(false)
     }
@@ -199,7 +194,7 @@ mod tests {
     fn empty_scale_falls_back_to_chromatic() {
         let mut t = TargetSet::default();
         t.set_scale(&[NoteState::Remove; 12]);
-        assert!(!t.is_empty());
+        assert_eq!(t.source(), TargetSource::Scale);
         assert_eq!(t.nearest(6130.0), Some(61));
     }
 

@@ -5,7 +5,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use vt_core::fft::{Correlator, FftBackend};
+use vt_core::fft::{Correlator, FftBackend, FftSizing};
 use vt_core::filter::{Biquad, DcBlocker, Decimator, OnePoleLp};
 use vt_core::interp::{InterpQuality, Interpolator, cubic};
 use vt_core::math;
@@ -78,6 +78,11 @@ fn processing_paths_do_not_allocate() {
     let mut y = vec![0.0f32; 4096];
     let mut corrs: Vec<Correlator> =
         [FftBackend::RealFft, FftBackend::Vdsp].iter().map(|&b| Correlator::new(4096, b)).collect();
+    // Non-power-of-two (fast) sizes: 3072 = 3·2^10 and 3840 = 15·2^8.
+    for b in [FftBackend::RealFft, FftBackend::Vdsp] {
+        corrs.push(Correlator::with_sizing(3072, b, FftSizing::Fast));
+        corrs.push(Correlator::with_sizing(3800, b, FftSizing::Fast));
+    }
     let mut ring = Ring::new(8192);
     let interp = Interpolator::new();
     let mut dec = Decimator::new(48_000.0, 3);

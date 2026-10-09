@@ -22,6 +22,7 @@
 //! they cannot drift apart.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use nice_plug::prelude::*;
 use vt_core::{
@@ -461,6 +462,12 @@ impl Default for ParamValues {
     }
 }
 
+/// Snap Min below this many cents is off (RT-1). The knob's bottom position
+/// after a host's float round trip (normalized 1e-6 is 0.00005 c) must reach
+/// the control law as exactly 0, never as a microscopic dead zone. Same
+/// threshold as `vt_control`'s own flush, so both layers agree.
+pub const SNAP_MIN_OFF_BELOW_CENTS: f32 = 0.05;
+
 /// Clamp to `[lo, hi]`, mapping NaN/Inf to `fallback` (Settings must never
 /// carry non-finite values into the control law).
 fn clean(x: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
@@ -498,6 +505,7 @@ impl ParamValues {
         let key = self.key.pitch_class();
         let scale: ScaleKind = self.scale.into();
         let snap_max = clean(self.snap_max_st, 0.0, 12.0, 0.0);
+        let snap_min = clean(self.snap_min_cents, 0.0, 50.0, 0.0);
         Settings {
             tier: self.tier.into(),
             engine: self.engine.into(),
@@ -516,7 +524,11 @@ impl ParamValues {
             amount: clean(self.amount_pct * 0.01, 0.0, 1.0, 1.0),
             tolerance_cents: clean(self.tolerance_cents, 0.0, 40.0, 8.0),
             tolerance_ms: clean(self.tolerance_ms, 0.0, 300.0, 0.0),
-            snap_min_cents: clean(self.snap_min_cents, 0.0, 50.0, 0.0),
+            snap_min_cents: if snap_min < SNAP_MIN_OFF_BELOW_CENTS {
+                0.0
+            } else {
+                snap_min
+            },
             // The knob's bottom position reads "Off"; anything below a hair
             // above zero is treated as off so a host's float jitter cannot
             // turn on a 0.001 st limit that would disable all correction.
@@ -952,6 +964,12 @@ pub struct VocalTuneParams {
     pub midi_all_octaves: BoolParam,
     #[id = "bend_range"]
     pub bend_range: FloatParam,
+
+    // --- Saved state that is not a parameter --------------------------------------------
+    /// Scale learned through MIDI Learn ([`crate::learn`] word layout). Saved
+    /// with the project; engine resets and rebuilds never clear it.
+    #[persist = "learned-scale"]
+    pub learned_scale: AtomicU32,
 }
 
 impl Default for VocalTuneParams {
@@ -1068,7 +1086,20 @@ impl VocalTuneParams {
             midi_all_octaves: BoolParam::new("MIDI All Octaves", d.midi_all_octaves),
             bend_range: linear("Bend Range", d.bend_range_st, 0.0, 12.0, " st", 0)
                 .with_step_size(1.0),
+            learned_scale: AtomicU32::new(0),
         }
+    }
+
+    /// The scale learned through MIDI Learn, if any (On = learned, the rest
+    /// Remove). Atomic load; safe on any thread.
+    pub fn learned_states(&self) -> Option<[NoteState; 12]> {
+        crate::learn::unpack(self.learned_scale.load(Ordering::Relaxed))
+    }
+
+    /// Forget the learned scale: correction returns to Key/Scale and the note
+    /// overrides. Atomic store; safe on any thread.
+    pub fn clear_learned_scale(&self) {
+        self.learned_scale.store(0, Ordering::Relaxed);
     }
 
     /// The override parameter of pitch class `pc` (0 = C; wraps modulo 12).

@@ -481,17 +481,62 @@ pub fn button(
     }
 }
 
-/// A compact draggable value box (drag up/right to increase, double-click
-/// resets), with a thin position bar along its bottom edge.
+/// A compact draggable value box for a **structural** parameter (drag
+/// up/right to increase, double-click resets), with a thin position bar
+/// along its bottom edge.
+///
+/// Every change of a structural parameter restarts the plugin, so the value
+/// is only previewed while dragging and written once, on release (one
+/// begin/set/end gesture); the scroll wheel is ignored. Streaming every
+/// dragged step would ask the host for one restart per step.
 pub fn value_box(ui: &mut Ui, rect: Rect, setter: &ParamSetter, param: &FloatParam) -> Response {
     let resp = ui.interact(
         rect,
         Id::new(("vt-valuebox", param.name())),
         Sense::click_and_drag(),
     );
-    let d = resp.drag_delta();
-    drive_float(ui, &resp, setter, param, d.x - d.y);
-    let norm = shown_normalized(ui, &resp, param);
+    let id = resp.id.with("drag");
+    if resp.drag_started() {
+        let start = param.unmodulated_normalized_value();
+        ui.data_mut(|d| {
+            d.insert_temp(
+                id,
+                DragState {
+                    start,
+                    accumulated: 0.0,
+                },
+            )
+        });
+    }
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        let fine = ui.input(|i| i.modifiers.shift);
+        let speed = if fine { FINE_DRAG_SPEED } else { DRAG_SPEED };
+        let mut st: DragState = ui.data(|m| m.get_temp(id)).unwrap_or_default();
+        st.accumulated = (st.accumulated + (d.x - d.y) * speed).clamp(-st.start, 1.0 - st.start);
+        ui.data_mut(|m| m.insert_temp(id, st));
+    }
+    // Preview: the dragged value snapped to the parameter's steps.
+    let preview = ui
+        .data(|m| m.get_temp::<DragState>(id))
+        .filter(|_| resp.dragged() || resp.drag_stopped())
+        .map(|st| param.preview_normalized(param.preview_plain(st.start + st.accumulated)));
+    if resp.drag_stopped() {
+        if let Some(norm) = preview
+            && (norm - param.unmodulated_normalized_value()).abs() > 1e-6
+        {
+            setter.begin_set_parameter(param);
+            setter.set_parameter_normalized(param, norm);
+            setter.end_set_parameter(param);
+        }
+        ui.data_mut(|m| m.remove::<DragState>(id));
+    }
+    if resp.double_clicked() {
+        setter.begin_set_parameter(param);
+        setter.set_parameter_normalized(param, param.default_normalized_value());
+        setter.end_set_parameter(param);
+    }
+    let norm = preview.unwrap_or_else(|| param.unmodulated_normalized_value());
     let hovered = resp.hovered() || resp.dragged();
     let painter = ui.painter();
     painter.rect_filled(
@@ -520,5 +565,123 @@ pub fn value_box(ui: &mut Ui, rect: Rect, setter: &ParamSetter, param: &FloatPar
         theme::mono(11.5),
         if hovered { ACCENT } else { TEXT },
     );
-    resp.on_hover_text("Drag to change, double-click to reset. Changing it restarts the plugin.")
+    resp.on_hover_text(
+        "Drag to change (applied when you let go), double-click to reset. Changing it restarts the plugin.",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use egui::{Event, Modifiers, MouseWheelUnit, PointerButton, RawInput, TouchPhase};
+    use nice_plug::context::gui::GuiContext;
+
+    /// Records every gesture the widget sends to the host.
+    #[derive(Default)]
+    struct Recorder {
+        log: Mutex<Vec<&'static str>>,
+    }
+
+    impl GuiContextInner for Recorder {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Vst3
+        }
+        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {
+            self.log.lock().unwrap().push("begin");
+        }
+        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {
+            self.log.lock().unwrap().push("set");
+        }
+        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {
+            self.log.lock().unwrap().push("end");
+        }
+        fn get_state(&self) -> PluginState {
+            PluginState {
+                version: String::new(),
+                params: Default::default(),
+                fields: Default::default(),
+            }
+        }
+        fn set_state(&self, _state: PluginState) {}
+        fn request_restart(&self) {}
+    }
+
+    /// Run frames of a single value box at (100, 100)-(170, 124) with the
+    /// given input events per frame; returns the gestures sent.
+    fn drive(frames: Vec<Vec<Event>>) -> Vec<&'static str> {
+        let recorder = Arc::new(Recorder::default());
+        let gui = GuiContext::new(recorder.clone());
+        let param = FloatParam::new(
+            "Studio Latency",
+            40.0,
+            FloatRange::Linear {
+                min: 20.0,
+                max: 50.0,
+            },
+        )
+        .with_step_size(1.0);
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(70.0, 24.0));
+        for (i, events) in frames.into_iter().enumerate() {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+                time: Some(i as f64 / 60.0),
+                events,
+                ..RawInput::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let setter = gui.param_setter();
+                value_box(ui, rect, &setter, &param);
+            });
+            out.textures_delta.clear(); // nothing renders here
+        }
+        recorder.log.lock().unwrap().clone()
+    }
+
+    fn press(pos: Pos2, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// HI-2: a drag across many steps writes the parameter once, on release.
+    #[test]
+    fn value_box_commits_a_drag_once_on_release() {
+        let start = pos2(135.0, 112.0);
+        let mut frames = vec![vec![Event::PointerMoved(start)], vec![press(start, true)]];
+        let mut pos = start;
+        for _ in 0..20 {
+            pos += vec2(0.0, -7.0); // ≈ one 1 ms step per frame
+            frames.push(vec![Event::PointerMoved(pos)]);
+        }
+        frames.push(vec![press(pos, false)]);
+        frames.push(vec![]);
+        let log = drive(frames);
+        assert_eq!(
+            log,
+            vec!["begin", "set", "end"],
+            "one gesture for the whole drag"
+        );
+    }
+
+    /// HI-2: the scroll wheel does not change a structural value.
+    #[test]
+    fn value_box_ignores_the_scroll_wheel() {
+        let at = pos2(135.0, 112.0);
+        let mut frames = vec![vec![Event::PointerMoved(at)]];
+        for _ in 0..10 {
+            frames.push(vec![Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0.0, 20.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+        assert!(drive(frames).is_empty());
+    }
 }

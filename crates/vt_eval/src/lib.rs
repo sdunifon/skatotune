@@ -13,6 +13,8 @@
 //!   measured latency, clicks, formant LSD, aligned segmental SNR.
 //! - [`scenarios`] / [`suite`]: named test signals and the full evaluation
 //!   matrix with the DESIGN §4 gates; [`rtbench`]: callback tail latencies.
+//! - [`vocadito`]: detector and correction evaluation on real singing (the
+//!   vocadito dataset) against its F0 and note annotations.
 //!
 //! The `vt_eval` binary (`src/main.rs`) exposes all of this on the command line.
 
@@ -25,4 +27,5 @@ pub mod rtbench;
 pub mod scenarios;
 pub mod suite;
 pub mod synth;
+pub mod vocadito;
 pub mod wav;

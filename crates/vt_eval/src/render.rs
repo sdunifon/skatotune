@@ -6,7 +6,9 @@
 //! comes out. Everything the engine sees is deterministic, so two renders with
 //! the same options are bit-identical.
 
-use vt_core::{EngineConfig, EngineKind, LatencyMode, MidiEvent, PitchFrame, QualityTier, Settings};
+use vt_core::{
+    EngineConfig, EngineKind, LatencyMode, MidiEvent, PitchFrame, QualityTier, Settings,
+};
 use vt_engine::{Engine, EngineStats, TimedMidi};
 
 use crate::rng::Rng;
@@ -18,14 +20,25 @@ pub enum BlockPattern {
     /// Cycle through these sizes.
     Sequence(Vec<usize>),
     /// Uniform random sizes in [min, max] from a fixed seed.
-    Random { seed: u64, min: usize, max: usize },
+    Random {
+        seed: u64,
+        min: usize,
+        max: usize,
+    },
 }
 
 impl BlockPattern {
     /// The standard invariance set of R§8.0: {1, 7, 32, 64, 128, 480, 4096, random}.
     pub fn invariance_set() -> Vec<BlockPattern> {
-        let mut v: Vec<BlockPattern> = [1, 7, 32, 64, 128, 480, 4096].into_iter().map(BlockPattern::Fixed).collect();
-        v.push(BlockPattern::Random { seed: 0xb10c, min: 1, max: 1500 });
+        let mut v: Vec<BlockPattern> = [1, 7, 32, 64, 128, 480, 4096]
+            .into_iter()
+            .map(BlockPattern::Fixed)
+            .collect();
+        v.push(BlockPattern::Random {
+            seed: 0xb10c,
+            min: 1,
+            max: 1500,
+        });
         v
     }
 
@@ -83,9 +96,25 @@ pub struct RenderOptions {
 impl RenderOptions {
     /// Mono engine at `sample_rate` with default settings, 64-sample blocks.
     pub fn new(sample_rate: f32, mode: LatencyMode, tier: QualityTier) -> Self {
-        let config = EngineConfig { sample_rate, channels: 1, latency_mode: mode, ..EngineConfig::default() };
-        let settings = Settings { tier, engine: default_engine(mode), ..Settings::default() };
-        Self { config, settings, blocks: BlockPattern::Fixed(64), telemetry: true, midi: Vec::new(), extra_tail: 0 }
+        let config = EngineConfig {
+            sample_rate,
+            channels: 1,
+            latency_mode: mode,
+            ..EngineConfig::default()
+        };
+        let settings = Settings {
+            tier,
+            engine: default_engine(mode),
+            ..Settings::default()
+        };
+        Self {
+            config,
+            settings,
+            blocks: BlockPattern::Fixed(64),
+            telemetry: true,
+            midi: Vec::new(),
+            extra_tail: 0,
+        }
     }
 
     pub fn with_settings(mut self, s: Settings) -> Self {
@@ -107,7 +136,29 @@ impl RenderOptions {
 /// Live-Min only allows the Classic engine (DESIGN §3.4); every other mode
 /// defaults to PSOLA.
 pub fn default_engine(mode: LatencyMode) -> EngineKind {
-    if mode == LatencyMode::LiveMin { EngineKind::Classic } else { EngineKind::Natural }
+    if mode == LatencyMode::LiveMin {
+        EngineKind::Classic
+    } else {
+        EngineKind::Natural
+    }
+}
+
+/// Hops between the end of a hop and the boundary at which the engine applies
+/// that hop's control and emits its telemetry frame: 1 for the Studio
+/// pipeline (RT-2; the engine pipelines Studio whenever
+/// [`vt_engine::studio_split`] leaves the control law a lead of at least one
+/// hop), 0 otherwise. The first `pipeline_hops` hops after a reset therefore
+/// apply no control and emit no frame, so a render has
+/// `stats.hops − pipeline_hops` frames, and frame `j` is produced at the
+/// boundary that closes hop `j + pipeline_hops`.
+pub fn pipeline_hops(config: &EngineConfig) -> u64 {
+    if config.latency_mode != LatencyMode::Studio {
+        return 0;
+    }
+    let hop = vt_core::hop_for_rate(config.sample_rate);
+    let d = vt_engine::latency_samples(config) as usize;
+    let (_, lead) = vt_engine::studio_split(config.sample_rate, hop, config.voice_range, d);
+    u64::from(lead >= 1)
 }
 
 /// The result of a render.
@@ -135,6 +186,36 @@ impl Rendered {
         let end = (d + self.input_len).min(raw.len());
         raw.get(d.min(end)..end).unwrap_or(&[])
     }
+}
+
+/// Collect the events of the block `[pos, pos + n)` from the sorted absolute
+/// list (continuing at `*idx`) with block-relative timings. Events before
+/// `pos` that were never delivered land at offset 0.
+fn block_events(
+    midi: &[(u64, MidiEvent)],
+    idx: &mut usize,
+    pos: usize,
+    n: usize,
+    out: &mut Vec<TimedMidi>,
+) {
+    out.clear();
+    while let Some((t, ev)) = midi.get(*idx) {
+        let t = *t as usize;
+        if t >= pos + n {
+            break;
+        }
+        out.push(TimedMidi {
+            timing: t.saturating_sub(pos) as u32,
+            event: *ev,
+        });
+        *idx += 1;
+    }
+}
+
+/// Render a synthetic [`Signal`](crate::synth::Signal) (mono, duplicated
+/// onto every engine channel).
+pub fn render_signal(sig: &crate::synth::Signal, opts: &RenderOptions) -> Rendered {
+    render(&sig.audio, opts)
 }
 
 /// Render mono `input`, duplicated onto every engine channel.
@@ -186,15 +267,7 @@ pub fn render_with(engine: &mut Engine, inputs: &[&[f32]], opts: &RenderOptions)
 
     let mut pos = 0usize;
     for n in opts.blocks.blocks(total) {
-        block_midi.clear();
-        while let Some((t, ev)) = midi.get(midi_idx) {
-            let t = *t as usize;
-            if t >= pos + n {
-                break;
-            }
-            block_midi.push(TimedMidi { timing: t.saturating_sub(pos) as u32, event: *ev });
-            midi_idx += 1;
-        }
+        block_events(&midi, &mut midi_idx, pos, n, &mut block_midi);
         let mut io: Vec<&mut [f32]> = channels.iter_mut().map(|c| &mut c[pos..pos + n]).collect();
         engine.process(&mut io, &block_midi);
         if let Some(c) = consumer.as_mut() {
@@ -204,7 +277,13 @@ pub fn render_with(engine: &mut Engine, inputs: &[&[f32]], opts: &RenderOptions)
         }
         pos += n;
     }
-    Rendered { channels, latency, input_len, telemetry, stats: engine.stats() }
+    Rendered {
+        channels,
+        latency,
+        input_len,
+        telemetry,
+        stats: engine.stats(),
+    }
 }
 
 #[cfg(test)]
@@ -221,14 +300,20 @@ mod tests {
         let b = BlockPattern::Sequence(vec![3, 5]).blocks(12);
         assert_eq!(b, vec![3, 5, 3, 1]);
         // Random patterns are reproducible.
-        let r = BlockPattern::Random { seed: 1, min: 1, max: 100 };
+        let r = BlockPattern::Random {
+            seed: 1,
+            min: 1,
+            max: 100,
+        };
         assert_eq!(r.blocks(5000), r.blocks(5000));
     }
 
     #[test]
     fn aligned_output_strips_latency() {
         let opts = RenderOptions::new(48_000.0, LatencyMode::Live, QualityTier::Hq);
-        let input: Vec<f32> = (0..4800).map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5).collect();
+        let input: Vec<f32> = (0..4800)
+            .map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5)
+            .collect();
         let r = render(&input, &opts);
         assert_eq!(r.raw(0).len(), input.len() + r.latency as usize);
         assert_eq!(r.aligned(0).len(), input.len());
@@ -237,10 +322,48 @@ mod tests {
 
     #[test]
     fn midi_is_split_per_block() {
-        // Events land in the block containing them with block-relative timing;
-        // here we only check the harness bookkeeping (the stub ignores MIDI).
+        let on = MidiEvent::NoteOn {
+            note: 60,
+            velocity: 1.0,
+        };
+        let off = MidiEvent::NoteOff { note: 60 };
+        let midi = vec![(5, MidiEvent::AllNotesOff), (64, on), (100, off), (130, on)];
+        let (mut idx, mut out) = (0, Vec::new());
+        let mut got = Vec::new();
+        for (pos, n) in [(0, 64), (64, 64), (128, 64)] {
+            block_events(&midi, &mut idx, pos, n, &mut out);
+            got.push(out.clone());
+        }
+        assert_eq!(
+            got[0],
+            vec![TimedMidi {
+                timing: 5,
+                event: MidiEvent::AllNotesOff
+            }]
+        );
+        assert_eq!(
+            got[1],
+            vec![
+                TimedMidi {
+                    timing: 0,
+                    event: on
+                },
+                TimedMidi {
+                    timing: 36,
+                    event: off
+                }
+            ]
+        );
+        assert_eq!(
+            got[2],
+            vec![TimedMidi {
+                timing: 2,
+                event: on
+            }]
+        );
+        // A full render with MIDI runs through the engine API.
         let mut opts = RenderOptions::new(48_000.0, LatencyMode::Live, QualityTier::Hq);
-        opts.midi = vec![(100, MidiEvent::NoteOn { note: 60, velocity: 1.0 }), (5, MidiEvent::AllNotesOff)];
+        opts.midi = midi;
         let r = render(&vec![0.0; 1000], &opts);
         assert_eq!(r.input_len, 1000);
     }

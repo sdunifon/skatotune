@@ -9,15 +9,19 @@ pub(crate) const FLEX_TAPER: f32 = 0.4;
 /// Soft dead zone: `e2 = e1 · x² / (1 + x²)` with `x = |e1| / D0`.
 ///
 /// Errors well below `D0` are attenuated quadratically (left mostly alone),
-/// errors well above it pass almost unchanged. `D0 <= 0` disables it.
+/// errors well above it pass almost unchanged. `D0 <= 0` (or NaN) disables it.
+///
+/// Evaluated as `e1 / (1 + 1/x²)`, which is the same function but total in
+/// f32: a tiny `D0` (e.g. 1e-20 c from an automation tail) makes `x²`
+/// overflow to infinity, and `e1·∞/(1 + ∞)` would be NaN, while
+/// `e1/(1 + 0)` is the correct limit `e1`. `e1 = 0` gives `0/∞ = 0`.
 #[inline]
 pub(crate) fn snap_min(e1: f32, d0: f32) -> f32 {
-    if d0 <= 0.0 {
+    if d0.is_nan() || d0 <= 0.0 {
         return e1;
     }
-    let x = e1.abs() / d0;
-    let x2 = x * x;
-    e1 * x2 / (1.0 + x2)
+    let x = e1 / d0;
+    e1 / (1.0 + 1.0 / (x * x))
 }
 
 /// Flex-Tune weight `w(d)` for a deviation `d = |p_dec − pitch(n*)|`.
@@ -64,6 +68,29 @@ mod tests {
         // Small errors are strongly attenuated, large ones barely touched.
         assert!(snap_min(2.0, 20.0).abs() < 0.02);
         assert!((snap_min(200.0, 10.0) - 200.0).abs() < 0.6);
+        assert_eq!(snap_min(0.0, 10.0), 0.0);
+        assert_eq!(snap_min(5.0, f32::NAN), 5.0);
+    }
+
+    /// RT-1: tiny and subnormal Snap Min values (automation or modulation
+    /// tails) used to overflow `x²` and return NaN, which then latched in the
+    /// retune one-pole. The dead zone must be finite for every finite input
+    /// and converge to the identity as `D0 → 0`.
+    #[test]
+    fn snap_min_is_total_for_tiny_dead_zones() {
+        let d0s = [1e-45f32, 1e-40, 1e-38, 1e-30, 1e-20, 1e-17, 1e-12, 1e-3];
+        let errs = [0.01f32, 0.1, 1.0, 5.0, 35.0, 100.0, 600.0, 1200.0, 2400.0];
+        for d0 in d0s {
+            for e in errs {
+                for e1 in [e, -e] {
+                    let y = snap_min(e1, d0);
+                    assert!(y.is_finite(), "snap_min({e1}, {d0}) = {y}");
+                    // x ≥ 10 for all of these: at most 1 % attenuation.
+                    assert!((y - e1).abs() <= 0.01 * e1.abs() + 1e-6, "snap_min({e1}, {d0}) = {y}");
+                }
+            }
+            assert_eq!(snap_min(0.0, d0), 0.0);
+        }
     }
 
     #[test]

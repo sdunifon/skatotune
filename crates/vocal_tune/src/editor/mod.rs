@@ -30,7 +30,7 @@ mod demo;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{Align2, CornerRadius, Id, Rect, Stroke, StrokeKind, Ui, pos2, vec2};
 use nice_plug::context::gui::GuiContext;
@@ -39,9 +39,12 @@ use nice_plug::prelude::*;
 use nice_plug_egui::{
     EguiEditor, EguiEditorState, EguiNiceSettings, NiceEguiApp, RepaintNotifier, create_egui_editor,
 };
-use vt_core::{NoteState, PitchFrame, frame_flags};
+use vt_core::{NoteState, PitchFrame, cents_to_hz, frame_flags};
 
-use crate::params::{EngineChoice, LatencyModeChoice, ParamValues, Preset, VocalTuneParams};
+use crate::params::{
+    EngineChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues, Preset,
+    VocalTuneParams,
+};
 use crate::shared::SharedState;
 use graph::{RollContext, RollScratch, draw_pitch_roll, is_voiced, note_label};
 use history::{DisplayClock, GraphView, PitchHistory};
@@ -119,6 +122,115 @@ impl Readouts {
     }
 }
 
+/// Mean content wander as a fraction of the period `period` for a reported
+/// latency `latency` (both in samples).
+///
+/// Pitch-synchronous shifting repeats or skips whole periods, so while the
+/// pitch is being shifted the voice itself is delayed by `D − e`, with `e`
+/// wandering over about one period (R§2.1). How far it trails D depends on
+/// how far ahead of the output the engine can see pitch marks: while D minus
+/// the mark delay is short compared with T (Live-Min; Live and Live+ for
+/// periods longer than the look-ahead) only the latest mark is known and the
+/// voice trails D by 0..T, mean ≈ 0.46·T; once D covers about 1.45 periods
+/// beyond the mark delay the nearest mark is known and the mean is ≈ 0
+/// (Studio; high voices in Live and Live+). Fitted to the shifter's
+/// content-offset diagnostic for both engines in every mode (±25/±50 c
+/// shifts, 70-600 Hz): within about 0.05·T.
+fn wander_fraction(period: f32, latency: f32) -> f32 {
+    if !(period > 0.0 && period.is_finite()) {
+        return 0.0;
+    }
+    let lookahead = (latency - 10.0 - 0.2 * period) / period;
+    0.46 * ((1.45 - lookahead) / 0.5).clamp(0.0, 1.0)
+}
+
+/// Time-averaged extra delay of the voice beyond the reported latency, for
+/// the "avg" latency readout.
+#[derive(Clone, Copy, Debug, Default)]
+struct AvgDelay {
+    /// Mean wander over recent voiced time, ms.
+    extra_ms: f32,
+    /// Mean period of the detected input pitch over the same time, ms.
+    period_ms: f32,
+    valid: bool,
+    /// Reported latency the average was built for (a new engine starts over).
+    latency: u32,
+}
+
+/// Averaging time of [`AvgDelay`] (voiced time only), seconds.
+const AVG_DELAY_TAU_S: f32 = 2.0;
+
+impl AvgDelay {
+    /// Fold in the newest voiced frame (`None` = not singing: hold).
+    fn update(&mut self, frame: Option<&PitchFrame>, dt: f32, sample_rate: f32, latency: u32) {
+        if latency != self.latency {
+            *self = Self {
+                latency,
+                ..Self::default()
+            };
+        }
+        let Some(f) = frame.filter(|f| f.detected > 0.0) else {
+            return;
+        };
+        let hz = cents_to_hz(f.detected);
+        if !(hz.is_finite() && hz > 1.0 && sample_rate > 0.0) {
+            return;
+        }
+        let period_ms = 1000.0 / hz;
+        // Periods are only repeated or skipped while the pitch is shifted.
+        let shifting = (f.output - f.detected).abs() > 1.0;
+        let extra = if shifting {
+            wander_fraction(sample_rate / hz, latency as f32) * period_ms
+        } else {
+            0.0
+        };
+        if self.valid {
+            let a = 1.0 - (-dt / AVG_DELAY_TAU_S).exp();
+            self.extra_ms += a * (extra - self.extra_ms);
+            self.period_ms += a * (period_ms - self.period_ms);
+        } else {
+            self.extra_ms = extra;
+            self.period_ms = period_ms;
+            self.valid = true;
+        }
+    }
+
+    /// Expected delay of the voice: reported latency plus the mean wander.
+    fn expected_ms(&self, reported_ms: f32) -> Option<f32> {
+        self.valid.then_some(reported_ms + self.extra_ms)
+    }
+}
+
+/// How long a pending structural change has been waiting, to offer the host
+/// restart as a click when the host takes its time (CLAP with a new latency;
+/// any change whose engine has not arrived). Automatic re-requests are the
+/// audio thread's job (VST3 only, `LATENCY_RETRY_AT_S`): it runs even while
+/// the editor is closed, e.g. during project load.
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingSince {
+    since: Option<Instant>,
+}
+
+impl PendingSince {
+    /// Wait before offering the manual restart.
+    const OVERDUE: Duration = Duration::from_secs(1);
+
+    /// Track `pending` (a structural change is waiting).
+    fn update(&mut self, pending: bool, now: Instant) {
+        self.since = if pending {
+            Some(self.since.unwrap_or(now))
+        } else {
+            None
+        };
+    }
+
+    /// The change has been waiting long enough to offer a manual restart.
+    fn overdue(&self, now: Instant) -> bool {
+        self.since
+            .is_some_and(|s| now.saturating_duration_since(s) >= Self::OVERDUE)
+    }
+}
+
 /// The editor app. Lives for the plugin's lifetime and survives editor
 /// close/reopen; the egui and GUI contexts are replaced on every open.
 pub struct VocalTuneEditor {
@@ -131,10 +243,10 @@ pub struct VocalTuneEditor {
     view: GraphView,
     scratch: RollScratch,
     readouts: Readouts,
+    avg: AvgDelay,
     advanced_open: bool,
     last_ui: Option<Instant>,
-    /// Engine generation a standalone state reload was requested for.
-    reload_requested_for: Option<u32>,
+    pending: PendingSince,
     #[cfg(feature = "demo-telemetry")]
     demo: demo::DemoSource,
     #[cfg(feature = "demo-telemetry")]
@@ -157,9 +269,10 @@ impl VocalTuneEditor {
             view: GraphView::default(),
             scratch: RollScratch::default(),
             readouts: Readouts::default(),
+            avg: AvgDelay::default(),
             advanced_open: false,
             last_ui: None,
-            reload_requested_for: None,
+            pending: PendingSince::default(),
             #[cfg(feature = "demo-telemetry")]
             demo: demo::DemoSource::default(),
             #[cfg(feature = "demo-telemetry")]
@@ -240,22 +353,6 @@ impl VocalTuneEditor {
         }
     }
 
-    /// The standalone wrapper cannot restart a plugin; reloading the state
-    /// re-runs `activate()`, which rebuilds the engine.
-    fn standalone_reload(&mut self, gui: &GuiContext) {
-        if gui.plugin_api() != PluginApi::Standalone
-            || !self.shared.restart_pending.load(Ordering::Acquire)
-        {
-            return;
-        }
-        let generation = self.shared.engine_generation.load(Ordering::Acquire);
-        if self.reload_requested_for != Some(generation) {
-            self.reload_requested_for = Some(generation);
-            let state = gui.get_state();
-            gui.set_state(state);
-        }
-    }
-
     /// Newest voiced frame within 150 ms of the display "now".
     fn recent_voiced(&self, now_pos: f64) -> Option<PitchFrame> {
         let recent = 0.15 * self.sample_rate();
@@ -316,24 +413,28 @@ impl VocalTuneEditor {
 
         let values = self.params.values();
         let settings = values.to_settings();
-        let learned = if values.midi_mode == crate::params::MidiModeChoice::Learn {
-            self.shared.learned()
-        } else {
-            None
-        };
+        // A learned scale replaces Key/Scale in every MIDI mode until cleared.
+        let learned = self.params.learned_states();
         let states = learned.unwrap_or(settings.note_states);
+        self.pending
+            .update(self.shared.restart_pending.load(Ordering::Acquire), now);
         let voiced_seen = self.pump_telemetry(now);
         #[cfg(feature = "demo-telemetry")]
         self.pump_demo(now, voiced_seen, &values, &states);
         #[cfg(not(feature = "demo-telemetry"))]
         let _ = voiced_seen; // only the demo cares
-        self.standalone_reload(&gui);
 
         let sr = self.sample_rate();
         let now_pos = self.clock.tick(now, sr);
         let recent = self.recent_voiced(now_pos);
         self.readouts
             .update(recent.as_ref(), values.transpose_st, dt);
+        self.avg.update(
+            recent.as_ref(),
+            dt,
+            sr as f32,
+            self.shared.latency_samples.load(Ordering::Relaxed),
+        );
         let follow = recent.map(|f| if f.target > 0.0 { f.target } else { f.output });
         self.view.follow(follow, dt);
 
@@ -342,7 +443,7 @@ impl VocalTuneEditor {
             .rect_filled(full, CornerRadius::ZERO, theme::BG);
 
         let header = Rect::from_min_size(full.min, vec2(WIDTH, HEADER_H));
-        self.header(ui, header, &setter, &values);
+        self.header(ui, header, &setter, &values, now);
 
         let sidebar = Rect::from_min_max(
             pos2(full.left() + MARGIN, header.bottom() + MARGIN),
@@ -458,7 +559,14 @@ fn cents_meter(ui: &Ui, rect: Rect, value: f32, range: f32, valid: bool) {
 }
 
 impl VocalTuneEditor {
-    fn header(&mut self, ui: &mut Ui, rect: Rect, setter: &ParamSetter, v: &ParamValues) {
+    fn header(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        setter: &ParamSetter,
+        v: &ParamValues,
+        now: Instant,
+    ) {
         let p = ui.painter().clone();
         p.rect_filled(rect, CornerRadius::ZERO, PANEL);
         p.hline(
@@ -579,36 +687,15 @@ impl VocalTuneEditor {
             );
         }
 
-        // Latency readout.
-        let sr = self.sample_rate() as f32;
-        let latency = self.shared.latency_samples.load(Ordering::Relaxed);
-        let x = rect.left() + 900.0;
-        widgets::caption(ui, pos2(x, rect.top() + 19.0), "LATENCY");
-        p.text(
-            pos2(x, rect.top() + 33.0),
-            Align2::LEFT_CENTER,
-            format!("{:.1} ms", latency as f32 / sr * 1000.0),
-            theme::mono(13.0),
-            TEXT,
+        // Latency readout: reported D, and the average delay of the voice.
+        self.latency_readout(
+            ui,
+            Rect::from_min_size(
+                pos2(rect.left() + 900.0, rect.top()),
+                vec2(100.0, rect.height()),
+            ),
+            now,
         );
-        if self.shared.restart_pending.load(Ordering::Acquire) {
-            let pending = self.shared.pending_latency_samples.load(Ordering::Relaxed);
-            p.text(
-                pos2(x, rect.top() + 47.0),
-                Align2::LEFT_CENTER,
-                format!("→ {:.1} ms after restart", pending as f32 / sr * 1000.0),
-                theme::font(9.0),
-                WARN,
-            );
-        } else {
-            p.text(
-                pos2(x, rect.top() + 47.0),
-                Align2::LEFT_CENTER,
-                format!("{latency} samples"),
-                theme::font(9.0),
-                TEXT_FAINT,
-            );
-        }
 
         // CPU meter: average bar plus a peak tick, as % of the buffer period.
         let x = rect.left() + 1004.0;
@@ -646,6 +733,97 @@ impl VocalTuneEditor {
         );
     }
 
+    /// The LATENCY block of the header (`rect` spans the header height).
+    fn latency_readout(&mut self, ui: &mut Ui, rect: Rect, now: Instant) {
+        let p = ui.painter().clone();
+        let sr = self.sample_rate() as f32;
+        let ms = |samples: u32| samples as f32 / sr * 1000.0;
+        let latency = self.shared.latency_samples.load(Ordering::Relaxed);
+        let x = rect.left();
+        widgets::caption(ui, pos2(x, rect.top() + 19.0), "LATENCY");
+        // Line 1: the reported latency D (what the host compensates).
+        let d = p.text(
+            pos2(x, rect.top() + 33.0),
+            Align2::LEFT_CENTER,
+            format!("{:.1} ms", ms(latency)),
+            theme::mono(13.0),
+            TEXT,
+        );
+        p.text(
+            pos2(d.right() + 4.0, rect.top() + 34.0),
+            Align2::LEFT_CENTER,
+            "reported",
+            theme::font(8.5),
+            TEXT_FAINT,
+        );
+        let avg = self.avg.expected_ms(ms(latency));
+        let line2 = pos2(x, rect.top() + 47.0);
+        let api = self.gui.as_ref().map(GuiContext::plugin_api);
+        let pending = self.shared.restart_pending.load(Ordering::Acquire);
+        if pending {
+            let target = ms(self.shared.pending_latency_samples.load(Ordering::Relaxed));
+            let host_restarts = matches!(api, Some(PluginApi::Vst3 | PluginApi::Clap));
+            let awaiting_host = self.shared.awaiting_host.load(Ordering::Relaxed);
+            if host_restarts && self.pending.overdue(now) {
+                // The host is taking its time: offer the restart as a click.
+                let r = Rect::from_min_size(pos2(x - 2.0, line2.y - 7.0), vec2(100.0, 14.0));
+                let resp = ui.interact(r, Id::new("vt-apply-restart"), egui::Sense::click());
+                let col = if resp.hovered() { TEXT } else { WARN };
+                p.text(
+                    line2,
+                    Align2::LEFT_CENTER,
+                    format!("→ {target:.1} ms · APPLY"),
+                    theme::font(9.0),
+                    col,
+                );
+                if resp
+                    .on_hover_text(
+                        "The new setting is not running yet, so the old latency and voice range are still in use.\nClick to ask the host to restart the plugin.",
+                    )
+                    .clicked()
+                    && let Some(gui) = &self.gui
+                {
+                    gui.request_restart();
+                }
+            } else {
+                let text = if awaiting_host {
+                    format!("→ {target:.1} ms after restart")
+                } else {
+                    format!("→ {target:.1} ms applying")
+                };
+                p.text(line2, Align2::LEFT_CENTER, text, theme::font(9.0), WARN);
+            }
+            return;
+        }
+        // Line 2: the average delay of the voice you hear (D plus the mean
+        // PSOLA wander), once a voice has been detected.
+        let (text, col) = match avg {
+            Some(a) => (format!("heard avg {a:.1} ms"), TEXT_DIM),
+            None => ("heard avg --".to_string(), TEXT_FAINT),
+        };
+        p.text(line2, Align2::LEFT_CENTER, text, theme::font(9.0), col);
+
+        let block = self.shared.block_samples.load(Ordering::Relaxed);
+        let max_block = self.shared.max_block.load(Ordering::Relaxed);
+        let period = self.avg.valid.then_some(self.avg.period_ms);
+        let hover = Rect::from_min_max(
+            pos2(x - 4.0, rect.top() + 8.0),
+            pos2(rect.right(), rect.bottom()),
+        );
+        ui.interact(hover, Id::new("vt-latency-info"), egui::Sense::hover())
+            .on_hover_ui(|ui| {
+                ui.label(latency_tooltip(LatencyInfo {
+                    reported_samples: latency,
+                    sample_rate: sr,
+                    avg_ms: avg,
+                    period_ms: period,
+                    extra_ms: self.avg.extra_ms,
+                    block,
+                    max_block,
+                }));
+            });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn sidebar(
         &mut self,
@@ -664,20 +842,44 @@ impl VocalTuneEditor {
         let w = x1 - x0;
         let mut y = rect.top() + 14.0;
 
-        widgets::section_title(ui, pos2(x0, y), x1, "KEY & SCALE");
+        // A learned scale replaces Key/Scale: grey the selectors out and say
+        // why, rather than letting edits silently do nothing.
+        let mut rule_end = x1;
+        if learned {
+            let note = ui.painter().text(
+                pos2(x1, y),
+                Align2::RIGHT_CENTER,
+                "NOT IN USE",
+                theme::font(9.0),
+                theme::MIDI,
+            );
+            rule_end = note.left() - 6.0;
+        }
+        widgets::section_title(ui, pos2(x0, y), rule_end, "KEY & SCALE");
         y += 12.0;
-        widgets::combo(
-            ui,
-            Rect::from_min_size(pos2(x0, y), vec2(54.0, 24.0)),
-            setter,
-            &params.key,
-        );
-        widgets::combo(
-            ui,
-            Rect::from_min_size(pos2(x0 + 62.0, y), vec2(w - 62.0, 24.0)),
-            setter,
-            &params.scale,
-        );
+        let selectors = Rect::from_min_size(pos2(x0, y), vec2(w, 24.0));
+        ui.add_enabled_ui(!learned, |ui| {
+            widgets::combo(
+                ui,
+                Rect::from_min_size(pos2(x0, y), vec2(54.0, 24.0)),
+                setter,
+                &params.key,
+            );
+            widgets::combo(
+                ui,
+                Rect::from_min_size(pos2(x0 + 62.0, y), vec2(w - 62.0, 24.0)),
+                setter,
+                &params.scale,
+            );
+        });
+        if learned {
+            ui.interact(
+                selectors,
+                Id::new("vt-key-scale-learned"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(LEARNED_REPLACES_SCALE);
+        }
         y += 42.0;
 
         widgets::section_title(ui, pos2(x0, y), x1, "PRESETS");
@@ -704,16 +906,72 @@ impl VocalTuneEditor {
         }
         y += 74.0;
 
-        widgets::section_title(
-            ui,
-            pos2(x0, y),
-            x1,
-            if learned {
-                "SCALE NOTES · MIDI LEARN"
+        let learning = v.midi_mode == MidiModeChoice::Learn;
+        if learned {
+            let keep = Rect::from_min_size(pos2(x1 - 40.0, y - 8.0), vec2(40.0, 16.0));
+            let clear = Rect::from_min_size(pos2(keep.left() - 48.0, y - 8.0), vec2(44.0, 16.0));
+            let title = ui.painter().text(
+                pos2(x0, y),
+                Align2::LEFT_CENTER,
+                "LEARNED SCALE",
+                theme::font(10.5),
+                theme::MIDI,
+            );
+            let title_tip = if learning {
+                "Learned from MIDI note-ons. It replaces Key/Scale in every MIDI mode until you clear it, and is saved with the project.\nMIDI Learn is on: each note-on adds its note (the first one after switching to Learn starts a new scale)."
             } else {
-                "SCALE NOTES"
-            },
-        );
+                "Learned from MIDI note-ons. It replaces Key/Scale in every MIDI mode until you clear it, and is saved with the project."
+            };
+            ui.interact(
+                title.expand(2.0),
+                Id::new("vt-learned-title"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(title_tip);
+            if widgets::button(
+                ui,
+                clear,
+                Id::new("vt-clear-learned"),
+                "CLEAR",
+                false,
+                "Forget the learned scale and go back to Key/Scale and the note settings.",
+            )
+            .clicked()
+            {
+                self.params.clear_learned_scale();
+            }
+            if widgets::button(
+                ui,
+                keep,
+                Id::new("vt-keep-learned"),
+                "KEEP",
+                false,
+                "Turn the learned scale into note settings (saved as parameters, automatable and undoable), then clear the learned scale. The notes stay the same.",
+            )
+            .clicked()
+            {
+                keep_learned_scale(setter, &params, states);
+                self.params.clear_learned_scale();
+            }
+        } else if learning {
+            let title = ui.painter().text(
+                pos2(x0, y),
+                Align2::LEFT_CENTER,
+                "SCALE NOTES · LEARN: PLAY NOTES",
+                theme::font(10.5),
+                theme::MIDI,
+            );
+            ui.interact(
+                title.expand(2.0),
+                Id::new("vt-learn-title"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(
+                "MIDI Learn: each MIDI note-on adds its note to a learned scale, which then replaces Key/Scale until you clear it.",
+            );
+        } else {
+            widgets::section_title(ui, pos2(x0, y), x1, "SCALE NOTES");
+        }
         y += 12.0;
         let kb = Rect::from_min_size(pos2(x0, y), vec2(w, 12.0 * 24.0));
         let ks = keyboard::KeyboardState {
@@ -1191,6 +1449,81 @@ impl VocalTuneEditor {
     }
 }
 
+/// Why Key/Scale is greyed out while a learned scale is in use.
+const LEARNED_REPLACES_SCALE: &str = "A MIDI-learned scale is in use and replaces Key and Scale.\nCLEAR it (above the keyboard) to use Key and Scale again.";
+
+/// Make a learned scale permanent: each pitch class's override becomes On
+/// (learned) or Remove, through the gesture protocol so it is undoable and
+/// saved like any edit. The caller then clears the learned scale.
+fn keep_learned_scale(setter: &ParamSetter, p: &VocalTuneParams, learned: &[NoteState; 12]) {
+    for (pc, state) in learned.iter().enumerate() {
+        let want = match state {
+            NoteState::On => NoteOverride::On,
+            NoteState::Bypass => NoteOverride::Bypass,
+            NoteState::Remove => NoteOverride::Remove,
+        };
+        let param = p.note_override(pc);
+        if param.value() != want {
+            setter.begin_set_parameter(param);
+            setter.set_parameter(param, want);
+            setter.end_set_parameter(param);
+        }
+    }
+}
+
+/// Inputs of the latency tooltip.
+struct LatencyInfo {
+    reported_samples: u32,
+    sample_rate: f32,
+    /// Expected delay of the voice, ms (`None` before any voice was detected).
+    avg_ms: Option<f32>,
+    /// Mean period of the voice, ms.
+    period_ms: Option<f32>,
+    /// Mean wander beyond the reported latency, ms.
+    extra_ms: f32,
+    /// Current and maximum host block, samples.
+    block: u32,
+    max_block: u32,
+}
+
+/// Explains reported vs average latency vs the host buffer.
+fn latency_tooltip(i: LatencyInfo) -> String {
+    let sr = if i.sample_rate > 0.0 {
+        i.sample_rate
+    } else {
+        48_000.0
+    };
+    let ms = |s: u32| s as f32 / sr * 1000.0;
+    let mut t = format!(
+        "Reported: {:.1} ms ({} samples at {:.1} kHz). The host compensates this (PDC), and it is the fixed part of what you hear when monitoring through the plugin.\n\n",
+        ms(i.reported_samples),
+        i.reported_samples,
+        sr / 1000.0
+    );
+    let how = "While it shifts the pitch, the engine repeats or skips whole pitch periods, so the voice wanders up to one period behind the reported latency. With little look-ahead (Live-Min, Live) that averages about half a period; Studio's look-ahead, and Live+ or Live for high voices, keeps it near zero. Unshifted, it is exactly the reported latency.";
+    match (i.avg_ms, i.period_ms) {
+        (Some(avg), Some(period)) => t.push_str(&format!(
+            "Heard avg: {avg:.1} ms, the expected delay of the voice itself. {how} At your average pitch ({:.0} Hz, period {period:.1} ms) that adds {:.1} ms.\n\n",
+            1000.0 / period,
+            i.extra_ms
+        )),
+        _ => t.push_str(&format!(
+            "Heard avg: shown once a voice is detected; it is the expected delay of the voice itself. {how}\n\n"
+        )),
+    }
+    if i.block > 0 {
+        t.push_str(&format!(
+            "Host buffer: {} samples ({:.1} ms), up to {}. Monitoring live through a DAW also goes through the audio interface's input and output buffers (about 2 × buffer) plus converter latency. The host does not tell plugins that part.",
+            i.block,
+            ms(i.block),
+            i.max_block
+        ));
+    } else {
+        t.push_str("Host buffer: not running. Monitoring live through a DAW adds the audio interface's input and output buffers (about 2 × buffer) plus converter latency; the host does not tell plugins that part.");
+    }
+    t
+}
+
 /// Write every field that differs between `old` and `new` through the gesture
 /// protocol (used by presets). Only correction-behaviour fields are covered,
 /// which is everything a [`Preset`] changes.
@@ -1304,6 +1637,183 @@ mod tests {
         assert!((t.correction - 20.0).abs() < 1e-3);
         r.update(None, 0.0, 0.016);
         assert!(!r.valid);
+    }
+
+    /// A voiced frame at `detected_hz`, shifted by `shift_cents`.
+    fn at(detected_hz: f32, shift_cents: f32) -> PitchFrame {
+        let detected = vt_core::hz_to_cents(detected_hz);
+        PitchFrame {
+            detected,
+            output: detected + shift_cents,
+            flags: frame_flags::VOICED,
+            ..PitchFrame::default()
+        }
+    }
+
+    #[test]
+    fn wander_fraction_follows_the_look_ahead() {
+        // 48 kHz. Live Alto/Tenor D = 213: half a period for 200 Hz (T = 240),
+        // none for 440 Hz (T = 109, the next mark is already known).
+        assert!((wander_fraction(240.0, 213.0) - 0.46).abs() < 1e-6);
+        assert_eq!(wander_fraction(109.0, 213.0), 0.0);
+        // Measured 0.22·T at 330 Hz: the fit is within 0.05·T.
+        assert!((wander_fraction(145.5, 213.0) - 0.22).abs() < 0.05);
+        // Live-Min (D = 48) always trails; Studio (D = 1920) never.
+        assert!((wander_fraction(686.0, 48.0) - 0.46).abs() < 1e-6);
+        assert_eq!(wander_fraction(686.0, 1920.0), 0.0);
+        // Live+ 10 ms (D = 480): 100 Hz trails, 150 Hz partly (measured 0.18).
+        assert!((wander_fraction(480.0, 480.0) - 0.46).abs() < 1e-6);
+        assert!((wander_fraction(320.0, 480.0) - 0.18).abs() < 0.05);
+        assert_eq!(wander_fraction(0.0, 213.0), 0.0);
+        assert_eq!(wander_fraction(f32::NAN, 213.0), 0.0);
+    }
+
+    #[test]
+    fn avg_latency_adds_the_mean_wander() {
+        let sr = 48_000.0;
+        let mut a = AvgDelay::default();
+        assert_eq!(a.expected_ms(4.44), None, "nothing sung yet");
+        // Live Alto/Tenor, 200 Hz being corrected: 4.44 + 0.46 · 5 ms.
+        a.update(Some(&at(200.0, 30.0)), 0.016, sr, 213);
+        let live = a.expected_ms(4.44).unwrap();
+        assert!((live - 6.74).abs() < 0.01, "{live}");
+        // Unvoiced frames and silence hold the average.
+        a.update(Some(&PitchFrame::default()), 1.0, sr, 213);
+        a.update(None, 1.0, sr, 213);
+        assert!((a.expected_ms(4.44).unwrap() - 6.74).abs() < 0.01);
+        // It follows the singer over a few seconds of voiced time.
+        for _ in 0..600 {
+            a.update(Some(&at(100.0, -40.0)), 1.0 / 60.0, sr, 213);
+        }
+        let low = a.expected_ms(4.44).unwrap();
+        assert!((low - 9.04).abs() < 0.1, "100 Hz adds 4.6 ms: {low}");
+        // A new engine (Studio, D = 1920) starts over: no wander there.
+        a.update(Some(&at(100.0, -40.0)), 0.016, sr, 1920);
+        assert!((a.expected_ms(40.0).unwrap() - 40.0).abs() < 1e-4);
+        // Nothing shifted (amount 0, or already in tune): no wander.
+        let mut still = AvgDelay::default();
+        still.update(Some(&at(200.0, 0.0)), 0.016, sr, 213);
+        assert!((still.expected_ms(4.44).unwrap() - 4.44).abs() < 1e-6);
+    }
+
+    #[test]
+    fn latency_tooltip_explains_reported_avg_and_buffer() {
+        let t = latency_tooltip(LatencyInfo {
+            reported_samples: 213,
+            sample_rate: 48_000.0,
+            avg_ms: Some(6.74),
+            period_ms: Some(5.0),
+            extra_ms: 2.3,
+            block: 128,
+            max_block: 512,
+        });
+        assert!(t.contains("Reported: 4.4 ms (213 samples"), "{t}");
+        assert!(t.contains("Heard avg: 6.7 ms"), "{t}");
+        assert!(t.contains("200 Hz") && t.contains("adds 2.3 ms"), "{t}");
+        assert!(t.contains("Host buffer: 128 samples (2.7 ms)"), "{t}");
+    }
+
+    /// HI-1 / HI-3: the manual restart is offered once a change has been
+    /// pending for a second, and the clock starts over for a new change.
+    #[test]
+    fn pending_change_becomes_overdue_after_a_second() {
+        let t0 = Instant::now();
+        let s = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        let mut p = PendingSince::default();
+        p.update(true, s(0.0));
+        assert!(!p.overdue(s(0.5)));
+        p.update(true, s(0.9));
+        assert!(p.overdue(s(1.0)), "offer the manual restart after 1 s");
+        p.update(false, s(2.0));
+        assert!(!p.overdue(s(30.0)));
+        p.update(true, s(30.0));
+        assert!(!p.overdue(s(30.5)));
+        assert!(p.overdue(s(31.05)));
+    }
+
+    /// A host GUI context that counts parameter edits.
+    #[derive(Default)]
+    struct TestGui {
+        edits: std::sync::atomic::AtomicUsize,
+    }
+
+    impl nice_plug::context::gui::GuiContextInner for TestGui {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Clap
+        }
+        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {
+            self.edits.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+        fn get_state(&self) -> PluginState {
+            PluginState {
+                version: String::new(),
+                params: Default::default(),
+                fields: Default::default(),
+            }
+        }
+        fn set_state(&self, _state: PluginState) {}
+        fn request_restart(&self) {}
+    }
+
+    /// One left click at `pos` through real egui input (move, press,
+    /// release over three frames).
+    fn click(ctx: &egui::Context, app: &mut VocalTuneEditor, pos: egui::Pos2) {
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDTH, HEIGHT))),
+            events,
+            ..Default::default()
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![button(false)],
+        ] {
+            let _ = ctx.run_ui(frame(events), |ui| app.draw(ui));
+        }
+    }
+
+    /// HI-4 GUI: while a learned scale is in use the keyboard edits it (not
+    /// the note overrides, which do not apply then), and CLEAR forgets it.
+    #[test]
+    fn learned_scale_is_edited_and_cleared_from_the_sidebar() {
+        let params = Arc::new(VocalTuneParams::default());
+        params
+            .learned_scale
+            .store(crate::learn::pack(&[0, 4, 7]), Ordering::Relaxed);
+        let mut app = VocalTuneEditor::new(params.clone(), Arc::new(SharedState::default()));
+        let host = Arc::new(TestGui::default());
+        let ctx = egui::Context::default();
+        app.setup(&ctx, GuiContext::new(host.clone()));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+
+        // Sidebar layout: keyboard rows of 24 px from y = 230, B at the top,
+        // so D (pitch class 2) is row 9; the CLEAR button sits at (136, 218).
+        let d_row = egui::pos2(100.0, 230.0 + 9.0 * 24.0 + 12.0);
+        click(&ctx, &mut app, d_row);
+        assert_eq!(
+            params.learned_states(),
+            crate::learn::unpack(crate::learn::pack(&[0, 2, 4, 7])),
+            "D added to the learned scale"
+        );
+        assert_eq!(
+            host.edits.load(Ordering::Relaxed),
+            0,
+            "no note override was touched"
+        );
+        click(&ctx, &mut app, egui::pos2(136.0, 218.0));
+        assert_eq!(params.learned_states(), None, "CLEAR");
+
+        // Without a learned scale the same click cycles D's override again.
+        click(&ctx, &mut app, d_row);
+        assert_eq!(host.edits.load(Ordering::Relaxed), 1);
     }
 
     #[test]

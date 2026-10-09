@@ -132,7 +132,13 @@ impl LfModel {
         };
         let ee = ee_of(alpha);
         let e0 = if ee.abs() > 1e-300 { 1.0 / ee } else { 1.0 };
-        Self { shape, alpha, eps, wg, e0 }
+        Self {
+            shape,
+            alpha,
+            eps,
+            wg,
+            e0,
+        }
     }
 
     pub fn shape(&self) -> LfShape {
@@ -172,13 +178,19 @@ impl GlottalTable {
         let model = LfModel::new(shape);
         let mut planner = RealFftPlanner::<f64>::new();
         let fft = planner.plan_fft_forward(GRID);
-        let mut input: Vec<f64> = (0..GRID).map(|n| model.eval(n as f64 / GRID as f64)).collect();
+        let mut input: Vec<f64> = (0..GRID)
+            .map(|n| model.eval(n as f64 / GRID as f64))
+            .collect();
         let rms = (input.iter().map(|v| v * v).sum::<f64>() / GRID as f64).sqrt();
         let mut spec = fft.make_output_vec();
         let k_max = max_harmonics.clamp(1, GRID / 2 - 1);
         let coeffs = if fft.process(&mut input, &mut spec).is_ok() {
             // x(φ) = Σ_k Re(c_k e^{i2πkφ}) with c_k = 2·X[k]/N for a real signal.
-            spec.iter().skip(1).take(k_max).map(|c| (2.0 * c.re / GRID as f64, 2.0 * c.im / GRID as f64)).collect()
+            spec.iter()
+                .skip(1)
+                .take(k_max)
+                .map(|c| (2.0 * c.re / GRID as f64, 2.0 * c.im / GRID as f64))
+                .collect()
         } else {
             vec![(0.0, 0.0); k_max]
         };
@@ -195,7 +207,9 @@ impl GlottalTable {
 
     /// |c_k|² of harmonic `k` (1-based); 0 outside the table.
     pub fn harmonic_power(&self, k: usize) -> f64 {
-        k.checked_sub(1).and_then(|i| self.coeffs.get(i)).map_or(0.0, |(re, im)| re * re + im * im)
+        k.checked_sub(1)
+            .and_then(|i| self.coeffs.get(i))
+            .map_or(0.0, |(re, im)| re * re + im * im)
     }
 
     /// Weight of harmonic frequency `fk` in [`GlottalTable::sample`]'s taper.
@@ -219,7 +233,7 @@ impl GlottalTable {
     /// `f0` Hz. Harmonics at or below `f_lo` get full weight, those between
     /// `f_lo` and `f_hi` a raised-cosine taper, those above `f_hi` none.
     pub fn sample(&self, phase: f64, f0: f64, f_lo: f64, f_hi: f64) -> f64 {
-        if !(f0 > 0.0) || !phase.is_finite() {
+        if f0.is_nan() || f0 <= 0.0 || !phase.is_finite() {
             return 0.0;
         }
         let k_top = ((f_hi / f0).floor() as usize).min(self.coeffs.len());
@@ -229,7 +243,11 @@ impl GlottalTable {
         let mut acc = 0.0;
         for (k, &(cr, ci)) in self.coeffs.iter().take(k_top).enumerate() {
             let fk = (k + 1) as f64 * f0;
-            let w = if fk <= f_lo { 1.0 } else { Self::taper(fk, f_lo, f_hi) };
+            let w = if fk <= f_lo {
+                1.0
+            } else {
+                Self::taper(fk, f_lo, f_hi)
+            };
             acc += w * (cr * zr - ci * zi);
             let nr = zr * c1 - zi * s1;
             zi = zr * s1 + zi * c1;
@@ -261,7 +279,10 @@ mod tests {
         for rd in [0.5, 1.0, 1.7, 2.5] {
             let m = LfModel::new(LfShape::from_rd(rd));
             let n = 200_000;
-            let area: f64 = (0..n).map(|i| m.eval((i as f64 + 0.5) / n as f64)).sum::<f64>() / n as f64;
+            let area: f64 = (0..n)
+                .map(|i| m.eval((i as f64 + 0.5) / n as f64))
+                .sum::<f64>()
+                / n as f64;
             assert!(area.abs() < 1e-6, "rd {rd} area {area}");
             let te = m.shape().te;
             assert!((m.eval(te) + 1.0).abs() < 1e-9, "rd {rd}");
@@ -280,7 +301,11 @@ mod tests {
         for i in 0..64 {
             let phase = i as f64 / 64.0 + 0.003;
             let bl = table.sample(phase, 1.0, 1e9, 2e9);
-            assert!((bl - model.eval(phase)).abs() < 2e-3, "phase {phase}: {bl} vs {}", model.eval(phase));
+            assert!(
+                (bl - model.eval(phase)).abs() < 2e-3,
+                "phase {phase}: {bl} vs {}",
+                model.eval(phase)
+            );
         }
     }
 
@@ -290,7 +315,9 @@ mod tests {
         // exactly one period must hold no energy above harmonic 10.
         let table = GlottalTable::new(LfShape::from_rd(1.0), 2000);
         let n = 48;
-        let x: Vec<f64> = (0..n).map(|i| table.sample(i as f64 / n as f64, 1000.0, 8000.0, 10_000.0)).collect();
+        let x: Vec<f64> = (0..n)
+            .map(|i| table.sample(i as f64 / n as f64, 1000.0, 8000.0, 10_000.0))
+            .collect();
         for k in 11..n / 2 {
             let (mut re, mut im) = (0.0, 0.0);
             for (i, v) in x.iter().enumerate() {

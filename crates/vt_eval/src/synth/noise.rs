@@ -44,9 +44,17 @@ fn db_to_lin(db: f64) -> f64 {
 
 /// Raised-cosine attack/release envelope over `len` samples.
 fn ar_envelope(n: usize, len: usize, attack: usize, release: usize) -> f64 {
-    let a = if attack > 0 && n < attack { 0.5 - 0.5 * (PI * n as f64 / attack as f64).cos() } else { 1.0 };
+    let a = if attack > 0 && n < attack {
+        0.5 - 0.5 * (PI * n as f64 / attack as f64).cos()
+    } else {
+        1.0
+    };
     let from_end = len.saturating_sub(n + 1);
-    let r = if release > 0 && from_end < release { 0.5 - 0.5 * (PI * from_end as f64 / release as f64).cos() } else { 1.0 };
+    let r = if release > 0 && from_end < release {
+        0.5 - 0.5 * (PI * from_end as f64 / release as f64).cos()
+    } else {
+        1.0
+    };
     a * r
 }
 
@@ -62,7 +70,13 @@ fn normalise(x: &mut [f64], level_dbfs: f64) {
 }
 
 /// Render a consonant of `len` samples at RMS `level_dbfs`.
-pub(crate) fn render_consonant(kind: Consonant, len: usize, sr: f64, level_dbfs: f64, rng: &mut Rng) -> Vec<f64> {
+pub(crate) fn render_consonant(
+    kind: Consonant,
+    len: usize,
+    sr: f64,
+    level_dbfs: f64,
+    rng: &mut Rng,
+) -> Vec<f64> {
     let ms = |m: f64| ((m * 1e-3 * sr).round() as usize).min(len / 2);
     let mut out = vec![0.0; len];
     match kind {
@@ -78,7 +92,10 @@ pub(crate) fn render_consonant(kind: Consonant, len: usize, sr: f64, level_dbfs:
                     Biquad64::bandpass(sr, 3200.0, 1.0),
                     Biquad64::lowpass(sr, 7000.0, 0.707),
                 ],
-                _ => vec![Biquad64::highpass(sr, 1500.0, 0.707), Biquad64::lowpass(sr, 9000.0, 0.707)],
+                _ => vec![
+                    Biquad64::highpass(sr, 1500.0, 0.707),
+                    Biquad64::lowpass(sr, 9000.0, 0.707),
+                ],
             };
             let (att, rel) = (ms(25.0), ms(35.0));
             for (n, o) in out.iter_mut().enumerate() {
@@ -90,18 +107,27 @@ pub(crate) fn render_consonant(kind: Consonant, len: usize, sr: f64, level_dbfs:
             }
         }
         Consonant::T | Consonant::K => {
-            let (centre, q, tau_ms) = if kind == Consonant::T { (4000.0, 0.8, 8.0) } else { (2000.0, 1.0, 15.0) };
+            let (centre, q, tau_ms) = if kind == Consonant::T {
+                (4000.0, 0.8, 8.0)
+            } else {
+                (2000.0, 1.0, 15.0)
+            };
             let mut bp = Biquad64::bandpass(sr, centre, q);
             let mut hp = Biquad64::highpass(sr, 500.0, 0.707);
             let att = ms(1.0).max(1);
             let tau = tau_ms * 1e-3 * sr;
             for (n, o) in out.iter_mut().enumerate() {
-                let env = if n < att { n as f64 / att as f64 } else { (-((n - att) as f64) / tau).exp() };
+                let env = if n < att {
+                    n as f64 / att as f64
+                } else {
+                    (-((n - att) as f64) / tau).exp()
+                };
                 *o = hp.process(bp.process(rng.gaussian())) * env;
             }
         }
         Consonant::Breath => {
-            let mut tract = FormantFilter::new(sr, &Formants::neutral(VoiceType::Male).widened(3.0));
+            let mut tract =
+                FormantFilter::new(sr, &Formants::neutral(VoiceType::Male).widened(3.0));
             let mut hp = Biquad64::highpass(sr, 150.0, 0.707);
             let (att, rel) = (len * 3 / 10, len * 3 / 10);
             for (n, o) in out.iter_mut().enumerate() {
@@ -118,14 +144,23 @@ pub(crate) fn render_consonant(kind: Consonant, len: usize, sr: f64, level_dbfs:
 /// as a pure delay.
 pub(crate) fn render_noise_burst(len: usize, sr: f64, level_dbfs: f64, rng: &mut Rng) -> Vec<f64> {
     let edge = ((0.002 * sr) as usize).min(len / 2);
-    let mut out: Vec<f64> = (0..len).map(|n| rng.gaussian() * ar_envelope(n, len, edge, edge)).collect();
+    let mut out: Vec<f64> = (0..len)
+        .map(|n| rng.gaussian() * ar_envelope(n, len, edge, edge))
+        .collect();
     normalise(&mut out, level_dbfs);
     out
 }
 
 /// Single-sample clicks every `interval_s` on average; `jitter` (0-1) randomises
 /// each interval by up to ±jitter·interval so the train can be made aperiodic.
-pub(crate) fn render_pulse_train(len: usize, sr: f64, interval_s: f64, jitter: f64, amplitude: f64, rng: &mut Rng) -> Vec<f64> {
+pub(crate) fn render_pulse_train(
+    len: usize,
+    sr: f64,
+    interval_s: f64,
+    jitter: f64,
+    amplitude: f64,
+    rng: &mut Rng,
+) -> Vec<f64> {
     let mut out = vec![0.0; len];
     let base = (interval_s * sr).max(1.0);
     let mut pos = 0.0f64;
@@ -144,7 +179,10 @@ mod tests {
     use super::*;
 
     fn band_energy_ratio(x: &[f64], sr: f64, f_split: f64) -> f64 {
-        let mut hp = [Biquad64::highpass(sr, f_split, 0.541), Biquad64::highpass(sr, f_split, 1.307)];
+        let mut hp = [
+            Biquad64::highpass(sr, f_split, 0.541),
+            Biquad64::highpass(sr, f_split, 1.307),
+        ];
         let mut hi = 0.0;
         let mut tot = 0.0;
         for v in x {
@@ -171,7 +209,12 @@ mod tests {
     fn pulse_train_spacing() {
         let mut rng = Rng::new(1);
         let p = render_pulse_train(4800, 48_000.0, 0.01, 0.0, 0.5, &mut rng);
-        let idx: Vec<usize> = p.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(i, _)| i).collect();
+        let idx: Vec<usize> = p
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != 0.0)
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(idx.len(), 10);
         assert!(idx.windows(2).all(|w| w[1] - w[0] == 480));
     }

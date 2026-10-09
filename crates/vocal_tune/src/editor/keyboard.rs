@@ -1,9 +1,15 @@
 //! Vertical 12-note keyboard: the scale editor.
 //!
 //! One row per pitch class, B at the top down to C, showing the *effective*
-//! state (scale membership resolved with the per-note override, or the MIDI
-//! Learn result while Learn is active). Clicking a row cycles its override
-//! Scale → On → Bypass → Remove; right-click returns it to the scale.
+//! state the engine corrects to:
+//!
+//! - Normally: scale membership resolved with the per-note override.
+//!   Clicking a row cycles its override Scale → On → Bypass → Remove;
+//!   right-click returns it to the scale. An "M" marks a manual override.
+//! - While a MIDI-learned scale is in use (it replaces Key/Scale and the
+//!   overrides until cleared, see [`crate::learn`]): learned notes are violet
+//!   "ON" chips, the rest plain "OFF", and a click adds or removes that note
+//!   in the learned scale. The overrides do not apply, so no "M" markers.
 
 use egui::{Align2, Color32, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use nice_plug::prelude::*;
@@ -19,25 +25,53 @@ use crate::params::{NOTE_NAMES, NoteOverride, VocalTuneParams};
 pub struct KeyboardState {
     /// Effective state per pitch class.
     pub states: [NoteState; 12],
-    /// `states` came from MIDI Learn (highlighted in violet).
+    /// `states` is a MIDI-learned scale (learned notes in violet; clicks
+    /// edit the learned scale instead of the overrides).
     pub learned: bool,
     /// Pitch class of the current target note, if any.
     pub target_pc: Option<usize>,
 }
 
-fn state_label(s: NoteState) -> &'static str {
-    match s {
-        NoteState::On => "ON",
-        NoteState::Bypass => "BYPASS",
-        NoteState::Remove => "REMOVE",
+fn state_label(s: NoteState, learned: bool) -> &'static str {
+    match (s, learned) {
+        (NoteState::On, _) => "ON",
+        (NoteState::Bypass, _) => "BYPASS",
+        // A learned scale has only learned notes and the rest.
+        (NoteState::Remove, true) => "OFF",
+        (NoteState::Remove, false) => "REMOVE",
     }
 }
 
-fn state_colour(s: NoteState) -> Color32 {
+fn state_colour(s: NoteState, learned: bool) -> Color32 {
     match s {
+        NoteState::On if learned => MIDI,
         NoteState::On => ACCENT,
         NoteState::Bypass => BYPASS,
         NoteState::Remove => REMOVE,
+    }
+}
+
+/// Hover text of one keyboard row.
+fn row_tooltip(name: &str, state: NoteState, learned: bool, manual: bool) -> String {
+    if learned {
+        let what = if state == NoteState::On {
+            "in the learned scale"
+        } else {
+            "not in the learned scale"
+        };
+        format!(
+            "{name}: {what} (learned from MIDI).\nClick: add or remove it in the learned scale.\nCLEAR returns to Key/Scale."
+        )
+    } else {
+        format!(
+            "{name}: {} ({}).\nClick: cycle Scale → On → Bypass → Remove.\nRight-click: follow the scale again.",
+            state_label(state, false).to_lowercase(),
+            if manual {
+                "manual override"
+            } else {
+                "from the scale"
+            },
+        )
     }
 }
 
@@ -60,12 +94,16 @@ pub fn keyboard(
         let ovr = param.value();
         let state = ks.states.get(pc).copied().unwrap_or(NoteState::On);
         let resp = ui.interact(r, Id::new(("vt-key", pc)), Sense::click());
-        if resp.clicked() {
+        if ks.learned {
+            if resp.clicked() {
+                crate::learn::toggle(&params.learned_scale, pc);
+            }
+        } else if resp.clicked() {
             setter.begin_set_parameter(param);
             setter.set_parameter(param, ovr.next());
             setter.end_set_parameter(param);
         }
-        if resp.secondary_clicked() && ovr != NoteOverride::Scale {
+        if !ks.learned && resp.secondary_clicked() && ovr != NoteOverride::Scale {
             setter.begin_set_parameter(param);
             setter.set_parameter(param, NoteOverride::Scale);
             setter.end_set_parameter(param);
@@ -123,20 +161,16 @@ pub fn keyboard(
             pos2(inner.right() - chip_w - 4.0, inner.top() + 2.0),
             pos2(inner.right() - 4.0, inner.bottom() - 2.0),
         );
-        let col = state_colour(state);
-        let manual = ovr != NoteOverride::Scale;
+        let col = state_colour(state, ks.learned);
+        // The overrides only matter while no learned scale replaces them.
+        let manual = !ks.learned && ovr != NoteOverride::Scale;
+        let strong = manual || (ks.learned && state == NoteState::On);
         painter.rect_filled(
             chip,
             CornerRadius::same(255),
-            theme::alpha(col, if manual { 0.24 } else { 0.12 }),
+            theme::alpha(col, if strong { 0.24 } else { 0.12 }),
         );
-        let border = if ks.learned {
-            MIDI
-        } else if manual {
-            col
-        } else {
-            theme::alpha(col, 0.35)
-        };
+        let border = if strong { col } else { theme::alpha(col, 0.35) };
         painter.rect_stroke(
             chip,
             CornerRadius::same(255),
@@ -146,7 +180,7 @@ pub fn keyboard(
         painter.text(
             chip.center(),
             Align2::CENTER_CENTER,
-            state_label(state),
+            state_label(state, ks.learned),
             theme::font(9.5),
             if state == NoteState::Remove {
                 TEXT_DIM
@@ -165,11 +199,30 @@ pub fn keyboard(
             );
         }
         resp.on_hover_ui(|ui| {
-            ui.label(format!(
-                "{name}: {} ({}).\nClick: cycle Scale → On → Bypass → Remove.\nRight-click: follow the scale again.",
-                state_label(state).to_lowercase(),
-                if manual { "manual override" } else { "from the scale" },
-            ));
+            ui.label(row_tooltip(name, state, ks.learned, manual));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn learned_rows_read_on_off_and_say_how_to_edit_them() {
+        assert_eq!(state_label(NoteState::Remove, true), "OFF");
+        assert_eq!(state_label(NoteState::Remove, false), "REMOVE");
+        assert_eq!(state_colour(NoteState::On, true), MIDI);
+        assert_eq!(state_colour(NoteState::On, false), ACCENT);
+        let t = row_tooltip("E", NoteState::On, true, false);
+        assert!(
+            t.contains("in the learned scale") && t.contains("CLEAR"),
+            "{t}"
+        );
+        let t = row_tooltip("F", NoteState::Bypass, false, true);
+        assert!(
+            t.contains("manual override") && t.contains("Right-click"),
+            "{t}"
+        );
     }
 }

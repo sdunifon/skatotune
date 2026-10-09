@@ -10,11 +10,17 @@
 //! - **Tract:** a five-formant Klatt cascade ([`formant`]) with male and
 //!   female vowel presets; legato vowel changes glide over 60 ms.
 //! - **Score:** [`Melody`] notes with per-note detune, onset scoops,
-//!   overshoot, OU drift, vibrato, legato or gaps; plus unvoiced material
+//!   overshoot, OU drift, vibrato, legato or gaps, per-note attack times and
+//!   voiced-consonant onsets (/m n l z v/); plus unvoiced material
 //!   (fricatives, plosives, breaths, noise bursts, click trains) placed by
 //!   [`SignalBuilder`].
-//! - **Truth:** [`Signal`] carries, per sample, the exact instantaneous f0 the
-//!   oscillator used (`f0_truth`, 0 = unvoiced), the intended in-tune note
+//! - **Room:** optional reverb and background noise floor
+//!   ([`SignalBuilder::room`], [`SignalBuilder::noise_floor`], [`room`]);
+//!   the truth keeps describing the direct sound.
+//! - **Truth:** [`Signal`] carries, per sample, the exact instantaneous f0 of
+//!   the radiated sound (`f0_truth`, 0 = unvoiced; the source runs ahead by
+//!   the vocal tract's group delay so the audio, not the hidden source, is
+//!   what the truth describes), the intended in-tune note
 //!   (`target_cents`, NaN = none) and the vibrato-free sung pitch
 //!   (`centre_cents`), plus note and event spans for the metrics.
 
@@ -22,10 +28,11 @@ pub mod formant;
 pub mod glottal;
 pub mod melody;
 pub mod noise;
+pub mod room;
 
-pub use formant::{FormantFilter, Formants, Vowel, VoiceType};
+pub use formant::{FormantFilter, Formants, VoiceType, Vowel};
 pub use glottal::{GlottalTable, LfModel, LfShape};
-pub use melody::{Drift, Melody, Note, OnsetConsonant, Vibrato};
+pub use melody::{Drift, Melody, Note, OnsetConsonant, Vibrato, VoicedConsonant, VoicedOnset};
 pub use noise::Consonant;
 
 use crate::rng::Rng;
@@ -48,12 +55,24 @@ pub struct Voice {
 impl Voice {
     /// Modal male voice with mild, healthy-range jitter and shimmer.
     pub fn male() -> Self {
-        Self { kind: VoiceType::Male, rd: 1.0, jitter: 0.002, shimmer: 0.02, aspiration_db: -30.0 }
+        Self {
+            kind: VoiceType::Male,
+            rd: 1.0,
+            jitter: 0.002,
+            shimmer: 0.02,
+            aspiration_db: -30.0,
+        }
     }
 
     /// Slightly laxer (higher Rd) female voice.
     pub fn female() -> Self {
-        Self { kind: VoiceType::Female, rd: 1.3, jitter: 0.002, shimmer: 0.02, aspiration_db: -28.0 }
+        Self {
+            kind: VoiceType::Female,
+            rd: 1.3,
+            jitter: 0.002,
+            shimmer: 0.02,
+            aspiration_db: -28.0,
+        }
     }
 
     /// No jitter, shimmer or aspiration: a perfectly periodic source for
@@ -133,7 +152,12 @@ pub struct EventSpan {
 pub struct Signal {
     pub sample_rate: f32,
     pub audio: Vec<f32>,
-    /// Instantaneous f0 actually synthesised, Hz (includes jitter); 0 = unvoiced.
+    /// Instantaneous f0 of the audio at each sample, Hz (includes per-cycle
+    /// jitter); 0 = unvoiced. This is the radiated pitch: the glottal source
+    /// is advanced by the tract's group delay (0.5-2 ms, see
+    /// `synthesize`), so waveform-matching estimators measure this curve
+    /// without a time offset. Within fast leaps (> 3 c/ms) the radiated pitch
+    /// is ambiguous by ~±15 c because the tract is dispersive.
     pub f0_truth: Vec<f32>,
     /// Intended in-tune note, absolute cents; NaN where there is none.
     pub target_cents: Vec<f32>,
@@ -161,13 +185,24 @@ impl Signal {
 
     /// A single sustained note with 60 ms of silence on both sides (for
     /// detector and tracker accuracy tests).
-    pub fn sustained(sample_rate: f32, voice: Voice, vowel: Vowel, f0_hz: f64, dur_s: f64, vibrato: Option<Vibrato>) -> Self {
+    pub fn sustained(
+        sample_rate: f32,
+        voice: Voice,
+        vowel: Vowel,
+        f0_hz: f64,
+        dur_s: f64,
+        vibrato: Option<Vibrato>,
+    ) -> Self {
         let cents = hz_to_cents64(f0_hz);
         let mut note = Note::new(cents, dur_s).vowel(vowel).detune(0.0);
         if let Some(v) = vibrato {
             note = note.vibrato(v);
         }
-        SignalBuilder::new(sample_rate).silence(0.06).melody(Melody::new(voice).note(note)).silence(0.06).build()
+        SignalBuilder::new(sample_rate)
+            .silence(0.06)
+            .melody(Melody::new(voice).note(note))
+            .silence(0.06)
+            .build()
     }
 
     pub fn len(&self) -> usize {
@@ -226,9 +261,21 @@ pub fn cents_to_hz64(cents: f64) -> f64 {
 enum Item {
     Silence(f64),
     Melody(Box<Melody>),
-    Consonant { kind: Consonant, dur_s: f64, level_dbfs: f64 },
-    NoiseBurst { dur_s: f64, level_dbfs: f64 },
-    PulseTrain { dur_s: f64, interval_s: f64, jitter: f64, amplitude: f64 },
+    Consonant {
+        kind: Consonant,
+        dur_s: f64,
+        level_dbfs: f64,
+    },
+    NoiseBurst {
+        dur_s: f64,
+        level_dbfs: f64,
+    },
+    PulseTrain {
+        dur_s: f64,
+        interval_s: f64,
+        jitter: f64,
+        amplitude: f64,
+    },
     Raw(Vec<f32>),
 }
 
@@ -238,6 +285,9 @@ pub struct SignalBuilder {
     seed: u64,
     voiced_rms_dbfs: f64,
     items: Vec<Item>,
+    /// (RT60 s, wet level relative to the dry mix dB).
+    room: Option<(f64, f64)>,
+    noise_floor_dbfs: Option<f64>,
 }
 
 /// Formant ringing rendered past a melody's last sample, s.
@@ -245,7 +295,27 @@ const RING_TAIL_S: f64 = 0.05;
 
 impl SignalBuilder {
     pub fn new(sample_rate: f32) -> Self {
-        Self { sample_rate: sample_rate as f64, seed: 0x5eed, voiced_rms_dbfs: -20.0, items: Vec::new() }
+        Self {
+            sample_rate: sample_rate as f64,
+            seed: 0x5eed,
+            voiced_rms_dbfs: -20.0,
+            items: Vec::new(),
+            room: None,
+            noise_floor_dbfs: None,
+        }
+    }
+
+    /// Add a diffuse room reverb ([`room::reverb`]) with reverberation time
+    /// `rt60_s`, its overall RMS `wet_db` relative to the dry mix.
+    pub fn room(mut self, rt60_s: f64, wet_db: f64) -> Self {
+        self.room = Some((rt60_s, wet_db));
+        self
+    }
+
+    /// Add background noise (room tone and hiss) at RMS `dbfs` everywhere.
+    pub fn noise_floor(mut self, dbfs: f64) -> Self {
+        self.noise_floor_dbfs = Some(dbfs);
+        self
     }
 
     /// Seed for every noise component (aspiration, jitter, consonants).
@@ -272,19 +342,31 @@ impl SignalBuilder {
 
     /// A standalone consonant (sibilant, plosive or breath) at RMS `level_dbfs`.
     pub fn consonant(mut self, kind: Consonant, secs: f64, level_dbfs: f64) -> Self {
-        self.items.push(Item::Consonant { kind, dur_s: secs, level_dbfs });
+        self.items.push(Item::Consonant {
+            kind,
+            dur_s: secs,
+            level_dbfs,
+        });
         self
     }
 
     /// White noise burst at RMS `level_dbfs` (latency calibration).
     pub fn noise_burst(mut self, secs: f64, level_dbfs: f64) -> Self {
-        self.items.push(Item::NoiseBurst { dur_s: secs, level_dbfs });
+        self.items.push(Item::NoiseBurst {
+            dur_s: secs,
+            level_dbfs,
+        });
         self
     }
 
     /// Click train; `jitter` in [0, 1) randomises the intervals.
     pub fn pulse_train(mut self, secs: f64, interval_s: f64, jitter: f64, amplitude: f64) -> Self {
-        self.items.push(Item::PulseTrain { dur_s: secs, interval_s, jitter, amplitude });
+        self.items.push(Item::PulseTrain {
+            dur_s: secs,
+            interval_s,
+            jitter,
+            amplitude,
+        });
         self
     }
 
@@ -311,9 +393,9 @@ impl SignalBuilder {
                     layouts.push((total, l, m.voice));
                     len
                 }
-                Item::Consonant { dur_s, .. } | Item::NoiseBurst { dur_s, .. } | Item::PulseTrain { dur_s, .. } => {
-                    samples(*dur_s)
-                }
+                Item::Consonant { dur_s, .. }
+                | Item::NoiseBurst { dur_s, .. }
+                | Item::PulseTrain { dur_s, .. } => samples(*dur_s),
                 Item::Raw(v) => v.len(),
             };
             total += len;
@@ -346,12 +428,20 @@ impl SignalBuilder {
                 centre[n] = layout.centre[i] as f32;
             }
             for s in &layout.notes {
-                notes.push(NoteSpan { start: s.start + offset, end: s.end + offset, ..*s });
+                notes.push(NoteSpan {
+                    start: s.start + offset,
+                    end: s.end + offset,
+                    ..*s
+                });
             }
             for c in &layout.consonants {
                 let buf = noise::render_consonant(c.kind, c.len, sr, c.level_dbfs, &mut rng);
                 add_into(&mut unvoiced, offset + c.start, &buf);
-                events.push(EventSpan { start: offset + c.start, end: offset + c.start + c.len, kind: EventKind::Consonant(c.kind) });
+                events.push(EventSpan {
+                    start: offset + c.start,
+                    end: offset + c.start + c.len,
+                    kind: EventKind::Consonant(c.kind),
+                });
             }
         }
 
@@ -363,35 +453,70 @@ impl SignalBuilder {
                 Item::Silence(s) => samples(*s),
                 Item::Melody(_) => {
                     // Lengths were computed in the same order above.
-                    let l = layouts.iter().find(|(o, _, _)| *o == cursor).map_or(0, |(_, l, _)| l.len);
+                    let l = layouts
+                        .iter()
+                        .find(|(o, _, _)| *o == cursor)
+                        .map_or(0, |(_, l, _)| l.len);
                     cursor += l;
                     continue;
                 }
-                Item::Consonant { kind, dur_s, level_dbfs } => {
+                Item::Consonant {
+                    kind,
+                    dur_s,
+                    level_dbfs,
+                } => {
                     let len = samples(*dur_s);
                     let buf = noise::render_consonant(*kind, len, sr, *level_dbfs, &mut unv_rng);
                     add_into(&mut unvoiced, cursor, &buf);
-                    events.push(EventSpan { start: cursor, end: cursor + len, kind: EventKind::Consonant(*kind) });
+                    events.push(EventSpan {
+                        start: cursor,
+                        end: cursor + len,
+                        kind: EventKind::Consonant(*kind),
+                    });
                     len
                 }
                 Item::NoiseBurst { dur_s, level_dbfs } => {
                     let len = samples(*dur_s);
                     let buf = noise::render_noise_burst(len, sr, *level_dbfs, &mut unv_rng);
                     add_into(&mut unvoiced, cursor, &buf);
-                    events.push(EventSpan { start: cursor, end: cursor + len, kind: EventKind::NoiseBurst });
+                    events.push(EventSpan {
+                        start: cursor,
+                        end: cursor + len,
+                        kind: EventKind::NoiseBurst,
+                    });
                     len
                 }
-                Item::PulseTrain { dur_s, interval_s, jitter, amplitude } => {
+                Item::PulseTrain {
+                    dur_s,
+                    interval_s,
+                    jitter,
+                    amplitude,
+                } => {
                     let len = samples(*dur_s);
-                    let buf = noise::render_pulse_train(len, sr, *interval_s, *jitter, *amplitude, &mut unv_rng);
+                    let buf = noise::render_pulse_train(
+                        len,
+                        sr,
+                        *interval_s,
+                        *jitter,
+                        *amplitude,
+                        &mut unv_rng,
+                    );
                     add_into(&mut unvoiced, cursor, &buf);
-                    events.push(EventSpan { start: cursor, end: cursor + len, kind: EventKind::PulseTrain });
+                    events.push(EventSpan {
+                        start: cursor,
+                        end: cursor + len,
+                        kind: EventKind::PulseTrain,
+                    });
                     len
                 }
                 Item::Raw(v) => {
                     let buf: Vec<f64> = v.iter().map(|x| *x as f64).collect();
                     add_into(&mut unvoiced, cursor, &buf);
-                    events.push(EventSpan { start: cursor, end: cursor + v.len(), kind: EventKind::Raw });
+                    events.push(EventSpan {
+                        start: cursor,
+                        end: cursor + v.len(),
+                        kind: EventKind::Raw,
+                    });
                     v.len()
                 }
             };
@@ -409,9 +534,34 @@ impl SignalBuilder {
         } else {
             1.0
         };
-        let mut mix: Vec<f64> = voiced.iter().zip(unvoiced.iter()).map(|(v, u)| v * gain + u).collect();
+        let mut mix: Vec<f64> = voiced
+            .iter()
+            .zip(unvoiced.iter())
+            .map(|(v, u)| v * gain + u)
+            .collect();
+        if let Some((rt60, wet_db)) = self.room {
+            let wet = room::reverb(&mix, sr, rt60);
+            let e = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+            let (e_dry, e_wet) = (e(&mix), e(&wet));
+            if e_wet > 0.0 {
+                let g = (e_dry / e_wet).sqrt() * 10f64.powf(wet_db / 20.0);
+                for (m, w) in mix.iter_mut().zip(wet.iter()) {
+                    *m += g * w;
+                }
+            }
+        }
+        if let Some(level) = self.noise_floor_dbfs {
+            let mut rng = master.fork(0x0f1007);
+            let floor = room::noise_floor(mix.len(), sr, level, &mut rng);
+            for (m, f) in mix.iter_mut().zip(floor.iter()) {
+                *m += f;
+            }
+        }
         // Guard against clipping only if a scenario asks for extreme levels.
-        let peak = mix.iter().fold(0.0f64, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+        let peak = mix.iter().fold(
+            0.0f64,
+            |m, v| if v.is_finite() { m.max(v.abs()) } else { m },
+        );
         if peak > 0.98 {
             let g = 0.98 / peak;
             for v in &mut mix {
@@ -421,7 +571,15 @@ impl SignalBuilder {
         let audio: Vec<f32> = mix.iter().map(|v| *v as f32).collect();
         notes.sort_by_key(|n| n.start);
         events.sort_by_key(|e| e.start);
-        Signal { sample_rate: sr as f32, audio, f0_truth: f0, target_cents: target, centre_cents: centre, notes, events }
+        Signal {
+            sample_rate: sr as f32,
+            audio,
+            f0_truth: f0,
+            target_cents: target,
+            centre_cents: centre,
+            notes,
+            events,
+        }
     }
 }
 
@@ -439,7 +597,14 @@ fn add_into(dst: &mut [f64], at: usize, src: &[f64]) {
 /// YIN, E/H, mark tracking) locate their peak by the *derivative energy* of
 /// the waveform (see `reference.rs` stage 3), so the delay they observe is the
 /// group delay averaged over harmonics with weights |c_k|²·|H(k·f0)|²·(k·f0)².
-fn radiated_delay(table: &GlottalTable, formants: &Formants, f0: f64, sr: f64, f_lo: f64, f_hi: f64) -> f64 {
+fn radiated_delay(
+    table: &GlottalTable,
+    formants: &Formants,
+    f0: f64,
+    sr: f64,
+    f_lo: f64,
+    f_hi: f64,
+) -> f64 {
     let (mut num, mut den) = (0.0, 0.0);
     for k in 1..=table.harmonics() {
         let f = k as f64 * f0;
@@ -459,7 +624,10 @@ fn radiated_delay(table: &GlottalTable, formants: &Formants, f0: f64, sr: f64, f
 fn traj_at(traj: &[f64], pos: f64, fallback: f64) -> f64 {
     let i = pos.floor().max(0.0) as usize;
     let frac = pos - pos.floor();
-    match (traj.get(i).copied().filter(|v| v.is_finite()), traj.get(i + 1).copied().filter(|v| v.is_finite())) {
+    match (
+        traj.get(i).copied().filter(|v| v.is_finite()),
+        traj.get(i + 1).copied().filter(|v| v.is_finite()),
+    ) {
         (Some(a), Some(b)) => a + (b - a) * frac,
         (Some(a), None) => a,
         (None, Some(b)) => b,
@@ -475,7 +643,13 @@ fn traj_at(traj: &[f64], pos: f64, fallback: f64) -> f64 {
 /// (`radiated_delay`), so the pitch of the output waveform at sample n is the
 /// layout's pitch at n: `f0_truth` then describes the audio itself, not the
 /// hidden source (they differ by 0.5-2 ms, i.e. up to ~3 c on a fast vibrato).
-fn synthesize(layout: &melody::MelodyLayout, voice: &Voice, sr: f64, tail: usize, rng: &mut Rng) -> (Vec<f64>, Vec<f64>) {
+fn synthesize(
+    layout: &melody::MelodyLayout,
+    voice: &Voice,
+    sr: f64,
+    tail: usize,
+    rng: &mut Rng,
+) -> (Vec<f64>, Vec<f64>) {
     use std::f64::consts::PI;
     // Harmonics up to 0.45·fs (≤ 20 kHz), tapered over the top 20 %. The taper
     // keeps harmonics from popping in and out as f0 moves.
@@ -485,24 +659,50 @@ fn synthesize(layout: &melody::MelodyLayout, voice: &Voice, sr: f64, tail: usize
         .cents
         .iter()
         .filter(|c| c.is_finite())
-        .fold(f64::INFINITY, |m, c| m.min(cents_to_hz64(*c) * (1.0 - 6.0 * voice.jitter)));
-    let max_h = if lowest_f0.is_finite() && lowest_f0 > 0.0 { (f_hi / lowest_f0).ceil() as usize + 1 } else { 1 };
+        .fold(f64::INFINITY, |m, c| {
+            m.min(cents_to_hz64(*c) * (1.0 - 6.0 * voice.jitter))
+        });
+    let max_h = if lowest_f0.is_finite() && lowest_f0 > 0.0 {
+        (f_hi / lowest_f0).ceil() as usize + 1
+    } else {
+        1
+    };
     let table = GlottalTable::new(LfShape::from_rd(voice.rd), max_h.min(4000));
     let te = table.shape().te;
-    let asp_gain = if voice.aspiration_db.is_finite() { table.rms() * 10f64.powf(voice.aspiration_db / 20.0) } else { 0.0 };
+    let asp_gain = if voice.aspiration_db.is_finite() {
+        table.rms() * 10f64.powf(voice.aspiration_db / 20.0)
+    } else {
+        0.0
+    };
 
     // Per-sample radiated delay: per note from its vowel and nominal pitch,
     // ramped across legato transitions together with the formants.
     let mut delay = vec![0.0f64; layout.len];
     let mut prev_d = 0.0;
-    for (note, seg) in layout.notes.iter().zip(layout.vowels.iter()) {
-        let mid = layout.centre.get((note.start + note.end) / 2).copied().unwrap_or(f64::NAN);
-        let f0 = if mid.is_finite() { cents_to_hz64(mid) } else { 200.0 };
-        let d = radiated_delay(&table, &seg.to, f0, sr, f_lo, f_hi);
-        let ramp = if note.legato_in { (0.06 * sr) as usize } else { 0 };
+    for (note, vowel) in layout.notes.iter().zip(layout.note_formants.iter()) {
+        let mid = layout
+            .centre
+            .get((note.start + note.end) / 2)
+            .copied()
+            .unwrap_or(f64::NAN);
+        let f0 = if mid.is_finite() {
+            cents_to_hz64(mid)
+        } else {
+            200.0
+        };
+        let d = radiated_delay(&table, vowel, f0, sr, f_lo, f_hi);
+        let ramp = if note.legato_in {
+            (0.06 * sr) as usize
+        } else {
+            0
+        };
         for (i, slot) in delay.iter_mut().enumerate().take(note.end).skip(note.start) {
             let k = i - note.start;
-            *slot = if k < ramp { prev_d + (d - prev_d) * (0.5 - 0.5 * (PI * k as f64 / ramp as f64).cos()) } else { d };
+            *slot = if k < ramp {
+                prev_d + (d - prev_d) * (0.5 - 0.5 * (PI * k as f64 / ramp as f64).cos())
+            } else {
+                d
+            };
         }
         prev_d = d;
     }
@@ -515,7 +715,10 @@ fn synthesize(layout: &melody::MelodyLayout, voice: &Voice, sr: f64, tail: usize
         (j, s)
     };
 
-    let first = layout.vowels.first().map_or(Formants::neutral(voice.kind), |v| v.from);
+    let first = layout
+        .vowels
+        .first()
+        .map_or(Formants::neutral(voice.kind), |v| v.from);
     let mut filter = FormantFilter::new(sr, &first);
     let mut seg_idx = 0usize;
 
@@ -545,7 +748,11 @@ fn synthesize(layout: &melody::MelodyLayout, voice: &Voice, sr: f64, tail: usize
             excitation = amp * shim * table.sample(phase, f0, f_lo, f_hi);
             if asp_gain > 0.0 {
                 // Turbulence is strongest while the glottis is open.
-                let open = if phase < te { (PI * phase / te).sin().powi(2) } else { 0.0 };
+                let open = if phase < te {
+                    (PI * phase / te).sin().powi(2)
+                } else {
+                    0.0
+                };
                 excitation += asp_gain * amp * (0.25 + 0.75 * open) * asp_rng.gaussian();
             }
             phase += f0 / sr;
@@ -559,7 +766,9 @@ fn synthesize(layout: &melody::MelodyLayout, voice: &Voice, sr: f64, tail: usize
         }
 
         // Formant trajectory.
-        while seg_idx + 1 < layout.vowels.len() && layout.vowels.get(seg_idx + 1).is_some_and(|s| n >= s.start) {
+        while seg_idx + 1 < layout.vowels.len()
+            && layout.vowels.get(seg_idx + 1).is_some_and(|s| n >= s.start)
+        {
             seg_idx += 1;
         }
         if let Some(seg) = layout.vowels.get(seg_idx)
@@ -598,12 +807,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn room_adds_tails_but_keeps_the_truth() {
+        let make = |room: bool| {
+            let b = SignalBuilder::new(48_000.0)
+                .seed(4)
+                .silence(0.1)
+                .melody(Melody::new(Voice::male()).note(Note::midi(57.0, 0.4).detune(0.0)))
+                .silence(0.4);
+            if room {
+                b.room(0.6, -12.0).noise_floor(-60.0).build()
+            } else {
+                b.build()
+            }
+        };
+        let (dry, wet) = (make(false), make(true));
+        assert_eq!(dry.f0_truth, wet.f0_truth);
+        assert_eq!(dry.target_cents.len(), wet.target_cents.len());
+        assert_eq!(dry.notes, wet.notes);
+        let end = dry.notes[0].end;
+        let rms = |x: &[f32]| {
+            (x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
+        };
+        // 100-200 ms after the note: the dry take is silent (formant ring
+        // long gone), the room still rings well above its noise floor.
+        let gap = end + 4800..end + 9600;
+        assert!(rms(&dry.audio[gap.clone()]) < 1e-6);
+        let tail = rms(&wet.audio[gap]);
+        assert!(
+            20.0 * tail.log10() > -50.0,
+            "tail {:.1} dBFS",
+            20.0 * tail.log10()
+        );
+        // Before the note only the noise floor (−60 dBFS) is there.
+        let floor = rms(&wet.audio[..4000]);
+        assert!((20.0 * floor.log10() + 60.0).abs() < 1.5, "floor {floor}");
+    }
+
+    #[test]
     fn deterministic_and_seed_dependent() {
         let build = |seed| {
             SignalBuilder::new(48_000.0)
                 .seed(seed)
                 .silence(0.05)
-                .melody(Melody::new(Voice::male()).note(Note::midi(57.0, 0.3).consonant(Consonant::S, 0.1, -35.0).gap(0.1)))
+                .melody(
+                    Melody::new(Voice::male()).note(
+                        Note::midi(57.0, 0.3)
+                            .consonant(Consonant::S, 0.1, -35.0)
+                            .gap(0.1),
+                    ),
+                )
                 .build()
         };
         let (a, b) = (build(1), build(1));
@@ -620,7 +872,11 @@ mod tests {
             .melody(
                 Melody::new(Voice::male().clean())
                     .note(Note::midi(57.0, 0.4).detune(12.0))
-                    .note(Note::midi(60.0, 0.4).gap(0.2).consonant(Consonant::Sh, 0.15, -35.0)),
+                    .note(
+                        Note::midi(60.0, 0.4)
+                            .gap(0.2)
+                            .consonant(Consonant::Sh, 0.15, -35.0),
+                    ),
             )
             .noise_burst(0.1, -20.0)
             .build();
@@ -635,11 +891,19 @@ mod tests {
         assert!(s.target_cents[a.end + 10].is_nan());
         assert_eq!(s.events.len(), 2);
         assert_eq!(s.events[0].end, s.notes[1].start);
-        assert_eq!(s.voicing_transitions(), vec![a.start, a.end, s.notes[1].start, s.notes[1].end]);
+        assert_eq!(
+            s.voicing_transitions(),
+            vec![a.start, a.end, s.notes[1].start, s.notes[1].end]
+        );
         // Voiced RMS calibrated to −20 dBFS.
-        let (sum, cnt) = s.audio.iter().zip(&s.f0_truth).filter(|(_, f)| **f > 0.0).fold((0.0f64, 0), |(a, c), (x, _)| {
-            (a + (*x as f64).powi(2), c + 1)
-        });
+        let (sum, cnt) = s
+            .audio
+            .iter()
+            .zip(&s.f0_truth)
+            .filter(|(_, f)| **f > 0.0)
+            .fold((0.0f64, 0), |(a, c), (x, _)| {
+                (a + (*x as f64).powi(2), c + 1)
+            });
         let db = 10.0 * (sum / cnt as f64).log10();
         assert!((db + 20.0).abs() < 0.5, "voiced level {db}");
     }
@@ -659,7 +923,8 @@ mod tests {
                 .map(|(i, v)| {
                     // 4-term Blackman-Harris window: −92 dB sidelobes.
                     let p = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
-                    let w = 0.35875 - 0.48829 * p.cos() + 0.14128 * (2.0 * p).cos() - 0.01168 * (3.0 * p).cos();
+                    let w = 0.35875 - 0.48829 * p.cos() + 0.14128 * (2.0 * p).cos()
+                        - 0.01168 * (3.0 * p).cos();
                     *v as f64 * w
                 })
                 .collect();
@@ -680,7 +945,10 @@ mod tests {
                 }
             }
             let ratio_db = 10.0 * (off_harmonic / total).log10();
-            assert!(ratio_db < -80.0, "sr {sr}: off-harmonic energy {ratio_db} dB");
+            assert!(
+                ratio_db < -80.0,
+                "sr {sr}: off-harmonic energy {ratio_db} dB"
+            );
         }
     }
 

@@ -38,16 +38,46 @@ impl Vowel {
     pub fn formants(self, voice: VoiceType) -> Formants {
         // (F1..F5 Hz, B1..B5 Hz)
         let (freq, bw) = match (voice, self) {
-            (VoiceType::Male, Vowel::A) => ([730.0, 1090.0, 2440.0, 3400.0, 4300.0], [80.0, 90.0, 120.0, 160.0, 200.0]),
-            (VoiceType::Male, Vowel::E) => ([530.0, 1840.0, 2480.0, 3450.0, 4300.0], [70.0, 90.0, 120.0, 160.0, 200.0]),
-            (VoiceType::Male, Vowel::I) => ([270.0, 2290.0, 3010.0, 3500.0, 4400.0], [55.0, 90.0, 120.0, 160.0, 200.0]),
-            (VoiceType::Male, Vowel::O) => ([570.0, 840.0, 2410.0, 3350.0, 4250.0], [70.0, 80.0, 120.0, 160.0, 200.0]),
-            (VoiceType::Male, Vowel::U) => ([300.0, 870.0, 2240.0, 3300.0, 4200.0], [60.0, 80.0, 120.0, 160.0, 200.0]),
-            (VoiceType::Female, Vowel::A) => ([850.0, 1220.0, 2810.0, 4100.0, 4950.0], [90.0, 100.0, 130.0, 170.0, 220.0]),
-            (VoiceType::Female, Vowel::E) => ([610.0, 2330.0, 2990.0, 4150.0, 4950.0], [80.0, 100.0, 130.0, 170.0, 220.0]),
-            (VoiceType::Female, Vowel::I) => ([310.0, 2790.0, 3310.0, 4200.0, 5000.0], [60.0, 100.0, 130.0, 170.0, 220.0]),
-            (VoiceType::Female, Vowel::O) => ([590.0, 920.0, 2710.0, 4050.0, 4950.0], [80.0, 90.0, 130.0, 170.0, 220.0]),
-            (VoiceType::Female, Vowel::U) => ([370.0, 950.0, 2670.0, 4000.0, 4900.0], [65.0, 90.0, 130.0, 170.0, 220.0]),
+            (VoiceType::Male, Vowel::A) => (
+                [730.0, 1090.0, 2440.0, 3400.0, 4300.0],
+                [80.0, 90.0, 120.0, 160.0, 200.0],
+            ),
+            (VoiceType::Male, Vowel::E) => (
+                [530.0, 1840.0, 2480.0, 3450.0, 4300.0],
+                [70.0, 90.0, 120.0, 160.0, 200.0],
+            ),
+            (VoiceType::Male, Vowel::I) => (
+                [270.0, 2290.0, 3010.0, 3500.0, 4400.0],
+                [55.0, 90.0, 120.0, 160.0, 200.0],
+            ),
+            (VoiceType::Male, Vowel::O) => (
+                [570.0, 840.0, 2410.0, 3350.0, 4250.0],
+                [70.0, 80.0, 120.0, 160.0, 200.0],
+            ),
+            (VoiceType::Male, Vowel::U) => (
+                [300.0, 870.0, 2240.0, 3300.0, 4200.0],
+                [60.0, 80.0, 120.0, 160.0, 200.0],
+            ),
+            (VoiceType::Female, Vowel::A) => (
+                [850.0, 1220.0, 2810.0, 4100.0, 4950.0],
+                [90.0, 100.0, 130.0, 170.0, 220.0],
+            ),
+            (VoiceType::Female, Vowel::E) => (
+                [610.0, 2330.0, 2990.0, 4150.0, 4950.0],
+                [80.0, 100.0, 130.0, 170.0, 220.0],
+            ),
+            (VoiceType::Female, Vowel::I) => (
+                [310.0, 2790.0, 3310.0, 4200.0, 5000.0],
+                [60.0, 100.0, 130.0, 170.0, 220.0],
+            ),
+            (VoiceType::Female, Vowel::O) => (
+                [590.0, 920.0, 2710.0, 4050.0, 4950.0],
+                [80.0, 90.0, 130.0, 170.0, 220.0],
+            ),
+            (VoiceType::Female, Vowel::U) => (
+                [370.0, 950.0, 2670.0, 4000.0, 4900.0],
+                [65.0, 90.0, 130.0, 170.0, 220.0],
+            ),
         };
         Formants { freq, bw }
     }
@@ -64,10 +94,14 @@ impl Formants {
     /// Neutral /ə/ (uniform tube) for breath noise.
     pub fn neutral(voice: VoiceType) -> Self {
         match voice {
-            VoiceType::Male => Self { freq: [500.0, 1500.0, 2500.0, 3500.0, 4500.0], bw: [80.0, 100.0, 130.0, 170.0, 210.0] },
-            VoiceType::Female => {
-                Self { freq: [580.0, 1700.0, 2900.0, 4000.0, 5000.0], bw: [90.0, 110.0, 140.0, 180.0, 230.0] }
-            }
+            VoiceType::Male => Self {
+                freq: [500.0, 1500.0, 2500.0, 3500.0, 4500.0],
+                bw: [80.0, 100.0, 130.0, 170.0, 210.0],
+            },
+            VoiceType::Female => Self {
+                freq: [580.0, 1700.0, 2900.0, 4000.0, 5000.0],
+                bw: [90.0, 110.0, 140.0, 180.0, 230.0],
+            },
         }
     }
 
@@ -176,7 +210,11 @@ pub struct FormantFilter {
 
 impl FormantFilter {
     pub fn new(sample_rate: f64, formants: &Formants) -> Self {
-        let mut f = Self { sr: sample_rate, res: [Resonator::default(); 5], current: None };
+        let mut f = Self {
+            sr: sample_rate,
+            res: [Resonator::default(); 5],
+            current: None,
+        };
         f.set(formants);
         f
     }
@@ -187,7 +225,11 @@ impl FormantFilter {
         if self.current.as_ref() == Some(formants) {
             return;
         }
-        for (r, (f, b)) in self.res.iter_mut().zip(formants.freq.iter().zip(formants.bw.iter())) {
+        for (r, (f, b)) in self
+            .res
+            .iter_mut()
+            .zip(formants.freq.iter().zip(formants.bw.iter()))
+        {
             r.set(self.sr, *f, *b);
         }
         self.current = Some(*formants);
@@ -266,8 +308,14 @@ mod tests {
                 dp += 2.0 * PI;
             }
             let d_meas = -dp / (2.0 * PI * 2.0 * df / sr);
-            assert!((d_meas - d).abs() < 0.02 * d.abs().max(1.0), "f {f}: delay {d} vs measured {d_meas}");
-            assert!((g_meas / g - 1.0).abs() < 0.05, "f {f}: gain {g} vs measured {g_meas}");
+            assert!(
+                (d_meas - d).abs() < 0.02 * d.abs().max(1.0),
+                "f {f}: delay {d} vs measured {d_meas}"
+            );
+            assert!(
+                (g_meas / g - 1.0).abs() < 0.05,
+                "f {f}: gain {g} vs measured {g_meas}"
+            );
         }
     }
 

@@ -25,7 +25,15 @@ pub struct Biquad64 {
 
 impl Biquad64 {
     fn from_raw(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Self {
-        Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     /// Normalised angular frequency and alpha for the cookbook formulas. The
@@ -40,13 +48,27 @@ impl Biquad64 {
     pub fn lowpass(sr: f64, f: f64, q: f64) -> Self {
         let (w0, alpha) = Self::w0_alpha(sr, f, q);
         let c = w0.cos();
-        Self::from_raw((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::from_raw(
+            (1.0 - c) / 2.0,
+            1.0 - c,
+            (1.0 - c) / 2.0,
+            1.0 + alpha,
+            -2.0 * c,
+            1.0 - alpha,
+        )
     }
 
     pub fn highpass(sr: f64, f: f64, q: f64) -> Self {
         let (w0, alpha) = Self::w0_alpha(sr, f, q);
         let c = w0.cos();
-        Self::from_raw((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::from_raw(
+            (1.0 + c) / 2.0,
+            -(1.0 + c),
+            (1.0 + c) / 2.0,
+            1.0 + alpha,
+            -2.0 * c,
+            1.0 - alpha,
+        )
     }
 
     /// Band-pass with 0 dB peak gain at `f`.
@@ -212,7 +234,10 @@ impl KaiserSinc {
                 bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) * inv_i0
             })
             .collect();
-        Self { half_width: half_width.max(1), window }
+        Self {
+            half_width: half_width.max(1),
+            window,
+        }
     }
 
     pub fn half_width(&self) -> usize {
@@ -231,7 +256,11 @@ impl KaiserSinc {
         let w0 = self.window.get(i).copied().unwrap_or(0.0);
         let w1 = self.window.get(i + 1).copied().unwrap_or(0.0);
         let w = w0 + (w1 - w0) * frac;
-        let sinc = if d.abs() < 1e-12 { 1.0 } else { (PI * d).sin() / (PI * d) };
+        let sinc = if d.abs() < 1e-12 {
+            1.0
+        } else {
+            (PI * d).sin() / (PI * d)
+        };
         sinc * w
     }
 
@@ -310,8 +339,12 @@ impl Correlator64 {
         self.buf_b[..lb].copy_from_slice(&b[..lb]);
         // Lengths are fixed by construction, so these cannot fail; on the
         // impossible error path the output is left zeroed.
-        let ok_a = self.fwd.process_with_scratch(&mut self.buf_a, &mut self.spec_a, &mut self.scratch);
-        let ok_b = self.fwd.process_with_scratch(&mut self.buf_b, &mut self.spec_b, &mut self.scratch);
+        let ok_a =
+            self.fwd
+                .process_with_scratch(&mut self.buf_a, &mut self.spec_a, &mut self.scratch);
+        let ok_b =
+            self.fwd
+                .process_with_scratch(&mut self.buf_b, &mut self.spec_b, &mut self.scratch);
         if ok_a.is_err() || ok_b.is_err() {
             out.fill(0.0);
             return;
@@ -326,7 +359,11 @@ impl Correlator64 {
         if let Some(last) = self.spec_a.last_mut() {
             last.im = 0.0;
         }
-        if self.inv.process_with_scratch(&mut self.spec_a, &mut self.out, &mut self.scratch).is_err() {
+        if self
+            .inv
+            .process_with_scratch(&mut self.spec_a, &mut self.out, &mut self.scratch)
+            .is_err()
+        {
             out.fill(0.0);
             return;
         }
@@ -354,7 +391,11 @@ pub fn decimate(x: &[f64], factor: usize) -> Vec<f64> {
         .map(|i| {
             let d = i as f64 - half as f64;
             let r = d / half as f64;
-            let sinc = if d == 0.0 { 2.0 * fc } else { (2.0 * PI * fc * d).sin() / (PI * d) };
+            let sinc = if d == 0.0 {
+                2.0 * fc
+            } else {
+                (2.0 * PI * fc * d).sin() / (PI * d)
+            };
             sinc * bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) * inv_i0
         })
         .collect();
@@ -421,20 +462,33 @@ mod tests {
     #[test]
     fn correlator_matches_direct() {
         let a: Vec<f64> = (0..100).map(|i| ((i * 7919) % 13) as f64 - 6.0).collect();
-        let b: Vec<f64> = (0..300).map(|i| ((i * 104_729) % 17) as f64 - 8.0).collect();
+        let b: Vec<f64> = (0..300)
+            .map(|i| ((i * 104_729) % 17) as f64 - 8.0)
+            .collect();
         let mut c = Correlator64::new(512);
         let mut out = vec![0.0; 200];
         c.cross_correlate(&a, &b, &mut out);
         for (tau, o) in out.iter().enumerate() {
-            let direct: f64 = a.iter().enumerate().map(|(j, x)| x * b.get(j + tau).copied().unwrap_or(0.0)).sum();
-            assert!((o - direct).abs() < 1e-8 * (1.0 + direct.abs()), "tau {tau}");
+            let direct: f64 = a
+                .iter()
+                .enumerate()
+                .map(|(j, x)| x * b.get(j + tau).copied().unwrap_or(0.0))
+                .sum();
+            assert!(
+                (o - direct).abs() < 1e-8 * (1.0 + direct.abs()),
+                "tau {tau}"
+            );
         }
     }
 
     #[test]
     fn decimate_keeps_passband_and_rejects_stopband() {
         let n = 48_000;
-        let tone = |f: f64| -> Vec<f64> { (0..n).map(|i| (2.0 * PI * f * i as f64 / 48_000.0).sin()).collect() };
+        let tone = |f: f64| -> Vec<f64> {
+            (0..n)
+                .map(|i| (2.0 * PI * f * i as f64 / 48_000.0).sin())
+                .collect()
+        };
         let pass = decimate(&tone(1000.0), 4);
         let stop = decimate(&tone(9000.0), 4);
         let mid = |v: &[f64]| rms(&v[1000..v.len() - 1000]);
@@ -445,7 +499,9 @@ mod tests {
     #[test]
     fn filtfilt_is_zero_phase() {
         let sr = 1000.0;
-        let x: Vec<f64> = (0..4000).map(|i| (2.0 * PI * 5.0 * i as f64 / sr).sin()).collect();
+        let x: Vec<f64> = (0..4000)
+            .map(|i| (2.0 * PI * 5.0 * i as f64 / sr).sin())
+            .collect();
         let lp = [Biquad64::lowpass(sr, 50.0, 0.707)];
         let y = filtfilt(&lp, &x);
         // Peak positions coincide (no phase shift) in the steady middle.

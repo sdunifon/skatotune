@@ -9,3 +9,12 @@ publish.workspace = true
 
 [dependencies]
 vt_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+# Spectral measurements in the quality tests (click detector, LPC envelopes).
+realfft.workspace = true
+
+[[bench]]
+name = "shift"
+harness = false

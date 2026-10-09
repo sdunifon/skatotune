@@ -7,3 +7,5 @@ target/
 .DS_Store
 # Local validator installs (clap-validator, pluginval, VST3 SDK validator)
 /.tools
+# Downloaded evaluation datasets (vocadito, CC BY 4.0)
+/data

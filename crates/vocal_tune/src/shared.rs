@@ -9,8 +9,9 @@
 //!   The consumer half is created with the engine in `activate()` and handed
 //!   to the GUI through [`SharedState::install_telemetry`] /
 //!   [`SharedState::take_telemetry`], a small `Mutex<Option<_>>` mailbox that
-//!   only `activate()` and the GUI thread ever touch. `process()` never sees
-//!   the mutex (DESIGN §3.6).
+//!   only `activate()`, the background thread (for an engine `process()`
+//!   swapped in, [`crate::swap`]) and the GUI thread ever touch. `process()`
+//!   never sees the mutex (DESIGN §3.6).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -26,14 +27,27 @@ pub struct SharedState {
     pub cpu_peak: AtomicF32,
     /// Latency of the running engine, samples.
     pub latency_samples: AtomicU32,
-    /// Latency the host has been told about while a restart is pending.
+    /// Latency of the pending structural change (equals `latency_samples`
+    /// when nothing is pending).
     pub pending_latency_samples: AtomicU32,
     /// Sample rate of the running engine (0 until the first activation).
     pub sample_rate: AtomicF32,
-    /// A structural parameter changed; the engine is rebuilt on the next
-    /// `activate()`.
+    /// Host's maximum block size and the engine's channel count from the last
+    /// activation.
+    pub max_block: AtomicU32,
+    pub engine_channels: AtomicU32,
+    /// Length of the most recent host block, samples (the host buffer).
+    pub block_samples: AtomicU32,
+    /// Id of the last background-built engine `process()` swapped in.
+    pub adopted_engine: AtomicU32,
+    /// A structural parameter changed and the engine for it is not running
+    /// yet (being built and swapped in, or waiting for a host restart).
     pub restart_pending: AtomicBool,
-    /// Engine scale after MIDI Learn, packed by [`pack_states`].
+    /// The pending change waits for the host to restart the plugin (CLAP
+    /// with a new latency); otherwise it is applied by an engine swap.
+    pub awaiting_host: AtomicBool,
+    /// MIDI-learned scale in effect (any MIDI mode), packed by
+    /// [`pack_states`].
     pub learned_states: AtomicU32,
     /// Telemetry frames the engine dropped because the GUI fell behind.
     pub telemetry_dropped: AtomicU64,
@@ -51,7 +65,12 @@ impl Default for SharedState {
             latency_samples: AtomicU32::new(0),
             pending_latency_samples: AtomicU32::new(0),
             sample_rate: AtomicF32::new(0.0),
+            max_block: AtomicU32::new(0),
+            engine_channels: AtomicU32::new(0),
+            block_samples: AtomicU32::new(0),
+            adopted_engine: AtomicU32::new(0),
             restart_pending: AtomicBool::new(false),
+            awaiting_host: AtomicBool::new(false),
             learned_states: AtomicU32::new(0),
             telemetry_dropped: AtomicU64::new(0),
             engine_generation: AtomicU32::new(0),
@@ -62,8 +81,9 @@ impl Default for SharedState {
 
 impl SharedState {
     /// Hand a fresh telemetry consumer to the GUI. Called from `activate()`
-    /// only (never from `process()`). Replaces (and drops, off the audio
-    /// thread) any consumer the GUI has not picked up yet.
+    /// and the background thread, never from `process()`. Replaces (and
+    /// drops, off the audio thread) any consumer the GUI has not picked up
+    /// yet.
     pub fn install_telemetry(&self, consumer: rtrb::Consumer<PitchFrame>) {
         let mut slot = self
             .telemetry

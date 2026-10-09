@@ -29,6 +29,12 @@
 //!    model of what each window measured. At 70 Hz with a 6 Hz ±50 c vibrato
 //!    this removes a ~3 c timing wobble and a ~1.5 c curvature bias.
 //!
+//! Voicing: a frame is voiced when the coarse clarity and level pass and the
+//! fine clarity is at least 0.5. Fast leaps smear the long coarse window, so
+//! unvoiced gaps of ≤ 150 ms between two voiced runs are re-examined with a
+//! log-interpolated period guess and a wide (±150 c) fine search, accepting
+//! frames with fine clarity ≥ 0.8.
+//!
 //! Validated against the synthesiser's exact `f0_truth` in this module's tests
 //! (median < 0.5 c, p99 < 3 c over clean vowels 70-1100 Hz, steady and with
 //! vibrato, at 44.1/48/96 kHz).
@@ -108,7 +114,10 @@ impl PitchTrack {
 
     /// Cents of the frame nearest to `pos`, if voiced.
     pub fn cents_at(&self, pos: usize) -> Option<f64> {
-        self.frames.get(self.frame_index(pos)).filter(|f| f.voiced).map(|f| f.cents)
+        self.frames
+            .get(self.frame_index(pos))
+            .filter(|f| f.voiced)
+            .map(|f| f.cents)
     }
 
     pub fn voiced_count(&self) -> usize {
@@ -147,6 +156,10 @@ const RESCUE_GAP_S: f64 = 0.15;
 const RESCUE_SEARCH_CENTS: f64 = 150.0;
 /// Fine clarity a rescued frame needs to count as voiced.
 const RESCUE_CLARITY: f64 = 0.8;
+/// Fine clarity any voiced frame needs: the long coarse window can call a
+/// frame voiced while the short fine window around it still sees a plosive
+/// burst or a fricative (no usable period there).
+const FINE_MIN_CLARITY: f64 = 0.5;
 
 pub struct ReferenceTracker {
     cfg: ReferenceConfig,
@@ -174,7 +187,11 @@ impl ReferenceTracker {
         let coarse_w = (2.0 * sr / f_min).round() as usize;
         let hop = ((cfg.hop_s * sr).round() as usize).max(1);
         Self {
-            cfg: ReferenceConfig { f_min, f_max, ..cfg },
+            cfg: ReferenceConfig {
+                f_min,
+                f_max,
+                ..cfg
+            },
             sr,
             hop,
             tau_min,
@@ -192,8 +209,15 @@ impl ReferenceTracker {
 
     /// Track the whole signal.
     pub fn track(&mut self, x: &[f32]) -> PitchTrack {
-        let x: Vec<f64> = x.iter().map(|v| if v.is_finite() { *v as f64 } else { 0.0 }).collect();
-        let n_frames = if x.is_empty() { 0 } else { (x.len() - 1) / self.hop + 1 };
+        let x: Vec<f64> = x
+            .iter()
+            .map(|v| if v.is_finite() { *v as f64 } else { 0.0 })
+            .collect();
+        let n_frames = if x.is_empty() {
+            0
+        } else {
+            (x.len() - 1) / self.hop + 1
+        };
 
         // Stage 1: coarse candidates + voicing evidence.
         let mut cands: Vec<Vec<Cand>> = Vec::with_capacity(n_frames);
@@ -257,14 +281,20 @@ impl ReferenceTracker {
         // Viterbi per voiced run over the coarse candidates.
         let mut coarse_tau = vec![0.0f64; n_frames];
         for (start, end) in runs(&voiced) {
-            self.viterbi(&cands[start..end], &best[start..end], &mut coarse_tau[start..end]);
+            self.viterbi(
+                &cands[start..end],
+                &best[start..end],
+                &mut coarse_tau[start..end],
+            );
         }
 
         // Stage 2: fine measurement per voiced frame.
         let mut fine: Vec<Option<Fine>> = vec![None; n_frames];
         for k in 0..n_frames {
             if voiced[k] && coarse_tau[k] > 0.0 {
-                fine[k] = self.refine(&x, k * self.hop, coarse_tau[k], FINE_SEARCH_CENTS);
+                fine[k] = self
+                    .refine(&x, k * self.hop, coarse_tau[k], FINE_SEARCH_CENTS)
+                    .filter(|f| f.clarity >= FINE_MIN_CLARITY);
             }
         }
 
@@ -278,18 +308,20 @@ impl ReferenceTracker {
         for pair in rs.windows(2) {
             let ((_, a_end), (b_start, _)) = (pair[0], pair[1]);
             let gap = b_start - a_end;
-            let loud = level[a_end..b_start].iter().all(|l| *l >= self.cfg.silence_dbfs && *l >= loudest + self.cfg.relative_silence_db);
+            let loud = level[a_end..b_start].iter().all(|l| {
+                *l >= self.cfg.silence_dbfs && *l >= loudest + self.cfg.relative_silence_db
+            });
             let (ta, tb) = (coarse_tau[a_end - 1], coarse_tau[b_start]);
             if gap == 0 || gap > max_gap || !loud || ta <= 0.0 || tb <= 0.0 {
                 continue;
             }
-            for k in a_end..b_start {
+            for (k, slot) in fine.iter_mut().enumerate().take(b_start).skip(a_end) {
                 let frac = (k + 1 - a_end) as f64 / (gap + 1) as f64;
                 let guess = (ta.ln() + (tb.ln() - ta.ln()) * frac).exp();
                 if let Some(f) = self.refine(&x, k * self.hop, guess, RESCUE_SEARCH_CENTS)
                     && f.clarity >= RESCUE_CLARITY
                 {
-                    fine[k] = Some(f);
+                    *slot = Some(f);
                 }
             }
         }
@@ -306,12 +338,17 @@ impl ReferenceTracker {
                 level_dbfs: level[k],
             })
             .collect();
-        let raw: Vec<f64> = fine.iter().map(|f| f.map_or(f64::NAN, |f| hz_to_cents64(self.sr / f.tau))).collect();
+        let raw: Vec<f64> = fine
+            .iter()
+            .map(|f| f.map_or(f64::NAN, |f| hz_to_cents64(self.sr / f.tau)))
+            .collect();
         let voiced_fine: Vec<bool> = fine.iter().map(|f| f.is_some()).collect();
         for (start, end) in runs(&voiced_fine) {
             for k in start..end {
                 let Some(fk) = fine[k] else { continue };
-                let c = self.deconvolve(k, &fine[start..end], &raw[start..end], start).unwrap_or(raw[k]);
+                let c = self
+                    .deconvolve(k, &fine[start..end], &raw[start..end], start)
+                    .unwrap_or(raw[k]);
                 frames[k] = RefFrame {
                     voiced: true,
                     f0_hz: 440.0 * ((c - 6900.0) / 1200.0).exp2(),
@@ -322,12 +359,18 @@ impl ReferenceTracker {
                 };
             }
         }
-        PitchTrack { sample_rate: self.sr, hop: self.hop, frames }
+        PitchTrack {
+            sample_rate: self.sr,
+            hop: self.hop,
+            frames,
+        }
     }
 
     /// Min-cost path through the candidates of one voiced run.
     fn viterbi(&self, cands: &[Vec<Cand>], best: &[f64], out: &mut [f64]) {
-        let local = |c: &Cand, m: f64| W_CLARITY * (m - c.1) + W_OCTAVE * (c.0 / self.tau_min as f64).log2();
+        let local = |c: &Cand, m: f64| {
+            W_CLARITY * (m - c.1) + W_OCTAVE * (c.0 / self.tau_min as f64).log2()
+        };
         let mut cost: Vec<Vec<f64>> = Vec::with_capacity(cands.len());
         let mut back: Vec<Vec<usize>> = Vec::with_capacity(cands.len());
         for (f, cs) in cands.iter().enumerate() {
@@ -336,7 +379,11 @@ impl ReferenceTracker {
             let mut brow = Vec::with_capacity(cs.len());
             for c in cs {
                 let l = local(c, m);
-                let prev = if f > 0 { cands.get(f - 1).zip(cost.get(f - 1)) } else { None };
+                let prev = if f > 0 {
+                    cands.get(f - 1).zip(cost.get(f - 1))
+                } else {
+                    None
+                };
                 match prev {
                     Some((pcs, pcost)) if !pcs.is_empty() => {
                         let (mut bc, mut bi) = (f64::INFINITY, usize::MAX);
@@ -361,7 +408,11 @@ impl ReferenceTracker {
             back.push(brow);
         }
         let Some(last) = cost.last() else { return };
-        let mut idx = last.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
+        let mut idx = last
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i);
         for f in (0..cands.len()).rev() {
             let Some(i) = idx else { break };
             if let (Some(o), Some(c)) = (out.get_mut(f), cands[f].get(i)) {
@@ -380,22 +431,46 @@ impl ReferenceTracker {
             return Some(first.0);
         }
         let second = self.refine_once(x, pos, first.0.tau, search_cents)?;
-        Some(if second.0.clarity >= first.0.clarity { second.0 } else { first.0 })
+        Some(if second.0.clarity >= first.0.clarity {
+            second.0
+        } else {
+            first.0
+        })
     }
 
     /// One fine search; the flag reports a peak on the band edge.
-    fn refine_once(&self, x: &[f64], pos: usize, tau_c: f64, search_cents: f64) -> Option<(Fine, bool)> {
+    fn refine_once(
+        &self,
+        x: &[f64],
+        pos: usize,
+        tau_c: f64,
+        search_cents: f64,
+    ) -> Option<(Fine, bool)> {
         let w = ((2.0 * tau_c).round() as usize).max(64);
         let ratio = (search_cents / 1200.0).exp2();
-        let lo = ((tau_c / ratio).floor() as usize).max(self.tau_min.saturating_sub(1)).max(2);
+        let lo = ((tau_c / ratio).floor() as usize)
+            .max(self.tau_min.saturating_sub(1))
+            .max(2);
         let hi = ((tau_c * ratio).ceil() as usize).max(lo + 1);
         let pad = self.sinc.half_width() + 2;
         let lag0 = lo.saturating_sub(pad).max(1);
         let lag1 = hi + pad;
         let s = pos as i64 - ((w as f64 + tau_c) / 2.0).round() as i64;
-        let get = |i: i64| -> f64 { if i < 0 { 0.0 } else { x.get(i as usize).copied().unwrap_or(0.0) } };
+        let get = |i: i64| -> f64 {
+            if i < 0 {
+                0.0
+            } else {
+                x.get(i as usize).copied().unwrap_or(0.0)
+            }
+        };
 
-        let weights: Vec<f64> = (0..w).map(|j| (std::f64::consts::PI * (j as f64 + 0.5) / w as f64).sin().powi(2)).collect();
+        let weights: Vec<f64> = (0..w)
+            .map(|j| {
+                (std::f64::consts::PI * (j as f64 + 0.5) / w as f64)
+                    .sin()
+                    .powi(2)
+            })
+            .collect();
         let a: Vec<f64> = (0..w).map(|j| get(s + j as i64)).collect();
         let e_a: f64 = a.iter().zip(&weights).map(|(v, wt)| wt * v * v).sum();
         if e_a <= 1e-30 {
@@ -417,7 +492,11 @@ impl ReferenceTracker {
         }
         let nsdf_at = |i: usize| -> f64 {
             let e = eb[i];
-            if e > 1e-30 { rr[i] / (e_a * e).sqrt() } else { 0.0 }
+            if e > 1e-30 {
+                rr[i] / (e_a * e).sqrt()
+            } else {
+                0.0
+            }
         };
         let (mut ti, mut tv) = (lo - lag0, f64::NEG_INFINITY);
         for i in (lo - lag0)..=(hi - lag0) {
@@ -430,11 +509,19 @@ impl ReferenceTracker {
         // Continuous maximisation of the sinc-interpolated NSDF.
         let f = |t: f64| -> f64 {
             let e = self.sinc.interp(&eb, t);
-            if e > 1e-30 { self.sinc.interp(&rr, t) / (e_a * e).sqrt() } else { 0.0 }
+            if e > 1e-30 {
+                self.sinc.interp(&rr, t) / (e_a * e).sqrt()
+            } else {
+                0.0
+            }
         };
         let on_edge = ti == lo - lag0 || ti == hi - lag0;
         let (t_best, v_best) = golden_max(&f, ti as f64 - 1.0, ti as f64 + 1.0, 64);
-        let (tau, clarity) = if v_best >= tv { (lag0 as f64 + t_best, v_best) } else { ((lag0 + ti) as f64, tv) };
+        let (tau, clarity) = if v_best >= tv {
+            (lag0 as f64 + t_best, v_best)
+        } else {
+            ((lag0 + ti) as f64, tv)
+        };
 
         // Effective kernel: weights c_j = w_j·x'(t_j)² (central difference).
         let (mut c_sum, mut c_t, mut c_tt) = (0.0, 0.0, 0.0);
@@ -452,16 +539,32 @@ impl ReferenceTracker {
         } else {
             (0.5 * (w as f64 - 1.0), (w * w) as f64 / 12.0)
         };
-        Some((Fine { tau, clarity, t_eff: s as f64 + centre + 0.5 * tau, var: spread + tau * tau / 12.0 }, on_edge))
+        Some((
+            Fine {
+                tau,
+                clarity,
+                t_eff: s as f64 + centre + 0.5 * tau,
+                var: spread + tau * tau / 12.0,
+            },
+            on_edge,
+        ))
     }
 
     /// Stage 3 for frame `k` (index into the whole track) using the
     /// measurements of its voiced run (`run_*` slices start at frame `start`).
-    fn deconvolve(&self, k: usize, run_fine: &[Option<Fine>], run_raw: &[f64], start: usize) -> Option<f64> {
+    fn deconvolve(
+        &self,
+        k: usize,
+        run_fine: &[Option<Fine>],
+        run_raw: &[f64],
+        start: usize,
+    ) -> Option<f64> {
         let fk = run_fine.get(k - start).copied().flatten()?;
         let t0 = (k * self.hop) as f64;
         // Neighbourhood: at least ±4 ms, wide enough to span the kernel.
-        let half = (1.5 * fk.var.sqrt()).max(0.004 * self.sr).min(0.02 * self.sr);
+        let half = (1.5 * fk.var.sqrt())
+            .max(0.004 * self.sr)
+            .min(0.02 * self.sr);
         let reach = (half / self.hop as f64).ceil() as usize + 1;
         let lo = (k - start).saturating_sub(reach);
         let hi = (k - start + reach).min(run_fine.len() - 1);
@@ -473,7 +576,9 @@ impl ReferenceTracker {
         let mut used = 0;
         let scale = 1.0 / half; // keep the system well conditioned
         for i in lo..=hi {
-            let (Some(f), Some(p)) = (run_fine.get(i).copied().flatten(), run_raw.get(i)) else { continue };
+            let (Some(f), Some(p)) = (run_fine.get(i).copied().flatten(), run_raw.get(i)) else {
+                continue;
+            };
             let u = (f.t_eff - t0) * scale;
             if u.abs() > 1.0 {
                 continue;
@@ -506,10 +611,11 @@ fn solve(a: &[[f64; 3]; 3], b: &[f64; 3], dim: usize) -> Option<[f64; 3]> {
         }
         m.swap(col, piv);
         v.swap(col, piv);
+        let pivot_row = m[col];
         for row in col + 1..dim {
-            let f = m[row][col] / m[col][col];
-            for c in col..dim {
-                m[row][c] -= f * m[col][c];
+            let f = m[row][col] / pivot_row[col];
+            for (dst, src) in m[row].iter_mut().zip(pivot_row.iter()).take(dim).skip(col) {
+                *dst -= f * src;
             }
             v[row] -= f * v[col];
         }
@@ -552,7 +658,11 @@ fn runs(v: &[bool]) -> Vec<(usize, usize)> {
 fn fill_segment(x: &[f64], s: i64, seg: &mut [f64]) {
     for (j, v) in seg.iter_mut().enumerate() {
         let i = s + j as i64;
-        *v = if i < 0 { 0.0 } else { x.get(i as usize).copied().unwrap_or(0.0) };
+        *v = if i < 0 {
+            0.0
+        } else {
+            x.get(i as usize).copied().unwrap_or(0.0)
+        };
     }
 }
 
@@ -608,7 +718,8 @@ fn key_maxima(nsdf: &[f64], tau_min: usize, tau_search: usize) -> Vec<Cand> {
         // A high voice has many near-equal subharmonic lobes (T, 2T, 3T, …):
         // keep the near-maximal ones shortest-lag first so T always survives,
         // then fill up with the strongest of the rest.
-        let (mut keep, mut rest): (Vec<Cand>, Vec<Cand>) = out.into_iter().partition(|c| c.1 >= 0.9 * m);
+        let (mut keep, mut rest): (Vec<Cand>, Vec<Cand>) =
+            out.into_iter().partition(|c| c.1 >= 0.9 * m);
         keep.truncate(MAX_CANDS);
         rest.sort_by(|a, b| b.1.total_cmp(&a.1));
         let room = MAX_CANDS - keep.len();
@@ -676,7 +787,9 @@ fn drop_short_runs(v: &mut [bool], min_len: usize) {
 mod tests {
     use super::*;
     use crate::dsp::percentile;
-    use crate::synth::{Consonant, Formants, Melody, Note, Signal, SignalBuilder, Vibrato, Voice, VoiceType, Vowel};
+    use crate::synth::{
+        Consonant, Formants, Melody, Note, Signal, SignalBuilder, Vibrato, Voice, VoiceType, Vowel,
+    };
 
     /// |error| in cents of every voiced reference frame at least `guard_s`
     /// inside a truth note, vs the exact synthesised f0 at the frame centre.
@@ -685,7 +798,11 @@ mod tests {
         let mut errs = Vec::new();
         let mut missed = 0;
         for f in &track.frames {
-            let Some(note) = sig.notes.iter().find(|n| f.pos >= n.start + guard && f.pos + guard < n.end) else {
+            let Some(note) = sig
+                .notes
+                .iter()
+                .find(|n| f.pos >= n.start + guard && f.pos + guard < n.end)
+            else {
                 continue;
             };
             let _ = note;
@@ -700,10 +817,16 @@ mod tests {
     }
 
     fn voice_for(f0: f64) -> Voice {
-        if f0 < 300.0 { Voice::male().clean() } else { Voice::female().clean() }
+        if f0 < 300.0 {
+            Voice::male().clean()
+        } else {
+            Voice::female().clean()
+        }
     }
 
-    const F0S: [f64; 11] = [70.0, 82.4, 110.0, 146.8, 196.0, 261.6, 349.2, 466.2, 622.3, 830.6, 1100.0];
+    const F0S: [f64; 11] = [
+        70.0, 82.4, 110.0, 146.8, 196.0, 261.6, 349.2, 466.2, 622.3, 830.6, 1100.0,
+    ];
 
     fn validate(sr: f32, f0s: &[f64]) -> (f64, f64, f64, usize) {
         let mut all = Vec::new();
@@ -711,7 +834,11 @@ mod tests {
         let mut tracker = ReferenceTracker::new(sr, ReferenceConfig::default());
         for (i, &f0) in f0s.iter().enumerate() {
             let vowel = Vowel::ALL[i % 5];
-            for vib in [None, Some(Vibrato::immediate(6.0, 50.0)), Some(Vibrato::immediate(5.5, 60.0))] {
+            for vib in [
+                None,
+                Some(Vibrato::immediate(6.0, 50.0)),
+                Some(Vibrato::immediate(5.5, 60.0)),
+            ] {
                 let sig = Signal::sustained(sr, voice_for(f0), vowel, f0, 0.6, vib);
                 let track = tracker.track(&sig.audio);
                 let (e, m) = frame_errors(&sig, &track, 0.04);
@@ -721,14 +848,21 @@ mod tests {
                 all.extend(e);
             }
         }
-        (percentile(&all, 50.0), percentile(&all, 99.0), percentile(&all, 100.0), missed)
+        (
+            percentile(&all, 50.0),
+            percentile(&all, 99.0),
+            percentile(&all, 100.0),
+            missed,
+        )
     }
 
     #[test]
     fn accuracy_on_clean_vowels_44k_48k() {
         for sr in [44_100.0f32, 48_000.0] {
             let (med, p99, max, missed) = validate(sr, &F0S);
-            eprintln!("reference @ {sr}: median {med:.4} c, p99 {p99:.4} c, max {max:.4} c, missed {missed}");
+            eprintln!(
+                "reference @ {sr}: median {med:.4} c, p99 {p99:.4} c, max {max:.4} c, missed {missed}"
+            );
             assert!(med < 0.5, "median {med}");
             assert!(p99 < 3.0, "p99 {p99}");
             assert_eq!(missed, 0);
@@ -745,15 +879,31 @@ mod tests {
     #[test]
     fn curvature_correction_matters_at_low_f0() {
         let sr = 48_000.0;
-        let sig = Signal::sustained(sr, Voice::male().clean(), Vowel::O, 70.0, 0.8, Some(Vibrato::immediate(6.0, 50.0)));
+        let sig = Signal::sustained(
+            sr,
+            Voice::male().clean(),
+            Vowel::O,
+            70.0,
+            0.8,
+            Some(Vibrato::immediate(6.0, 50.0)),
+        );
         let on = ReferenceTracker::new(sr, ReferenceConfig::default()).track(&sig.audio);
-        let off = ReferenceTracker::new(sr, ReferenceConfig { curvature_correction: false, ..Default::default() })
-            .track(&sig.audio);
+        let off = ReferenceTracker::new(
+            sr,
+            ReferenceConfig {
+                curvature_correction: false,
+                ..Default::default()
+            },
+        )
+        .track(&sig.audio);
         let (e_on, _) = frame_errors(&sig, &on, 0.05);
         let (e_off, _) = frame_errors(&sig, &off, 0.05);
         let (m_on, m_off) = (percentile(&e_on, 50.0), percentile(&e_off, 50.0));
         eprintln!("70 Hz vibrato median: corrected {m_on:.3} c, raw {m_off:.3} c");
-        assert!(m_on < m_off * 0.5, "correction did not help: {m_on} vs {m_off}");
+        assert!(
+            m_on < m_off * 0.5,
+            "correction did not help: {m_on} vs {m_off}"
+        );
     }
 
     #[test]
@@ -770,7 +920,10 @@ mod tests {
             let (e, missed) = frame_errors(&sig, &track, 0.04);
             assert_eq!(missed, 0);
             let worst = percentile(&e, 100.0);
-            assert!(worst < 3.0, "f0 {f0}: worst error {worst} c (octave error?)");
+            assert!(
+                worst < 3.0,
+                "f0 {f0}: worst error {worst} c (octave error?)"
+            );
         }
     }
 
@@ -820,7 +973,11 @@ mod tests {
             .build();
         let t = track(&sig.audio, sr);
         let v = t.voiced_count();
-        assert!(v * 100 < t.frames.len(), "{v} of {} frames voiced", t.frames.len());
+        assert!(
+            v * 100 < t.frames.len(),
+            "{v} of {} frames voiced",
+            t.frames.len()
+        );
     }
 
     /// On a melody with leaps, scoops, overshoot and gaps. Inside fast leaps
@@ -852,7 +1009,11 @@ mod tests {
         };
         let (mut slow, mut missed, mut worst_fast) = (Vec::new(), 0, 0.0f64);
         for f in &t.frames {
-            if !sig.notes.iter().any(|n| f.pos >= n.start + guard && f.pos + guard < n.end) {
+            if !sig
+                .notes
+                .iter()
+                .any(|n| f.pos >= n.start + guard && f.pos + guard < n.end)
+            {
                 continue;
             }
             let truth = hz_to_cents64(sig.f0_truth[f.pos] as f64);
@@ -865,7 +1026,9 @@ mod tests {
             }
         }
         let (med, p99) = (percentile(&slow, 50.0), percentile(&slow, 99.0));
-        eprintln!("melody: median {med:.3} p99 {p99:.3} missed {missed} worst-in-leap {worst_fast:.1}");
+        eprintln!(
+            "melody: median {med:.3} p99 {p99:.3} missed {missed} worst-in-leap {worst_fast:.1}"
+        );
         assert_eq!(missed, 0);
         assert!(med < 0.5 && p99 < 5.0, "median {med} p99 {p99}");
         assert!(worst_fast < 60.0, "gross error inside a leap: {worst_fast}");

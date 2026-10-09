@@ -15,10 +15,15 @@ pub fn read_wav(path: &Path) -> Result<(Vec<Vec<f32>>, f32)> {
     let spec = reader.spec();
     let chans = spec.channels.max(1) as usize;
     let interleaved: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().collect::<std::result::Result<_, _>>()?,
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<_, _>>()?,
         hound::SampleFormat::Int => {
             let scale = 1.0 / (1u64 << (spec.bits_per_sample.clamp(1, 32) - 1)) as f32;
-            reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<std::result::Result<_, _>>()?
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 * scale))
+                .collect::<std::result::Result<_, _>>()?
         }
     };
     let mut out = vec![Vec::with_capacity(interleaved.len() / chans); chans];
@@ -55,7 +60,13 @@ pub fn write_truth_csv(path: &Path, sig: &Signal) -> Result<()> {
     let mut f = BufWriter::new(File::create(path)?);
     writeln!(f, "time_s,f0_truth_hz,target_cents,centre_cents")?;
     let step = ((sig.sample_rate as f64) / 1000.0).round().max(1.0) as usize;
-    let opt = |v: f32| if v.is_finite() { format!("{v:.3}") } else { String::new() };
+    let opt = |v: f32| {
+        if v.is_finite() {
+            format!("{v:.3}")
+        } else {
+            String::new()
+        }
+    };
     for n in (0..sig.len()).step_by(step) {
         writeln!(
             f,

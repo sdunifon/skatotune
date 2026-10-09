@@ -73,6 +73,27 @@ fn transition_link_and_snap_off() {
     assert_eq!(resolve(&v).snap_max_st, 3.0);
 }
 
+/// RT-1 (plugin side): Snap Min below 0.05 c is off. Host float jitter on
+/// the knob's bottom position (a normalized 1e-6 is 0.00005 c) must reach
+/// the engine as exactly 0, not as a microscopic dead zone.
+#[test]
+fn snap_min_below_a_twentieth_of_a_cent_is_off() {
+    let mut v = ParamValues::default();
+    for tiny in [1e-7, 5e-5, 0.01, 0.049] {
+        v.snap_min_cents = tiny;
+        assert_eq!(resolve(&v).snap_min_cents, 0.0, "{tiny} c must be off");
+    }
+    for kept in [0.05, 0.5, 12.0, 50.0] {
+        v.snap_min_cents = kept;
+        assert_eq!(resolve(&v).snap_min_cents, kept);
+    }
+    let p = VocalTuneParams::default();
+    let jitter = p.snap_min_cents.preview_plain(1e-6);
+    assert!(jitter > 0.0);
+    v.snap_min_cents = jitter;
+    assert_eq!(v.to_settings().snap_min_cents, 0.0);
+}
+
 #[test]
 fn percentages_and_whole_semitones() {
     let mut v = ParamValues::default();

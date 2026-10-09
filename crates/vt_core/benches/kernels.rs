@@ -3,19 +3,31 @@
 //!
 //! * `dot`, `sum_sq`, `axpy`, `mul_acc`, `diff_sq`: scalar vs NEON (vs AVX2)
 //!   at 256 / 1024 / 4096 (plus a naive iterator baseline for the reductions).
+//!   `dot` and `sum_sq` also carry an `algebraic` variant (a plain fold with
+//!   `f32::algebraic_add`/`algebraic_mul`, the rejected alternative to
+//!   explicit accumulators).
 //! * `diff_sq_direct_vs_fft`: direct type-I difference vs the `Correlator`
-//!   path for W=1024/τ=512 and W=2048/τ=1024.
-//! * `fft`: RealFft vs Vdsp at n = 512 … 8192 (autocorrelation = forward +
-//!   inverse, and power spectrum = forward only).
+//!   path for W=1024/τ=512 and W=2048/τ=1024, at the power-of-two size and at
+//!   the exact fast size (1536 / 3072).
+//! * `fft`: RealFft vs Vdsp at n = 512 … 8192 plus the fast sizes 768, 1536,
+//!   3072, 6144 (autocorrelation = forward + inverse, and power spectrum =
+//!   forward only).
+//! * `fft_exact_vs_pow2`: the detector's cross-correlation (W-sample head
+//!   against the W + τ_max buffer, τ_max + 1 lags) at `FftSizing::PowerOfTwo`
+//!   vs `FftSizing::Fast` for the 48 kHz detector cells, both backends.
 //! * `fast_math`: fast vs std exp2 / log2 / tanh over 1024-element arrays.
 //! * `interp_512_reads`: cubic vs Sinc8 vs Sinc16, 512 reads per iteration.
+//! * `decimator`: the minimum-phase IIR `Decimator` vs a linear-phase Kaiser
+//!   FIR polyphase decimator of the same stopband (65 dB from fs_out/2,
+//!   passband to 0.4·fs_out), per 1024 input samples.
 //!
 //! Run: `cargo bench -p vt_core --bench kernels -- --warm-up-time 1 --measurement-time 2`
 
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use vt_core::fft::{Correlator, FftBackend};
+use vt_core::fft::{Correlator, FftBackend, FftSizing};
+use vt_core::filter::Decimator;
 use vt_core::interp::{InterpQuality, Interpolator};
 use vt_core::math::{fast_exp2, fast_log2, fast_tanh};
 use vt_core::ring::Ring;
@@ -49,6 +61,11 @@ fn bench_reductions(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("naive_iter", n), &n, |bch, _| {
             bch.iter(|| black_box(&a).iter().zip(black_box(&b)).map(|(x, y)| x * y).sum::<f32>())
         });
+        g.bench_with_input(BenchmarkId::new("algebraic", n), &n, |bch, _| {
+            bch.iter(|| {
+                black_box(&a).iter().zip(black_box(&b)).fold(0.0f32, |s, (x, y)| s.algebraic_add(x.algebraic_mul(*y)))
+            })
+        });
         g.bench_with_input(BenchmarkId::new("scalar", n), &n, |bch, _| {
             bch.iter(|| simd::scalar::dot(black_box(&a), black_box(&b)))
         });
@@ -72,6 +89,9 @@ fn bench_reductions(c: &mut Criterion) {
         g.throughput(Throughput::Elements(n as u64));
         g.bench_with_input(BenchmarkId::new("naive_iter", n), &n, |bch, _| {
             bch.iter(|| black_box(&a).iter().map(|x| x * x).sum::<f32>())
+        });
+        g.bench_with_input(BenchmarkId::new("algebraic", n), &n, |bch, _| {
+            bch.iter(|| black_box(&a).iter().fold(0.0f32, |s, x| s.algebraic_add(x.algebraic_mul(*x))))
         });
         g.bench_with_input(BenchmarkId::new("scalar", n), &n, |bch, _| {
             bch.iter(|| simd::scalar::sum_sq(black_box(&a)))
@@ -173,42 +193,87 @@ fn bench_diff_sq(c: &mut Criterion) {
         g.bench_function(BenchmarkId::new("direct_best", &label), |bch| {
             bch.iter(|| simd::diff_sq(black_box(&x), w, 0, black_box(&mut out)))
         });
-        let n = (w + tau).next_power_of_two();
-        for be in [FftBackend::RealFft, FftBackend::Vdsp] {
-            let mut corr = Correlator::new(n, be);
-            let name = match corr.backend() {
-                FftBackend::RealFft => "fft_realfft",
-                FftBackend::Vdsp => "fft_vdsp",
-            };
-            if be == FftBackend::Vdsp && corr.backend() != FftBackend::Vdsp {
-                continue; // no vDSP on this platform
+        // `tau` lags need n ≥ w + tau − 1: 2048 / 4096 as a power of two,
+        // 1536 / 3072 at the fast size.
+        for sizing in [FftSizing::PowerOfTwo, FftSizing::Fast] {
+            for be in [FftBackend::RealFft, FftBackend::Vdsp] {
+                let mut corr = Correlator::with_sizing(w + tau, be, sizing);
+                if be == FftBackend::Vdsp && corr.backend() != FftBackend::Vdsp {
+                    continue; // no vDSP on this platform
+                }
+                let name = format!("fft_{}_n{}", backend_tag(be), corr.len());
+                g.bench_function(BenchmarkId::new(name, &label), |bch| {
+                    bch.iter(|| corr.diff_sq(black_box(&x), w, 0, black_box(&mut out)))
+                });
             }
-            g.bench_function(BenchmarkId::new(name, &label), |bch| {
-                bch.iter(|| corr.diff_sq(black_box(&x), w, 0, black_box(&mut out)))
-            });
         }
     }
     g.finish();
 }
 
+fn backend_tag(be: FftBackend) -> &'static str {
+    match be {
+        FftBackend::RealFft => "realfft",
+        FftBackend::Vdsp => "vdsp",
+    }
+}
+
 fn bench_fft(c: &mut Criterion) {
     let mut g = c.benchmark_group("fft");
-    for &n in &[512usize, 1024, 2048, 4096, 8192] {
+    // Powers of two and the fast sizes between them (3·2^8 … 3·2^11).
+    for &n in &[512usize, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192] {
         let x = signal(n / 2, 11);
         let mut out = vec![0.0f32; n / 2 + 1];
         g.throughput(Throughput::Elements(n as u64));
         for be in [FftBackend::RealFft, FftBackend::Vdsp] {
-            let mut corr = Correlator::new(n, be);
+            let mut corr = Correlator::with_sizing(n, be, FftSizing::Fast);
+            debug_assert_eq!(corr.len(), n);
             if be == FftBackend::Vdsp && corr.backend() != FftBackend::Vdsp {
                 continue;
             }
-            let tag = if be == FftBackend::Vdsp { "vdsp" } else { "realfft" };
+            let tag = backend_tag(be);
             g.bench_with_input(BenchmarkId::new(format!("{tag}_autocorrelate"), n), &n, |bch, _| {
                 bch.iter(|| corr.autocorrelate(black_box(&x), black_box(&mut out)))
             });
             g.bench_with_input(BenchmarkId::new(format!("{tag}_power_spectrum"), n), &n, |bch, _| {
                 bch.iter(|| corr.power_spectrum(black_box(&x), black_box(&mut out)))
             });
+        }
+    }
+    g.finish();
+
+    // The verifier's per-hop cross term at 48 kHz (vt_detect LongFrame /
+    // ShortFrame geometry: W = 2.2/f_min at 24 kHz (HQ) or 16 kHz (Eco),
+    // τ_max = 1.06·rate/f_min; buffer W + τ_max + 1), plus the P§3.4.1 shapes.
+    let mut g = c.benchmark_group("fft_exact_vs_pow2");
+    for &(label, w, tau) in &[
+        ("hq_lowmale_W960_tau463", 960usize, 463usize),
+        ("hq_soprano_W377_tau182", 377, 182),
+        ("eco_altotenor_W440_tau212", 440, 212),
+        ("eco_soprano_W251_tau122", 251, 122),
+        ("short_lowmale_W480_tau287", 480, 287),
+        ("W1024_tau512", 1024, 511),
+        ("W2048_tau1024", 2048, 1023),
+    ] {
+        let len = w + tau + 1;
+        let x = signal(len, 13);
+        let mut out = vec![0.0f32; tau + 1];
+        for sizing in [FftSizing::PowerOfTwo, FftSizing::Fast] {
+            for be in [FftBackend::RealFft, FftBackend::Vdsp] {
+                let mut corr = Correlator::with_sizing(len, be, sizing);
+                if be == FftBackend::Vdsp && corr.backend() != FftBackend::Vdsp {
+                    continue;
+                }
+                let name = format!(
+                    "{}_{}_n{}",
+                    backend_tag(be),
+                    if sizing == FftSizing::Fast { "fast" } else { "pow2" },
+                    corr.len()
+                );
+                g.bench_function(BenchmarkId::new(name, label), |bch| {
+                    bch.iter(|| corr.cross_correlate(black_box(&x[..w]), black_box(&x), black_box(&mut out)))
+                });
+            }
         }
     }
     g.finish();
@@ -271,5 +336,100 @@ fn bench_interp(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_reductions, bench_elementwise, bench_diff_sq, bench_fft, bench_fast_math, bench_interp);
+/// Linear-phase baseline for `decimator`: a Kaiser-windowed sinc low-pass with
+/// the IIR's specification (65 dB at and above fs_out/2, transition from
+/// 0.4·fs_out), evaluated only at the kept output instants (polyphase cost:
+/// taps / factor multiply-adds per input sample) on a contiguous history.
+struct FirDecimator {
+    taps: Vec<f32>,
+    hist: Vec<f32>,
+    factor: usize,
+    phase: usize,
+}
+
+impl FirDecimator {
+    fn new(factor: usize) -> Self {
+        // Kaiser's estimate: N = (A − 7.95) / (14.36·Δf) + 1, Δf = 0.1 / factor
+        // (normalised to fs_in); β = 0.1102·(A − 8.7).
+        let atten = 65.0f64;
+        let n = (((atten - 7.95) / (14.36 * 0.1 / factor as f64)).ceil() as usize + 1) | 1;
+        let fc = 0.45 / factor as f64; // cutoff mid-transition, cycles/sample
+        let mut win = vec![0.0f32; n];
+        vt_core::window::kaiser(&mut win, (0.1102 * (atten - 8.7)) as f32);
+        let mid = (n - 1) as f64 / 2.0;
+        let taps: Vec<f32> = win
+            .iter()
+            .enumerate()
+            .map(|(i, &wv)| {
+                let t = i as f64 - mid;
+                let s = if t == 0.0 {
+                    2.0 * fc
+                } else {
+                    (2.0 * std::f64::consts::PI * fc * t).sin() / (std::f64::consts::PI * t)
+                };
+                (s * wv as f64) as f32
+            })
+            .collect();
+        Self { hist: vec![0.0; n + 1024], taps, factor, phase: 0 }
+    }
+
+    /// Filters `input` (≤ 1024 samples), writing kept outputs; returns the count.
+    fn push_block(&mut self, input: &[f32], out: &mut [f32]) -> usize {
+        let n = self.taps.len();
+        // `hist` = the previous n − 1 samples, then this block.
+        let keep = n - 1;
+        let total = keep + input.len();
+        let Some(hist) = self.hist.get_mut(..total) else { return 0 };
+        hist[keep..].copy_from_slice(input);
+        let mut produced = 0;
+        for i in 0..input.len() {
+            self.phase += 1;
+            if self.phase == self.factor {
+                self.phase = 0;
+                if let Some(o) = out.get_mut(produced) {
+                    *o = simd::dot(&hist[i..i + n], &self.taps);
+                    produced += 1;
+                }
+            }
+        }
+        hist.copy_within(total - keep..total, 0);
+        produced
+    }
+}
+
+fn bench_decimator(c: &mut Criterion) {
+    let x = signal(1024, 14);
+    let mut out = vec![0.0f32; 1024];
+    let mut g = c.benchmark_group("decimator");
+    g.throughput(Throughput::Elements(1024));
+    // The detector's streams: 48 kHz → 24 kHz (HQ), 16 kHz (Eco); 96 kHz →
+    // 24 kHz; 192 kHz → 24 kHz.
+    for &(label, sr, factor) in &[
+        ("48k_div2", 48_000.0f32, 2usize),
+        ("48k_div3", 48_000.0, 3),
+        ("96k_div4", 96_000.0, 4),
+        ("192k_div8", 192_000.0, 8),
+    ] {
+        let mut iir = Decimator::new(sr, factor);
+        g.bench_function(BenchmarkId::new(format!("iir_cheby2_order{}", iir.order()), label), |bch| {
+            bch.iter(|| iir.push_block(black_box(&x), black_box(&mut out)))
+        });
+        let mut fir = FirDecimator::new(factor);
+        g.bench_function(BenchmarkId::new(format!("fir_kaiser_{}taps", fir.taps.len()), label), |bch| {
+            bch.iter(|| fir.push_block(black_box(&x), black_box(&mut out)))
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_reductions,
+    bench_elementwise,
+    bench_diff_sq,
+    bench_fft,
+    bench_fast_math,
+    bench_interp,
+    bench_decimator
+);
 criterion_main!(benches);

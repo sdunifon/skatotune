@@ -8,10 +8,10 @@
 //! - turning points of `p_s` with 5 c hysteresis;
 //! - each extremum gives a half-period `hp` and half-extent `A`; it is valid
 //!   when `1/(2·hp)` is 3.5-9 Hz and `A` is 8-150 c (larger is a trill/note);
-//! - after 3 valid, consistent half-periods (`hp_max/hp_min ≤ 1.6`,
-//!   `A_max/A_min ≤ 2`) the split engages and `w_v` ramps 0 → 1 over one
-//!   half-period. Engagement therefore takes about one vibrato cycle; in Live
-//!   at retune 0 the first cycle is flattened (unavoidable causally, R§8.11);
+//! - after 3 consistent extrema (2 valid half-periods with `hp_max/hp_min ≤
+//!   1.6`, `A_max/A_min ≤ 2`) the split engages and `w_v` ramps 0 → 1 over
+//!   one half-period. Engagement therefore takes about one vibrato cycle; in
+//!   Live at retune 0 the first cycle is flattened (unavoidable causally);
 //! - centre anchors `(p_{e−2} + 2·p_{e−1} + p_e)/4`, placed at the middle
 //!   extremum, cancel both the vibrato and linear drift. Between anchors the
 //!   centre is extrapolated along the slope of the last two anchors (clamped
@@ -29,8 +29,6 @@
 //! tuning notes on the constants below for the measured deviations from
 //! R§8.11's starting values.
 
-use core::f64::consts::PI;
-
 /// Turning-point hysteresis, cents.
 const HYSTERESIS: f32 = 5.0;
 const RATE_MIN_HZ: f32 = 3.5;
@@ -39,8 +37,14 @@ const EXTENT_MIN: f32 = 8.0;
 const EXTENT_MAX: f32 = 150.0;
 const HP_RATIO_MAX: f32 = 1.6;
 const EXTENT_RATIO_MAX: f32 = 2.0;
-/// Valid half-periods needed before engaging.
+/// Valid half-period history kept for the rate/extent means.
 const ENGAGE_COUNT: usize = 3;
+/// Valid half-periods needed before engaging: three consistent extrema
+/// (R§8.11 "3 valid, consistent extrema"; the first extremum has no
+/// predecessor, so three extrema give two half-periods). This matches the
+/// quoted engagement delay of about one cycle (170-250 ms); requiring four
+/// extrema measured ≈ 310 ms at 6 Hz.
+const ENGAGE_HALF_PERIODS: usize = 2;
 /// Centre slope clamp, cents per second.
 const SLOPE_MAX: f32 = 300.0;
 /// Disengage ramp after a transition, ms.
@@ -135,6 +139,8 @@ impl Resonator {
     }
 
     /// One predict/update step with measurement `z = c + v + noise`.
+    // Small dense matrix algebra reads best as index loops.
+    #[allow(clippy::needless_range_loop)]
     fn step(&mut self, z: f32) -> f32 {
         let f = [
             [1.0, 1.0, 0.0, 0.0],
@@ -164,7 +170,9 @@ impl Resonator {
         let hp: [f64; 4] = core::array::from_fn(|j| pp[0][j] + pp[2][j]);
         let s = hp[0] + hp[2] + self.r;
         let innov = f64::from(z) - (xp[0] + xp[2]);
-        if !(s > 0.0) || !innov.is_finite() {
+        // `s` is a sum of variances; NaN or non-positive means the filter
+        // has diverged, so drop out of the Kalman path.
+        if s.is_nan() || s <= 0.0 || !innov.is_finite() {
             self.active = false;
             return self.x[0] as f32;
         }
@@ -187,10 +195,11 @@ impl Resonator {
     }
 
     /// Scalar pseudo-measurement of the centre alone (`H = [1, 0, 0, 0]`).
+    #[allow(clippy::needless_range_loop)]
     fn observe_centre(&mut self, z: f32, r: f64) -> f32 {
         let s = self.p[0][0] + r;
         let innov = f64::from(z) - self.x[0];
-        if !(s > 0.0) || !innov.is_finite() {
+        if s.is_nan() || s <= 0.0 || !innov.is_finite() {
             return self.x[0] as f32;
         }
         let hp = self.p[0];
@@ -224,6 +233,8 @@ pub(crate) struct VibratoTracker {
     started: bool,
     ext: [Point; 3],
     n_ext: usize,
+    /// `ext[2]` (the newest accepted extremum) is a maximum.
+    last_max: bool,
     // Valid (hp seconds, half-extent) history, newest last.
     hist: [(f32, f32); ENGAGE_COUNT],
     n_hist: usize,
@@ -258,6 +269,7 @@ impl VibratoTracker {
             started: false,
             ext: [Point::default(); 3],
             n_ext: 0,
+            last_max: false,
             hist: [(0.0, 0.0); ENGAGE_COUNT],
             n_hist: 0,
             mean_hp: 0.0,
@@ -318,7 +330,9 @@ impl VibratoTracker {
     pub fn update(&mut self, y: f32) -> VibratoOut {
         self.t += f64::from(self.hop_s);
         if let Some(e) = self.detect(y) {
-            self.on_extremum(e);
+            // `detect` has just reversed direction: falling now means `e` was a maximum.
+            let is_max = self.dir < 0;
+            self.on_extremum(e, is_max);
         }
 
         // Timeout: no extremum within 1.6 mean half-periods.
@@ -434,7 +448,27 @@ impl VibratoTracker {
         }
     }
 
-    fn on_extremum(&mut self, e: Point) {
+    fn on_extremum(&mut self, e: Point, is_max: bool) {
+        // Noise rejection while engaged (design choice): a turning point
+        // sooner than the shortest vibrato half-period after the last
+        // accepted extremum, or of the same kind, is a wiggle of the contour
+        // rather than a turning point of the vibrato. The Live pitch source
+        // (PSOLA mark spacing, R§7.6.2 A) moves by up to ±10 c from one
+        // period to the next with the voice's jitter, enough to cross the
+        // 5 c hysteresis at a vibrato peak; counted as an invalid (≈ 100 Hz)
+        // half-period it would clear the history and disengage the split for
+        // a whole cycle (measured on 6 Hz ±55 c vibrato). Ignoring it keeps
+        // history, timeout and anchors on the real extrema. Slow or
+        // out-of-range extrema still disengage (R§8.11). Before engagement
+        // every extremum counts as before, so fast wobbles never assemble
+        // into a fake vibrato.
+        if self.engaged && self.n_ext > 0 {
+            let hp = (e.t - self.ext[2].t) as f32;
+            if is_max == self.last_max || hp < 0.5 / RATE_MAX_HZ {
+                return;
+            }
+        }
+        self.last_max = is_max;
         self.ext = [self.ext[1], self.ext[2], e];
         self.n_ext = (self.n_ext + 1).min(3);
         self.last_ext_t = e.t;
@@ -487,7 +521,7 @@ impl VibratoTracker {
             self.configure_kalman();
         }
 
-        if !self.engaged && self.n_hist >= ENGAGE_COUNT && self.consistent() {
+        if !self.engaged && self.n_hist >= ENGAGE_HALF_PERIODS && self.consistent() {
             self.engaged = true;
             self.w_step = 1.0 / self.hops(self.mean_hp);
             if self.use_kalman {
@@ -502,7 +536,7 @@ impl VibratoTracker {
 
     fn consistent(&self) -> bool {
         let (mut hp_lo, mut hp_hi, mut a_lo, mut a_hi) = (f32::MAX, 0.0f32, f32::MAX, 0.0f32);
-        for &(hp, a) in &self.hist {
+        for &(hp, a) in &self.hist[ENGAGE_COUNT - self.n_hist.min(ENGAGE_COUNT)..] {
             hp_lo = hp_lo.min(hp);
             hp_hi = hp_hi.max(hp);
             a_lo = a_lo.min(a);
@@ -512,11 +546,10 @@ impl VibratoTracker {
     }
 }
 
-/// Half-extent (cents) and rate (Hz) of a sinusoid sampled every hop: a helper
-/// for tests that need to know what the tracker should report.
+/// A sinusoidal pitch contour (test helper).
 #[cfg(test)]
 pub(crate) fn sine_contour(t: f64, centre: f32, extent: f32, rate: f32) -> f32 {
-    centre + extent * (2.0 * PI * f64::from(rate) * t).sin() as f32
+    centre + extent * (2.0 * core::f64::consts::PI * f64::from(rate) * t).sin() as f32
 }
 
 #[cfg(test)]
@@ -603,6 +636,44 @@ mod tests {
         let (_, last) = out[out.len() - 1];
         assert!((last.centre - 6200.0).abs() < 1.0);
         assert!(last.w < 1e-6);
+    }
+
+    /// The Live pitch source (PSOLA mark spacing) is a staircase that moves
+    /// by up to ±10 c from one glottal period to the next. Those wiggles cross
+    /// the 5 c hysteresis near vibrato peaks; once engaged, the split must
+    /// ignore them instead of disengaging for a cycle.
+    #[test]
+    fn engaged_split_survives_per_period_pitch_noise() {
+        for kalman in [false, true] {
+            let mut tr = VibratoTracker::new(HOP_S, kalman);
+            // 220 Hz voice: a new offset, uniform in ±9 c, every 4.5 ms
+            // period (in the engine the mark-spacing pitch moved by up to
+            // 12-15 c between periods near vibrato peaks), then the
+            // corrector's 4 ms pre-smoother (R§7.6.2 C) as in the real path.
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            let mut noise = [0.0f32; 1024];
+            for v in noise.iter_mut() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *v = ((seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * 9.0;
+            }
+            let alpha = 1.0 - (-HOP_S / 0.004).exp();
+            let p_s = core::cell::Cell::new(6030.0f32);
+            let out = run(&mut tr, 3.0, |t| {
+                let k = ((t / 0.0045) as usize) % noise.len();
+                let y = p_s.get() + alpha * (sine_contour(t, 6030.0, 50.0, 6.0) + noise[k] - p_s.get());
+                p_s.set(y);
+                y
+            });
+            let engaged_at = out.iter().position(|(_, o)| o.w >= 1.0).unwrap_or(usize::MAX);
+            assert!((engaged_at as f32) * HOP_S < 0.5, "engaged at {engaged_at} (kalman {kalman})");
+            let after = &out[engaged_at..];
+            let dropouts = after.iter().filter(|(_, o)| o.w < 1.0).count();
+            assert_eq!(dropouts, 0, "split dropped out for {dropouts} hops (kalman {kalman})");
+            let max_err = after[after.len() / 4..].iter().map(|(_, o)| (o.centre - 6030.0).abs()).fold(0.0, f32::max);
+            assert!(max_err < 12.0, "centre error {max_err} (kalman {kalman})");
+        }
     }
 
     #[test]

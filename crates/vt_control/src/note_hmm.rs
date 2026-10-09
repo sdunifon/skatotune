@@ -28,10 +28,24 @@
 //! the transition prior keeps the current note: that is the HMM form of the
 //! Waves cents tolerance, and it is what prevents flip-flop. Outside it the
 //! log-likelihood falls quadratically (`K_TAIL` per ms per c²), capped at
-//! `E_CAP` per ms so a one-hop outlier cannot flip the note. Tolerance *time*
-//! adds a small linear slope so that a pitch sitting just past the midpoint
-//! switches after about that time (OR semantics, R§7.6.2 F). Attack states
-//! use a capture region widened by 25 c (scoops) at half the evidence rate.
+//! `E_CAP` per ms so a one-hop outlier cannot flip the note, plus a linear
+//! near-band slope (`K_NEAR` per ms per c) once the corrector reports that
+//! the pitch has *persisted* past the current note's band ([`HmmObs::near`]):
+//! a pitch held just past the band then switches within tens of ms instead of
+//! 0.57 s (CL-2), while brief excursions past it (vibrato peaks, wobble at
+//! note ends) keep the quadratic tail's hysteresis and do not warble.
+//! Tolerance *time* adds a small linear slope so the evidence for the nearer
+//! note grows with how long and how far past the midpoint the pitch sits
+//! (R§8.12: the tolerance knobs map onto the evidence, calibrated). The
+//! corrector gates every switch with Waves' OR rule (R§7.6.2 F), so neither
+//! term can switch before x > T_c or x > 0 has held for T_t. Attack states
+//! use the same capture region at half the evidence rate (R§8.12: one
+//! observation model around the note pitch). A wider attack region (tried:
+//! +25 c, to tolerate scoops) makes the note just entered sticky: after a
+//! scoop that commits to the lower neighbour, or in a legato glide through an
+//! intermediate note, its attack state keeps full likelihood while the pitch
+//! sits 20-30 c past midpoint + tolerance, and the switch came 40-140 ms late
+//! in the engine harness.
 //! All evidence is expressed per millisecond and multiplied by the hop length
 //! and by the detector confidence, so behaviour is hop-length invariant and
 //! unclear frames weigh less ("σ scaled by detector confidence").
@@ -54,14 +68,17 @@ const UNIFORM_JUMP: f32 = 0.03;
 const FLOOR_JUMP: f32 = 1e-4;
 pub(crate) const MAX_JUMP_HQ: usize = 13;
 pub(crate) const MAX_JUMP_MAX: usize = 24;
+/// Linear evidence beyond the capture region once the pitch has persisted
+/// there ([`HmmObs::near`]), nats per ms per c: a pitch held 1 c past the
+/// band then switches about 20 ms after the persistence test passes, 4 c past
+/// in about 5 ms (CL-2; with only the quadratic tail 1 c past took 0.57 s).
+const K_NEAR: f32 = 0.4;
 /// Quadratic evidence beyond the capture region, nats per ms per c².
 const K_TAIL: f32 = 0.006;
 /// Evidence cap, nats per ms.
 const E_CAP: f32 = 2.5;
 /// Past-midpoint distance (c) that switches in about `tolerance_ms`.
 const D_REF_TIME: f32 = 5.0;
-/// Attack capture regions are this much wider (c).
-const ATTACK_EXTRA: f32 = 25.0;
 /// Attack evidence weight.
 const ATTACK_SCALE: f32 = 0.5;
 /// Capture half-width used at the ends of the candidate range, c.
@@ -82,6 +99,9 @@ pub(crate) struct HmmObs {
     pub confidence: f32,
     /// FSM-confirmed voicing.
     pub voiced: bool,
+    /// The pitch has stayed past the current note's cents band long enough
+    /// to count as held there: enables the near-band slope `K_NEAR`.
+    pub near: bool,
 }
 
 /// Fixed-lag Viterbi state (Studio only).
@@ -216,8 +236,8 @@ impl NoteHmm {
         self.max_jump = mj;
         self.tol_c = tol;
         // Switching cost ≈ −ln q plus the jump prior; a pitch d_ref past the
-        // midpoint accumulates 2·d_ref·k_t nats per ms, so choose k_t to pay
-        // that cost in about tolerance_ms.
+        // midpoint accumulates 2·d_ref·k_t nats per ms more for the nearer
+        // note, so choose k_t to pay that cost in about tolerance_ms.
         self.k_t = if tolerance_ms > 0.0 {
             let cost = -(self.q.max(1e-9)).ln() + 1.0;
             cost / (2.0 * D_REF_TIME * tolerance_ms)
@@ -283,14 +303,12 @@ impl NoteHmm {
 
     /// Evidence energies (nats per ms) of the stable and attack states.
     #[inline]
-    fn energies(&self, n: usize, rel: f32) -> (f32, f32) {
+    fn energies(&self, n: usize, rel: f32, near: bool) -> (f32, f32) {
         let dx = rel - 100.0 * n as f32;
-        let dist = dx.abs();
         let out = if dx >= 0.0 { dx - self.r_hi[n] } else { -dx - self.r_lo[n] }.max(0.0);
-        let out_a = (out - ATTACK_EXTRA).max(0.0);
-        let lin = self.k_t * dist;
-        let es = (lin + K_TAIL * out * out).min(E_CAP);
-        let ea = ATTACK_SCALE * (lin + K_TAIL * out_a * out_a).min(E_CAP);
+        let k_near = if near { K_NEAR } else { 0.0 };
+        let es = (self.k_t * dx.abs() + (k_near + K_TAIL * out) * out).min(E_CAP);
+        let ea = ATTACK_SCALE * es;
         (es, ea)
     }
 
@@ -308,7 +326,7 @@ impl NoteHmm {
                 self.lik_s[n] = 0.0;
                 continue;
             }
-            let (es, ea) = self.energies(n, obs.rel);
+            let (es, ea) = self.energies(n, obs.rel, obs.near);
             self.lik_s[n] = if es >= E_CAP { cap_s } else { (-w * es).exp() };
             self.lik_a[n] = if ea >= ATTACK_SCALE * E_CAP { cap_a } else { (-w * ea).exp() };
         }
@@ -355,10 +373,14 @@ impl NoteHmm {
     fn forward_voiced(&mut self) {
         let q = self.q;
         if !self.started {
-            // Onset with no memory: uniform over the attack states.
-            let p0 = 1.0 / self.count.max(1) as f32;
+            // Onset with no memory: attack states weighted by the *stable*
+            // (narrow) likelihood, so the onset commits to the note whose
+            // capture region holds the pitch. The wider attack region then
+            // only serves to tolerate scoops after that commitment; weighting
+            // by it here would leave neighbours tied and the first vibrato
+            // excursion past the midpoint would flip the note.
             for n in 0..N_NOTES {
-                self.a[n] = if self.allowed[n] { p0 * self.lik_a[n] } else { 0.0 };
+                self.a[n] = if self.allowed[n] { self.lik_s[n] } else { 0.0 };
                 self.s[n] = 0.0;
                 self.z[n] = 0.0;
             }
@@ -415,7 +437,7 @@ impl NoteHmm {
             // note from the current evidence.
             let mut acc = 0.0;
             for n in 0..N_NOTES {
-                self.a[n] = if self.allowed[n] { self.lik_a[n].max(1e-12) } else { 0.0 };
+                self.a[n] = if self.allowed[n] { self.lik_s[n].max(1e-12) } else { 0.0 };
                 self.s[n] = 0.0;
                 self.z[n] = 0.0;
                 acc += self.a[n];
@@ -465,6 +487,9 @@ impl NoteHmm {
 
     // ----- Studio: fixed-lag Viterbi --------------------------------------
 
+    // The per-note tables (scores, likelihoods, priors, backpointers) are
+    // parallel arrays read with neighbour offsets; index loops are clearer.
+    #[allow(clippy::needless_range_loop)]
     fn viterbi_step(&mut self, voiced: bool) {
         let q = self.q;
         let ln_keep_s = (1.0 - q).ln();
@@ -489,7 +514,7 @@ impl NoteHmm {
             if !v.started || (!v.silent && v.la.iter().chain(v.ls.iter()).all(|x| *x <= NEG)) {
                 for m in 0..N_NOTES {
                     if self.allowed[m] {
-                        na[m] = lnl(self.lik_a[m]);
+                        na[m] = lnl(self.lik_s[m]);
                     }
                     v.bp[base + 3 * m] = state(m, 0);
                     v.bp[base + 3 * m + 1] = state(m, 1);
@@ -634,7 +659,7 @@ mod tests {
     const HOP_MS: f32 = 64.0 / 48.0;
 
     fn voiced(rel: f32) -> HmmObs {
-        HmmObs { rel, confidence: 0.9, voiced: true }
+        HmmObs { rel, confidence: 0.9, voiced: true, near: true }
     }
 
     fn feed(h: &mut NoteHmm, rel: f32, hops: usize) {
@@ -710,18 +735,34 @@ mod tests {
         assert!((hops as f32) * HOP_MS < 15.0, "20 st leap took {hops} hops");
     }
 
-    #[test]
-    fn tolerance_time_switches_after_dwell() {
+    /// Hops until note 61's posterior exceeds `P_SWITCH` for a pitch held
+    /// `past` cents beyond C4's capture band (midpoint + tolerance).
+    fn switch_hops(tol: f32, past: f32) -> usize {
         let mut h = NoteHmm::new(HOP_MS, 0);
-        h.set_params(8.0, 30.0, MAX_JUMP_HQ);
+        h.set_params(tol, 0.0, MAX_JUMP_HQ);
         feed(&mut h, 6000.0, 200);
         let mut hops = 0;
-        while h.prob(61) < P_SWITCH && hops < 1000 {
-            h.step(&voiced(6055.0));
+        while h.prob(61) < P_SWITCH && hops < 2000 {
+            h.step(&voiced(6050.0 + tol + past));
             hops += 1;
         }
-        let ms = hops as f32 * HOP_MS;
-        assert!(ms > 10.0 && ms < 80.0, "dwell switch after {ms} ms");
+        hops
+    }
+
+    /// CL-2: the cents part of the OR rule. Just past the band the switch
+    /// comes within about 20 ms (it took 0.57 s with only the quadratic
+    /// tail), and sooner the further past, for every preset tolerance.
+    #[test]
+    fn pitch_just_past_the_cents_band_switches_promptly() {
+        for tol in [0.0f32, 5.0, 8.0, 15.0, 40.0] {
+            let one = switch_hops(tol, 1.0) as f32 * HOP_MS;
+            let four = switch_hops(tol, 4.0) as f32 * HOP_MS;
+            let far = switch_hops(tol, 40.0) as f32 * HOP_MS;
+            assert!(one < 25.0, "tol {tol}: 1 c past took {one} ms");
+            assert!(four < 10.0, "tol {tol}: 4 c past took {four} ms");
+            assert!(far < 6.0, "tol {tol}: 40 c past took {far} ms");
+            assert!(far <= four && four <= one, "tol {tol}: {one} / {four} / {far} ms");
+        }
     }
 
     #[test]
@@ -730,7 +771,7 @@ mod tests {
         h.set_params(8.0, 0.0, MAX_JUMP_HQ);
         feed(&mut h, 6400.0, 100);
         for _ in 0..30 {
-            h.step(&HmmObs { rel: 0.0, confidence: 0.0, voiced: false });
+            h.step(&HmmObs { rel: 0.0, confidence: 0.0, voiced: false, near: false });
         }
         assert_eq!(top(&h, 0.0), 64);
         // Re-voicing near the same note stays there.

@@ -28,7 +28,12 @@ When this file and `research.md` disagree, **this file wins**, because it record
 - fastF0ArMl harmonic re-scoring, harmonic-chirp scoring, SWIPE′ second opinion.
 - S2 spectral Studio engine, per-grain true-envelope re-colouring beyond ±3 st (formant knob still works to ±12 st via grain resampling; clean within ±3 st).
 - SEDREAMS/ZFF GCI marks with DP path (Studio uses the Live NCC mark tracker with lookahead in v1).
-- Key detection, sidechain chord prior, worker-thread pipelining (everything runs inline on the audio thread in v1; the whole chain is a few % of one core).
+- Key detection, sidechain chord prior, worker-thread pipelining (everything runs inline on the audio thread in v1; the whole chain is a few % of one core). Studio spreads each hop's detector analysis over the next hop in four stages at fixed sample offsets (RT-2/PERF-7, still inline, bit-identical to one `analyze()`), so host blocks smaller than a hop share the work out (§3.5).
+- Full HQ L2 mark tracking (R§7.2.2): causal multi-hypothesis (Viterbi) marks. v1 HQ/Max resolve competing NCC mark peaks by period continuity and pick the best of the nearest 2-3 grains by overlap correlation; Max behaves as HQ in the shifter.
+- Distribution signing: bundles are ad-hoc signed; Developer ID signing, notarisation and an installer are needed before a public release. (The licence part is done: the repo has an ISC `LICENSE`, and `cargo xtask bundle` writes `LICENSE.txt` and a generated `THIRD-PARTY-NOTICES.txt`, which covers the OFL-1.1 and Ubuntu font licences, into every bundle.)
+- An RT-priority, paced `rt-bench` mode (P§5.5). v1's rt-bench runs unpaced on a normal-priority thread, so its `max` column measures OS preemption on a loaded machine.
+
+v1 closed on 2026-10-09; a hardening pass the same day fixed note onsets, the Studio ratio timing, the CPU tail and the plugin's structural-change protocol. `docs/STATUS.md` has the measured state of every §4 gate, the real-singing results, and the contract deviations recorded during integration.
 
 ---
 
@@ -62,7 +67,7 @@ xtask              nice-plug-xtask bundler
 ### 2.2 Hop and timing
 
 - The **control hop** is `hop = 64` samples at 44.1/48 kHz, `128` at 88.2/96 kHz, `256` at 176.4/192 kHz (`vt_core::hop_for_rate(sr)`). It is the same for every tier and mode.
-- The engine splits every host block at hop boundaries. Per segment: push samples into the detector, run the shifter on the segment. At each hop boundary: `detector.analyze()` → `corrector.process_hop()` → `shifter.set_control()` (the ratio then ramps linearly across the next hop). This adds **no** latency; control just updates at hop boundaries.
+- The engine splits every host block at hop boundaries. Per segment: push samples into the detector, run the shifter on the segment. At each hop boundary: `detector.analyze()` → `corrector.process_hop()` → `shifter.set_control()` (the ratio then ramps linearly across the next hop). This adds **no** latency; control just updates at hop boundaries. (Studio pipelines this over the next hop, §3.5.)
 - Absolute input sample index `n` counts from `reset()`. Output sample `n` carries input content from about `n − D` (plus PSOLA content wander, R§2.1).
 - Telemetry `PitchFrame::sample_pos` is **output time**: `estimate.sample_pos + D`.
 
@@ -256,14 +261,25 @@ impl Detector {
     /// only (conditioning, decimation, E/H recursion).
     pub fn push(&mut self, x: &[f32]);
     /// Run the per-hop analysis. Called by the engine exactly once every `hop` pushed samples.
+    /// Equivalent to begin_analysis() + finish_analysis().
     pub fn analyze(&mut self) -> PitchEstimate;
+    /// Split analysis (PERF-7): snapshot the stream positions at the hop boundary (call before
+    /// any newer sample is pushed), then run the ANALYSIS_STEPS (= 4) stages Frames, Checks,
+    /// Track, Output one per call; Some(estimate) after the last. Up to one hop of newer samples
+    /// may be pushed in between; the estimate is bit-identical to analyze() at the boundary.
+    pub fn begin_analysis(&mut self);
+    pub fn step_analysis(&mut self) -> Option<PitchEstimate>;
+    pub fn finish_analysis(&mut self) -> PitchEstimate;  // runs every remaining stage
+    pub fn analysis_steps_left(&self) -> usize;          // 0 when idle
     /// Up to 5 (period_samples, score) candidates from the last analyze(), best first (hook for a
     /// future neural arbiter and for tests).
     pub fn candidates(&self) -> &[(f32, f32)];
 }
 ```
 
-Tier behaviour (R§7.2.2, simplified): **Eco** verifier at ~16 kHz, 20-cent HMM bins, parabolic refinement only above 400 Hz; **HQ** verifier at ~24 kHz, 10-cent bins, two-resolution NSDF, full-rate refinement every hop; **Max** HQ + 5-cent bins + detector-lag compensation (R§8.10) applied to `cents`. Studio (`Centered`) adds fixed-lag HMM smoothing over `delay / hop` frames.
+Tier behaviour (R§7.2.2, simplified): **Eco** verifier at ~16 kHz, 20-cent HMM bins, parabolic refinement only above 400 Hz, no harmonic score: its octave decisions use the time-domain measures only, including a rough-phonation rule (a period-doubled voice keeps T when T is strongly periodic on the long-frame and E/H measures, heights ≤ 0.3, and 2T is not decisively more periodic, ≥ 0.2× on each); **HQ** verifier at ~24 kHz, 10-cent bins, two-resolution NSDF, full-rate refinement every hop; **Max** HQ + 5-cent bins + detector-lag compensation (R§8.10) applied to `cents`. Studio (`Centered`) adds fixed-lag HMM smoothing over `delay / hop` frames.
+
+Voicing (all tiers, R§8.8): onset hops must agree within 50 c; an onset after silence must start ≤ 20 c above `f_max` and, above 150 Hz, takes 3 raw hops instead of 2; segments younger than 12 ms do not hold; release tails more than 18 dB under the segment's decaying peak (20 dB/s) are unvoiced; segments within 6 dB of that peak hold through low-clarity hops unless the level rises.
 
 Tests: synthetic glottal vowels and pure/harmonic tones at 55-1400 Hz, all sample rates (44.1/48/96 kHz): median error < 1 c on steady tones (< 3 c above 1 kHz), no octave errors on a vowel set with strong F1 near 2·f0, step-response lag at 110/220/440 Hz reported and asserted below 1.5·W/2, voicing F1 ≥ 0.97 on vowel/silence/noise/sibilant sequences, vibrato (6 Hz, ±50 c) tracked with RMS error < 15 c in Live HQ, block-size independence.
 
@@ -301,14 +317,16 @@ impl Corrector {
     pub fn set_settings(&mut self, s: &Settings);     // every block; RT-safe
     pub fn midi(&mut self, ev: MidiEvent);
     /// One control hop. `mark_cents` = instantaneous input pitch from the PSOLA mark tracker when
-    /// it is locked (Live modes, R§7.6.2 A), else None.
+    /// it is locked (Live modes, R§7.6.2 A), else None. Ignored since the hardening pass (SN-2:
+    /// on real singing the mark pitch is 2.3× noisier than the detector and no earlier); the
+    /// correction follows the detector pitch (`f0_hz` at the analysed sample in Live Max).
     pub fn process_hop(&mut self, est: &PitchEstimate, mark_cents: Option<f32>) -> ControlOutput;
     /// Effective scale after MIDI Learn edits (for the GUI keyboard), one state per pitch class.
     pub fn learned_states(&self) -> Option<[vt_core::NoteState; 12]>;
 }
 ```
 
-Note decision: **Eco** = rules (fat1 bias + Waves OR-tolerance, R§7.6.2 F); **HQ/Max** = MonoNote-style HMM forward filter (R§8.12); **Studio** = fixed-lag decisions using `lookahead_hops`.
+Note decision: **Eco** = rules (fat1 bias + Waves OR-tolerance, R§7.6.2 F); **HQ/Max** = MonoNote-style HMM forward filter (R§8.12); **Studio** = fixed-lag decisions using `lookahead_hops` (a switch also needs the crossing to persist through the visible lookahead). A phrase restart (an estimate > 300 c from the last accepted pitch within 60 ms of the phrase start or after a gap ≥ 15 ms) is decided as a fresh onset, without the octave guard. In Studio the pitch that sets the shift comes from the frame round(0.5 + 0.25·T/hop) hops newer than the one the note is decided on (it matches the shifter's ratio timing).
 
 Tests (pure control law, no audio): step response matches the one-pole definition (63% at τ); τ = 0 hard-snaps; residual vibrato ratio vs τ matches the R§7.6.2 H table within 0.03; PreserveVibrato + τ = 0 keeps a 6 Hz ±40 c vibrato around the corrected centre (extent within ±10% after engagement) while Depth 0 removes it; Flex-Tune weight curve; Humanize slows only sustained notes; hysteresis prevents flip-flop on a pitch hovering ±5 c around a midpoint; Bypass/Remove semantics; MIDI Target/Learn/Auto, all-octaves, bend, sustain, all-notes-off; transpose/detune; unvoiced hold/release/forget timings; octave guard.
 
@@ -393,10 +411,16 @@ impl Engine {
     pub fn stats(&self) -> EngineStats;
     /// Effective scale after MIDI Learn (forwarded from Corrector).
     pub fn learned_states(&self) -> Option<[vt_core::NoteState; 12]>;
+    /// Switch the voice range at runtime when that keeps D (HI-3; RT-safe: `new` prebuilds a
+    /// detector and shifter for every range with the same D and Studio pipeline shape). Returns
+    /// false, changing nothing, when D would change: the host must then rebuild the engine. The
+    /// output fades out (5 ms), the new range takes over at the next hop boundary and fades back
+    /// in after D samples; the control law, settings and telemetry carry on.
+    pub fn set_voice_range(&mut self, range: VoiceRange) -> bool;
 }
 ```
 
-Responsibilities: sanitize NaN/Inf; build the analysis signal from `Settings::analysis_channel`; split at hop boundaries and MIDI timings; per-hop pipeline (§2.2); Studio `Alignment::Centered { delay: D }` and `lookahead_hops = D / hop`; fill `PitchFrame::sample_pos = est.sample_pos + D`; drop telemetry when the ring is full (count it).
+Responsibilities: sanitize NaN/Inf; build the analysis signal from `Settings::analysis_channel`; split at hop boundaries and MIDI timings; per-hop pipeline (§2.2); fill `PitchFrame::sample_pos = est.sample_pos + D`; drop telemetry when the ring is full (count it). Studio splits D between the detector (`Alignment::Centered { delay: D − k·hop }`) and the control law's lookahead (`k` hops, `vt_engine::studio_split`, CL-3), and spreads each hop's work over the next hop (RT-2/PERF-7): `begin_analysis()` at the boundary, the four detector stages before samples hop/4, 3·hop/8, hop/2 and 3·hop/4, the control law before 7·hop/8, the control applied at the following boundary (one hop of the lookahead pays for this, so `lookahead_hops = ⌈D/hop⌉ − 1`). In every mode the shifter update decided at a boundary is applied before the first sample after it.
 
 Tests: zero allocations in `process()` after construction (separate test binary with a counting `#[global_allocator]`, including a negative control); block-size invariance over {1, 7, 32, 64, 128, 480, 4096, random}; measured latency == reported for every mode × range at 44.1/48/96 kHz (cross-correlation on unvoiced noise bursts); NaN input recovers.
 
@@ -404,7 +428,12 @@ Tests: zero allocations in `process()` after construction (separate test binary 
 
 - nice-plug `Plugin` + `ClapPlugin` + `Vst3Plugin`, exported with `nice_export_clap!` / `nice_export_vst3!`. Stable `CLAP_ID = "com.vocaltune.vocal-tune"`, fixed `VST3_CLASS_ID`, stable param `#[id]`s from day one.
 - `AUDIO_IO_LAYOUTS`: stereo→stereo (first/default), mono→mono, mono→stereo (upmix). `MIDI_INPUT = MidiConfig::Basic`. `SAMPLE_ACCURATE_AUTOMATION = false`.
-- `activate()`: build `Engine` from `EngineConfig` (sample rate, max block, channels, latency mode, voice range, live+/studio ms), report `latency_samples`. Changing a structural param (latency mode, voice range, live+/studio ms) calls `context.set_latency_samples()` once and requests a restart; the engine is rebuilt in the next `activate()`.
+- `activate()`: build `Engine` from `EngineConfig` (sample rate, max block, channels, latency mode, voice range, live+/studio ms), report `latency_samples`; an engine that already matches is kept.
+- Structural params (latency mode, voice range, live+/studio ms):
+  - A voice-range change that keeps D is applied by the running engine (`Engine::set_voice_range`) at once, with no host involvement.
+  - Any other change waits until it has been left alone for 0.25 s (HI-2). The engine is then built on nice-plug's background thread and swapped in at a block boundary behind a 3 ms fade (it stays muted until its delay line has filled). A VST3 host is told the new latency only after the swap, and again at 1, 3 and 7 s until it re-activates (HI-1). CLAP allows a latency change only in `activate()`, so a CLAP change that moves D requests a host restart and the engine is rebuilt there; one that keeps D is swapped. The standalone always swaps.
+  - Nothing is allocated, freed or locked on the audio thread.
+- MIDI Learn: the learned scale is plugin state saved with the project; once notes are learned it replaces Key/Scale and the note overrides in every MIDI mode until the user clears it (HI-4/CL-4).
 - Params (all with sensible ranges/skews/units/formatters; non-automatable where noted):
   - Structural (non-automatable): `latency_mode`, `voice_range`, `live_plus_ms` (5-10), `studio_ms` (20-50).
   - Runtime: `tier` (non-automatable), `engine` (Classic/Natural), `key`, `scale`, 12 note overrides `note_<pc>` ∈ {Scale, On, Bypass, Remove}, `retune_ms` (0-400, skewed, default 20), `transition_link` (bool), `transition_ms` (0-800), `humanize`, `flex_tune`, `amount` (%), `detune_cents`, `transpose_st` (±12, step 1), `formant_st` (±12), `formant_follow`, `preserve_vibrato`, `ignore_vibrato`, `vibrato_depth` (-100..200 %), `tolerance_cents`, `tolerance_ms`, `snap_min_cents`, `snap_max_st` (0 = off), `tracking`, `gate_db`, `analysis_channel`, synthetic vibrato (`lfo_on`, `lfo_rate`, `lfo_depth`, `lfo_delay`, `lfo_ramp`), MIDI (`midi_mode`, `midi_all_octaves`, `bend_range`), `output_gain_db`, `presets` are GUI actions writing params.
@@ -446,3 +475,19 @@ Tests: zero allocations in `process()` after construction (separate test binary 
 | CPU (M4 Max, 48 kHz) | Live HQ p99.9 block time < 5 % of the buffer period at 128; < 10 % at 32; Max < 25 % |
 | Perf proofs | each SIMD/FFT/fast-math optimisation shows a statistically significant speedup in criterion vs its scalar/std baseline (numbers recorded in `docs/PERFORMANCE.md`) |
 | Plugin | builds/bundles VST3 + CLAP; clap-validator passes; loads in Bitwig and Ableton |
+
+**How the gates are measured (fixed during v1 integration).** These definitions are binding for the rows above; `vt_eval suite` and `crates/vt_eval/tests/quality_gates.rs` implement them.
+
+- **Tuning.** At retune > 0, frames within 2·τ of an input-centre movement (> 10 c in that window) are excluded as by-design convergence: an ideal R§7.6 corrector scores p95 19.3 c on `melody_male` at τ = 20 ms without the exclusion and 4.0 c with it. Retune 0 is scored on every stable frame. Frames are ambiguous only within the scale-aware limit (half the gap to the neighbouring *legal* note minus the Tolerance cents, never below 50 c).
+- **Settling.** Every onset must settle in < 30 ms; there is no median, and an onset that never settles fails. The clock starts at the note-decision point: the sung centre has passed the midpoint to the neighbouring legal note by the Tolerance cents (the HQ/Max capture region). Onsets that miss are listed by name in `KNOWN_SLOW_ONSETS` with a regression guard each, and the suite reports the gate as FAIL while that list is not empty.
+- **Vibrato preservation** also covers vibrato that starts with the note (`vibrato_onset`).
+
+Gates added during v1 integration (same evidence standard as the table):
+
+| Gate | Target |
+|---|---|
+| Vibrato engagement (Live HQ, τ = 0, vibrato from the onset) | output reaches ≥ 80 % of the input extent ≤ 2.5 periods after the vibrato starts; first-two-period extent ratio ≤ 1.15. A flattened first cycle is the documented causal limit (R§8.11) |
+| Content delay (amount 0, voiced, `melody_male`; other scenarios reported in the latency gauge) | \|PSOLA wander\| ≤ one sung period (R§10.3); heard delay = D + wander |
+| Held-out scenarios (`heldout_pentatonic`, `heldout_room`; never used for tuning constants) | the Tuning, Settling and Voicing F1 targets above, reported as separate suite rows; known misses are listed with regression guards |
+| Real singing (vocadito, Live HQ) | detector within 2 points RPA50, +0.5 points octave errors, +1 point other gross errors and −0.015 voicing F1 of the offline reference tracker on the same frames; hard-tune output p95, settle p90 and onset glitches under per-range regression guards (`vt_eval::vocadito::gates`) |
+| Plugin validators | VST3 SDK `validator` and pluginval (strictness 10, in process, GUI tests skipped) pass on the bundles, in addition to clap-validator |
