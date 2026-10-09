@@ -537,3 +537,17 @@ Live is unchanged (its analysis stays at the boundary): Live HQ p99.9 2.8 / 6.5 
   - [2, 4, 5, 6, 7] keeps the two-block case lighter (192 kHz/128 67.6 µs) but pairs Checks with Track at four blocks per hop (192 kHz/64 p99.9 13.1 % against 11.9 %) and is worse at 48 kHz/32 (Max Wide 40.8 µs).
   - [2, 3, 4, 6, 7] was kept (`vt_engine::PIPELINE_EIGHTHS`).
 - **Determinism across builds:** the old and new engines, built separately, gave identical hashes on all 336 configurations, so the cross-build drift the vt_control/vt_engine owner saw in a detector-only hash (an unused padding field changed it) did not show up here.
+
+## 12. End-to-end SIMD and FFT-backend A/B (2026-10-09)
+
+Kernel speedups (§3) do not say how much the whole plugin gains. Three builds of the same commit (`704d95d`) were benchmarked with `cargo bench -p vt_eval --bench engine`, 128-sample blocks, 48 kHz stereo, two interleaved rounds (load 7-12 on 16 cores), median of the two rounds:
+
+| Build | Live Eco | Live HQ | Studio Max |
+|---|---:|---:|---:|
+| **Shipping**: hand NEON kernels + realfft in the detector | **21.6 µs** | **36.6 µs** | **81.6 µs** |
+| `simd::best = scalar` (auto-vectorised scalar kernels, still realfft) | 22.7 µs (+5 %) | 37.9 µs (+3.5 %) | 83.0 µs (+1.7 %) |
+| Detector FFT on vDSP instead of realfft (NEON kernels) | 24.4 µs (+13 %) | 37.9 µs (+3.6 %) | 90.1 µs (+10 %) |
+
+- **Hand-written NEON is worth 2-5 % of the whole engine.** The "scalar" backend is not SIMD-free: LLVM auto-vectorises its chunked accumulator loops into NEON, which is where most of the kernel gain over naive code (§3.1: 7-20×) comes from. On aarch64 a truly SIMD-free build is not possible (NEON is part of the base ABI).
+- **vDSP loses end to end** even though it wins every isolated FFT (§3.3). The detector's decimated-rate FFTs are small (exact sizes of a few hundred points), where vDSP is slower (§3.4), and vDSP once produced instance-dependent last bits. The detector therefore stays on realfft (`vt_detect/src/verifier.rs`, `FFT_BACKEND`).
+- The engine uses about 1.4 % of one M4 Max core in Live HQ, so the remaining CPU is better spent on quality (Max tier, worker threads) than on further kernel tuning.
