@@ -98,6 +98,7 @@ pub fn install_into_bundles(args: &[String]) -> Result<()> {
                 .with_context(|| format!("Could not create {}", resources.display()))?;
             fs::write(resources.join(NOTICES_FILE), &text)?;
             fs::write(resources.join("LICENSE.txt"), &license)?;
+            crate::identity::set_bundle_identifier(&bundle, &package)?;
             sign(&bundle);
             eprintln!("Added license notices to '{}'", bundle.display());
         }

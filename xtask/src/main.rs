@@ -1,4 +1,5 @@
-//! `cargo xtask`: nice-plug's bundler plus third-party notices (LIC-1).
+//! `cargo xtask`: nice-plug's bundler plus third-party notices (LIC-1) and our
+//! own bundle identifier.
 //!
 //! ```text
 //! cargo xtask bundle vocal_tune --release   # nice-plug bundle, then the notices
@@ -9,6 +10,7 @@
 //!
 //! Everything else is passed to `nice_plug_xtask` unchanged.
 
+mod identity;
 mod notices;
 
 fn main() -> nice_plug_xtask::Result<()> {

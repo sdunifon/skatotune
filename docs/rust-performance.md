@@ -10,7 +10,7 @@
 - Spot checks made while writing:
   - the nice-plug 0.4.2 sources in the local cargo registry;
   - three new probes on this machine (exact-size FFT YIN with realfft and vDSP, phase-interpolated polyphase SNR, fixed-phase FIR grain read);
-  - a scratch crate that compiles the main code patterns in this document and tests them (7/7 pass): `/private/tmp/claude-501/-Users-scott-vibe-vocal-tune/d86c8b21-f6a6-405c-a400-2d930c03d9a0/scratchpad/perfdoc_snippets`.
+  - a scratch crate (kept outside the repository) that compiles the main code patterns in this document and tests them (7/7 pass).
 - "(measured, M4 Max)" means measured on the dev machine: Apple M4 Max, 12 P-cores + 4 E-cores, macOS 27.2, release build, f32. Other jobs were running during most runs (load average 5-62), so absolute numbers carry about ±10% noise. Comparisons made inside one run are reliable.
 - "(estimate)" means an engineering estimate. "(design choice)" means our own decision.
 - **Budget machine.** Release budgets are set against a base M1, which is slower than the M4 Max, as in research.md §10.7. Gates on the M4 Max are therefore tighter.
@@ -1027,12 +1027,7 @@ Pass: 0-sample tolerance on items 1, 4 and 5. In the DAW, run the research.md §
 
 ## 6. Local measurements (M4 Max)
 
-Unless noted, everything here is single-threaded, f32, built with fat LTO and codegen-units = 1. The reports used divan medians; the new probes use best-of-40 batch means. Load averages were 5-62 during the research and 8.9-13.4 during the new probes. Raw outputs:
-
-- `/private/tmp/claude-501/simdbench/{final_small,final_large,bench_stable,profile_default,profile_tuned,cpu_default,cpu_native}.txt`
-- `…/scratchpad/rtsys/{wake_results,pipe_results}.txt`
-- `…/scratchpad/review/` (verifier probes)
-- `…/scratchpad/perfdoc_probe` and `…/scratchpad/perfdoc_snippets` (new probes)
+Unless noted, everything here is single-threaded, f32, built with fat LTO and codegen-units = 1. The reports used divan medians; the new probes use best-of-40 batch means. Load averages were 5-62 during the research and 8.9-13.4 during the new probes. The raw outputs came from scratch benchmark crates kept outside the repository (a SIMD kernel bench, a real-time threading probe, verifier probes and the documentation probes); the kernel benchmarks that matter were later rebuilt inside the repository (`crates/vt_core/benches/kernels.rs`, see `docs/PERFORMANCE.md`).
 
 ### 6.1 Dot product, 2048 elements (256 elements in parentheses)
 

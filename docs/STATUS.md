@@ -236,7 +236,7 @@ The margin is 3-4 ms on the two low-male onsets; Live-Min (Classic engine, not p
 ## 7. Build, test, install
 
 ```sh
-cd /Users/scott/vibe/vocal_tune
+cd vocal_tune   # the repository root
 cargo build --workspace
 cargo test --workspace --release            # 552 passed, 0 failed, 2 ignored (opt-in), ≈ 70 s
 cargo clippy --workspace --all-targets --all-features -- -D warnings

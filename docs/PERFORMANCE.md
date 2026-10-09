@@ -372,7 +372,7 @@ This build is newer than the 22:08 snapshot of §4, and it ran at a lower load. 
 Use a private target dir when other agents share the machine. Check `sysctl -n vm.loadavg` before timing anything, and repeat any run whose load average exceeds about half the core count.
 
 ```sh
-cd /Users/scott/vibe/vocal_tune
+cd vocal_tune   # the repository root
 export CARGO_TARGET_DIR=target/perf
 
 # Kernels: every group, saved as a named baseline (≈ 8 min)
