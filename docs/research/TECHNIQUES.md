@@ -64,13 +64,13 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 | Steadiness gating of pitch evidence (slope over 20 ms) | AK | Hop-to-hop slope reads detector jitter as glides; on real singing the loosest setting (4 c/ms) won | Adopted (loose) | #6, #7 |
 | "Sung-notes" agreement confidence (sets differing only on unsung notes agree) | AK | Confident on incomplete scales, lower confident precision on DEV | Available, off | #6 |
 | Key confirmation with hysteresis (new key leads 8 s, at a pause ≥ 150 ms) | AK, KEY §5.3 | 142/144 synthetic takes confirmed, all right; no wrong confirmations on vocadito | Adopted | #6, #5 |
-| Optional sidechain chroma from the backing track | R§9.6, KEY §5.3 | Where Antares puts Auto-Key; vocal-only is weak on short material (AK §3) | Candidate | #6, #12 |
+| Optional sidechain chroma from the backing track | R§9.6, KEY §5.3 | Where Antares puts Auto-Key; vocal-only is weak on short material (AK §3) | Candidate | #34, #6, #12, #26 |
 
 ## Host integration
 
 | Technique | Source | Evidence | Status | Helps |
 |---|---|---|---|---|
-| VST3 `kScaleEvent` / `ProcessContext.chord` via a nice-plug patch | KEY | No host documented as sending scale events | Candidate (cheap) | #5 |
+| VST3 `kScaleEvent` / `ProcessContext.chord` via a nice-plug patch | KEY | No host documented as sending scale events | Candidate (cheap) | #33, #5 |
 | Latched MIDI-scale key source; Bitwig Key Filter+ → MIDI input | KEY §5, AK §1.1 | Note-on sets the scale to every held note (2+ classes); only older notes lifted within 50 ms of a chord shrink it (staccato, staggered release and legato retrigger tested end to end); saved with the project. Bitwig route not yet tried in Bitwig | Adopted (Key Source = MIDI Scale) | #5, #6, #19 |
 | Key-change hold: a note removed by a scale change keeps its target until the next note (≤ 200 ms), then glides | KEY §3.3 | Control tests in Live and Studio; default output bit-identical | Adopted | #5, #6, #7 |
 | Display timeline that survives CLAP sleep/wake resets | commit 704d95d | Graph no longer wipes on pauses | Adopted | #19 |
