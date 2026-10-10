@@ -3,7 +3,7 @@
 use super::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use skato_core::{LatencyMode, MidiEvent, MidiMode, NoteState, QualityTier, SynthVibrato};
+use skato_core::{LatencyMode, MidiEvent, MidiMode, NoteState, QualityTier, ReferenceMode, SynthVibrato};
 
 // Counts allocations made by the current thread while armed, so parallel
 // tests do not disturb each other.
@@ -86,6 +86,8 @@ fn random_settings(r: &mut Lcg) -> Settings {
         midi_mode: modes[(r.next() * 4.0) as usize % 4],
         midi_all_octaves: r.next() < 0.5,
         bend_range_st: r.next() * 12.0,
+        note_hold: r.next() < 0.5,
+        reference: if r.next() < 0.5 { ReferenceMode::FollowSinger } else { ReferenceMode::A440 },
         ..Settings::default()
     }
 }

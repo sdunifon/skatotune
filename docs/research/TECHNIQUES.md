@@ -48,14 +48,14 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 | MonoNote-style note HMM (HQ/Max) | R§8.12 | — | Adopted | #7, #10 |
 | Phrase restart on a > 300 c jump near a phrase start | STATUS (v1.1) | Onset glitches 13.9 % → 6.3 % (with the other v1.1 fixes) | Adopted | #7, #16 |
 | Studio decisions over the lookahead, pitch advance | STATUS (v1.1) | Studio settle 35/83 ms → 17/41 ms (median/p90) | Adopted | #7, #10 |
-| Adaptive singer tuning reference | NI proto A | Hurts real singers as a default; on a detuned-singer benchmark it recovers most of the intent loss | Prototyped; recommended only as an opt-in "Follow singer's tuning" | #7, #6 |
+| Adaptive singer tuning reference | NI proto A | Hurts real singers as a default; on a detuned-singer benchmark it recovers most of the intent loss | Adopted as the opt-in Labs "Follow singer's tuning" (off by default) | #7, #6 |
 | Musical note model: key/interval/duration priors, glide state | NI proto B | No frontier gain (audit); its b_adapt preset trades note accuracy for warble | Prototyped, not adopted | #7, #6 |
-| Release freeze: no downward switch while the level falls > 4 dB in 40 ms | NI proto C, lead | Removes about a third more warble on top of the veto | Prototyped; recommended | #7, #16 |
+| Release freeze: no downward switch while the level falls > 4 dB in 40 ms | NI proto C, lead | Removes about a third more warble on top of the veto | Adopted in the Labs "Learned note hold" (off by default) | #7, #16 |
 | Glide-endpoint extrapolation (Saitou-style) | NI proto C | Future pitch change uncorrelated with velocity (R² ≈ 0.05); worse in closed loop | Rejected | #7, #8 |
 | Onset cues that aren't pitch (energy dip + rise, voicing gaps) set the note-change hazard | NI literature | Moved the frontier in an offline test (AUC 0.72); level dip/rise features feed the learned veto | Partly adopted via the veto | #7, #16, #10, #17 |
-| Learned switch veto ("rule proposes, model vetoes"): gradient-boosted trees, 300 trees, 82 causal features relative to the decided pitch, can only block a proposed switch | NI proto D, lead | Live HQ chromatic TEST: warble 50 → 24 /min, stable p95 25.6 → 20.1 c, frame accuracy +3.3 pts, but per-note accuracy 79.7 → 76.5 %; 10.6 µs per hop, no allocation; audited sound with caveats (Live HQ chromatic only) | Prototyped; recommended for Live HQ pending confirmation on new singers | #7, #14, #27, #16 |
-| Studio onset note read from the newest third of the lookahead | NI protos B, C | DEV onset glitches 1.1 → 0.5 %; not confirmed on TEST | Prototyped | #7, #10 |
-| Frontier yardstick: compare a change against the Pareto envelope of a Tolerance sweep | NI lead | Separates "better" from "a different setting of the same trade-off" | Prototyped (eval tool) | #26, #12, #7, #8 |
+| Learned switch veto ("rule proposes, model vetoes"): gradient-boosted trees, 300 trees, 82 causal features relative to the decided pitch, can only block a proposed switch | NI proto D, lead | Live HQ chromatic TEST: warble 50 → 24 /min, stable p95 25.6 → 20.1 c, frame accuracy +3.3 pts, but per-note accuracy 79.7 → 76.5 %; 10.6 µs per hop, no allocation; audited sound with caveats (Live HQ chromatic only) | Adopted in the Labs "Learned note hold" (off by default; HQ/Max); confirmation on new singers still pending | #7, #14, #27, #16 |
+| Studio onset note read from the newest third of the lookahead | NI protos B, C | DEV onset glitches 1.1 → 0.5 %; not confirmed on TEST | Adopted in the Labs "Learned note hold" (Studio) | #7, #10 |
+| Frontier yardstick: compare a change against the Pareto envelope of a Tolerance sweep | NI lead | Separates "better" from "a different setting of the same trade-off" | Adopted (`skato_eval note-intent`) | #26, #12, #7, #8 |
 | Uncertainty-scaled transition time | NI literature | Shrinks A→B→A swings without delaying confident switches | Candidate | #7 |
 | Key detection: profile matching on a stable-note histogram; optional sidechain chroma | R§6, KEY §5.3 | Vocal-only needs ~20-30 s of singing | Candidate | #6, #5, #7 |
 
@@ -90,7 +90,7 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 |---|---|---|---|---|
 | Synthetic singing with exact ground truth, held-out scenarios | STATUS | Basis of the quality gates | Adopted | #26 |
 | vocadito real-singing evaluation | STATUS | 40 takes, two annotators | Adopted | #26, #7 |
-| Note-intent replay harness (cached detector, fixed DEV/TEST split, leave-one-singer-out) | NI | Reproduces the in-engine targets; lives in a scratch copy for now | Prototyped (move into `skato_eval`) | #7, #26, #12 |
+| Note-intent replay harness (cached detector, fixed DEV/TEST split, leave-one-singer-out) | NI | Reproduces the in-engine targets and every audited TEST number | Adopted (`skato_eval note-intent`; leave-one-singer-out selection and the detuned-singer benchmark not ported) | #7, #26, #12 |
 | Detuned-singer benchmark (real contours, controlled offsets) | NI proto A | Shows benefits invisible on vocadito's labels | Prototyped | #26, #7 |
 | Analysis-resynthesis to exact pitch curves; perceptual metrics; listening-test calibration | #26 plan | — | Candidate | #26, #12 |
 

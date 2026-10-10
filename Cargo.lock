@@ -2750,7 +2750,9 @@ dependencies = [
  "hound",
  "realfft",
  "rtrb",
+ "skato_control",
  "skato_core",
+ "skato_detect",
  "skato_engine",
 ]
 

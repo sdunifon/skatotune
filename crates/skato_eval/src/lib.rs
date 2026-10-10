@@ -15,11 +15,15 @@
 //!   matrix with the DESIGN §4 gates; [`rtbench`]: callback tail latencies.
 //! - [`vocadito`]: detector and correction evaluation on real singing (the
 //!   vocadito dataset) against its F0 and note annotations.
+//! - [`note_intent`]: the note-intent harness: replays cached detector
+//!   streams of vocadito through the control law with the Labs options off
+//!   and on, on a fixed DEV/TEST split, and scores the note decisions.
 //!
 //! The `skato_eval` binary (`src/main.rs`) exposes all of this on the command line.
 
 pub mod dsp;
 pub mod metrics;
+pub mod note_intent;
 pub mod reference;
 pub mod render;
 pub mod rng;

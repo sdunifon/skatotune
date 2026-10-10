@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 skato_core.workspace = true
 skato_engine.workspace = true
+# The note-intent harness replays the detector stream through the control law.
+skato_detect.workspace = true
+skato_control.workspace = true
 hound.workspace = true
 # Telemetry consumer type handed out by `Engine::take_telemetry`.
 rtrb.workspace = true

@@ -2,6 +2,7 @@
 //! `PitchEstimate` sequences in, `ControlOutput`s checked against R§7.6.
 
 mod midi;
+mod note_intent;
 mod notes;
 mod onsets;
 mod retune;

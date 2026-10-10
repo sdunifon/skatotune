@@ -175,6 +175,19 @@ pub enum MidiMode {
     Auto,
 }
 
+/// Where the note grid sits ([`Settings::reference`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub enum ReferenceMode {
+    /// 12-TET at A440, moved only by Detune and the MIDI bend.
+    #[default]
+    A440,
+    /// The singer's own tuning (Labs "Follow singer's tuning"): a gated
+    /// estimate of how far the singer sits from A440 moves the note grid, and
+    /// each note's target keeps the offset it started with. Scale targets
+    /// only; the output is off A440 by design.
+    FollowSinger,
+}
+
 /// Which input channel feeds the pitch analysis for stereo input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
 pub enum AnalysisChannel {
@@ -281,6 +294,16 @@ pub struct Settings {
     /// 0 = off.
     pub snap_max_st: f32,
 
+    // --- Note intent (Labs experiments, off by default) ----------------------
+    /// Learned note hold (HQ/Max tiers, scale targets): a gradient-boosted
+    /// model may hold the current note when the note decision proposes a
+    /// switch, a downward switch waits while the level falls (a phrase-end
+    /// release), and Studio reads a new note from the late part of its
+    /// lookahead. It never adds a switch. Eco and MIDI targets are unaffected.
+    pub note_hold: bool,
+    /// Where the note grid sits: A440, or the singer's own tuning.
+    pub reference: ReferenceMode,
+
     // --- Vibrato ------------------------------------------------------------
     /// Correct the vibrato-free centre of the note and keep the sung vibrato
     /// (DVA-style). Off = classic Auto-Tune behaviour.
@@ -333,6 +356,8 @@ impl Default for Settings {
             tolerance_ms: 0.0,
             snap_min_cents: 0.0,
             snap_max_st: 0.0,
+            note_hold: false,
+            reference: ReferenceMode::A440,
             preserve_vibrato: true,
             ignore_vibrato: true,
             vibrato_depth: 1.0,

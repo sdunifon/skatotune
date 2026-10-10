@@ -7234,3 +7234,29 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+Data used to train embedded models
+----------------------------------
+
+The binaries contain model weights trained on the datasets below, which
+are credited here as their licenses require.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+vocadito
+
+The Labs "Learned note hold" embeds two gradient-boosted tree ensembles
+(crates/skato_control/models/live_hq.skgb and studio_hq.skgb). They were
+trained on features that Skatotune's pitch detector and control law compute
+from the 28 vocadito takes of its 20 DEV singers, labelled with the dataset's
+two note annotations, together with synthetic singing. The model weights
+are derived from vocadito; no audio or annotation of it is included.
+
+Credit:
+  Rachel M. Bittner, Katherine Pasalo, Juan José Bosch, Gabriel Meseguer-Brocal
+  and David Rubinstein: "vocadito: A dataset of solo vocals with f0, note, and
+  lyric annotations", 2021 (arXiv:2110.05580); dataset version 3,
+  doi:10.5281/zenodo.5578807.
+
+License: Creative Commons Attribution 4.0 International (CC BY 4.0),
+https://creativecommons.org/licenses/by/4.0/
+Source: https://zenodo.org/records/5578807

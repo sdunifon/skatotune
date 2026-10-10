@@ -5,7 +5,7 @@
 use skato_core::{MidiMode, PitchFrame, Settings, ShiftControl, frame_flags};
 
 use super::front::Frame;
-use super::{Corrector, MEDIAN_CAP, STUDIO_ADVANCE_HOPS, STUDIO_ADVANCE_PERIODS};
+use super::{Corrector, MEDIAN_CAP, STUDIO_ADVANCE_HOPS, STUDIO_ADVANCE_PERIODS, STUDIO_LATE_ONSET};
 use crate::ControlOutput;
 use crate::note_hmm::P_SWITCH;
 use crate::rules::past_midpoint;
@@ -56,6 +56,9 @@ pub(super) struct BackState {
     was_pass: bool,
     /// The note has changed since the phrase onset (ends the ON-5 attack).
     pub(super) switched: bool,
+    /// Follow singer's tuning: the grid offset latched when the current note
+    /// started (its target keeps it for the whole note).
+    pub(super) r_tgt: f32,
 }
 
 impl BackState {
@@ -77,7 +80,8 @@ impl BackState {
 }
 
 /// Outcome of the note decision for one hop.
-enum Change {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Change {
     Keep,
     /// First note of a phrase (onset rules apply, no transition window).
     Onset(usize),
@@ -112,7 +116,14 @@ impl Corrector {
         if !self.be.s_core.is_finite() {
             self.be.s_core = 0.0;
         }
-        let offset = self.be.offset();
+        let base = self.be.offset();
+        // Follow singer's tuning: decisions on the singer's grid, and the
+        // target on it too, with the offset the note started with. Not for
+        // MIDI targets (the offset is 0 for them, and so is the target's).
+        let follow = self.d.follow;
+        let offset = if follow { base + f.r_dec } else { base };
+        let scale_t = self.targets.source() == TargetSource::Scale;
+        let t_off = if follow && scale_t { base + self.be.r_tgt } else { base };
         // A fresh onset also clears the note, in case a Studio lead change
         // skipped the frame that carried the forget.
         if f.forget || (f.onset && self.be.note.is_some()) {
@@ -138,7 +149,7 @@ impl Corrector {
             self.be.last_voiced = false;
             self.be.grace = 0;
             let s_total = self.compose(self.be.u * self.be.s_core);
-            let target = self.be.note.map(|n| 100.0 * n as f32 + offset);
+            let target = self.be.note.map(|n| 100.0 * n as f32 + t_off);
             let mut flags = 0;
             if self.be.trans {
                 flags |= frame_flags::TRANSITION;
@@ -163,11 +174,13 @@ impl Corrector {
             match self.decide(f, offset) {
                 Change::Keep => {}
                 Change::Onset(n) => {
+                    self.be.r_tgt = f.r_dec;
                     self.start_note(n, false);
                     snap = self.d.snap_onset;
                     self.be.switched = false;
                 }
                 Change::Switch(n) => {
+                    self.be.r_tgt = f.r_dec;
                     self.start_note(n, true);
                     self.be.switched = true;
                 }
@@ -181,7 +194,8 @@ impl Corrector {
 
         // G. Error.
         let note = if pass { None } else { self.be.note };
-        let target = note.map(|n| 100.0 * n as f32 + offset);
+        let t_off = if follow && scale_t { base + self.be.r_tgt } else { base };
+        let target = note.map(|n| 100.0 * n as f32 + t_off);
         let bypass = note.is_some_and(|n| self.targets.is_bypass(n) && !midi_t);
         // SN-3: in Studio the shift reaches the output a fraction of a hop
         // plus a fraction of a period after the boundary that applies it
@@ -190,7 +204,7 @@ impl Corrector {
         // lookahead already holds it. Decisions stay on this frame.
         let fp = self.pitch_frame(f);
         let e = match note {
-            Some(n) => self.error(&fp, n, offset, midi_t),
+            Some(n) => self.error(&fp, n, t_off, midi_t),
             None => 0.0,
         };
         // A non-finite error is dropped (no correction this hop) rather than
@@ -252,8 +266,40 @@ impl Corrector {
         self.finish(f, s_total, target, flags)
     }
 
-    /// F. Note decision for one voiced frame.
+    /// The Labs learned note hold applies to this hop: on, an HQ/Max tier,
+    /// and scale targets (MIDI targets are the singer's intent already).
+    fn note_hold(&self) -> bool {
+        self.d.note_hold && self.targets.source() == TargetSource::Scale
+    }
+
+    /// F. Note decision for one voiced frame: the control law's rule, then
+    /// (learned note hold) the learned veto on a proposed switch away from an
+    /// allowed held note. The veto can only turn a switch into a Keep.
     fn decide(&mut self, f: &Frame, offset: f32) -> Change {
+        let change = self.decide_rule(f, offset);
+        let out = match change {
+            Change::Switch(m) => match self.be.note {
+                Some(cur)
+                    if self.note_hold()
+                        && cur != m
+                        && self.targets.is_allowed(cur)
+                        && !self.intent.keeps_switch(self.lead_now(), cur, m, offset, &self.targets) =>
+                {
+                    Change::Keep
+                }
+                _ => change,
+            },
+            _ => change,
+        };
+        #[cfg(test)]
+        if let Some(log) = self.decisions.as_mut() {
+            log.push((change, out));
+        }
+        out
+    }
+
+    /// The control law's note decision (the rule the learned veto judges).
+    fn decide_rule(&mut self, f: &Frame, offset: f32) -> Change {
         let rel = f.p_dec - offset;
         let lead = self.lead_now();
         let hmm = self.d.hmm_on;
@@ -272,8 +318,16 @@ impl Corrector {
                 // absorb a scoop of more than ~75 c, so it would start on the
                 // scoop note.
                 self.be.onset_hold = self.d.studio_onset_hops.min(lead) as u32;
-                let m = self.lookahead_median(self.d.studio_onset_hops, offset).unwrap_or(rel);
-                self.targets.nearest(m)
+                let m = if self.note_hold() {
+                    // Learned note hold: the newest third of the visible
+                    // onset window (where a scoop has landed).
+                    let n = self.d.studio_onset_hops.min(lead);
+                    let k = ((n as f32) * STUDIO_LATE_ONSET).round().max(1.0) as usize;
+                    self.lookahead_median_from(k.min(lead), k.min(lead), offset)
+                } else {
+                    self.lookahead_median(self.d.studio_onset_hops, offset)
+                };
+                self.targets.nearest(m.unwrap_or(rel))
             } else if hmm {
                 self.hmm.argmax(rel).map(|(n, _)| n).or_else(|| self.targets.nearest(rel))
             } else {
@@ -351,10 +405,20 @@ impl Corrector {
             Some((m, pm))
                 if m != cur && (pm > P_SWITCH || self.hmm.prob(cur) < P_ABANDON) && self.or_gate(cur, m, raw, 0) =>
             {
-                Change::Switch(m)
+                if self.release_freeze(cur, m) { Change::Keep } else { Change::Switch(m) }
             }
             _ => Change::Keep,
         }
+    }
+
+    /// Labs learned note hold: a downward switch waits while the level falls
+    /// (`crate::release`). Counted when it holds a switch back.
+    fn release_freeze(&mut self, cur: usize, m: usize) -> bool {
+        let frozen = self.note_hold() && self.release.blocks(cur, m);
+        if frozen {
+            self.intent.stats.frozen += 1;
+        }
+        frozen
     }
 
     /// The frame whose pitch sets this hop's shift (SN-3): `f` itself in
@@ -414,7 +478,7 @@ impl Corrector {
         // midpoints within a note, and every such switch is a 100 c output
         // step (vocadito Studio HQ hard tune: warble episodes −31 %).
         let persists = ahead >= self.d.studio_persist_hops.min(age);
-        if persists && self.or_gate(cur, m, raw, ahead as u32) {
+        if persists && self.or_gate(cur, m, raw, ahead as u32) && !self.release_freeze(cur, m) {
             Change::Switch(m)
         } else {
             Change::Keep

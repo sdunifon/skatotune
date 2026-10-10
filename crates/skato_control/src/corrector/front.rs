@@ -4,6 +4,7 @@
 use skato_core::{LatencyMode, PitchEstimate, QualityTier, hz_to_cents};
 
 use super::{ATTACK_MOVE_C, Corrector, ONSET_HOPS, RESTART_JUMP_C};
+use crate::intent::features::HFrame;
 use crate::note_hmm::HmmObs;
 use crate::rules::past_midpoint;
 
@@ -45,6 +46,9 @@ pub(super) struct Frame {
     pub confidence: f32,
     pub period: f32,
     pub sibilant: bool,
+    /// Follow singer's tuning: offset of the singer's grid in force for this
+    /// frame's decisions, cents (0 while the option is off).
+    pub r_dec: f32,
 }
 
 /// Front-end state: voicing FSM, octave guard and pre-smoother.
@@ -156,6 +160,10 @@ impl Corrector {
             }
         }
         self.fe.voiced = voiced;
+        // Learned note hold: every hop's level for the release freeze (and,
+        // below, every hop's analysis for the switch veto's history).
+        self.release.push(est.level_db);
+        let level = if est.level_db.is_finite() { est.level_db } else { -120.0 };
 
         let mut f = Frame {
             voiced,
@@ -169,6 +177,11 @@ impl Corrector {
         };
 
         if !voiced {
+            self.intent.push(HFrame { forget, level, conf: f.confidence, ..HFrame::default() });
+            if self.d.follow {
+                self.rt.unvoiced();
+                f.r_dec = self.adaptive_offset();
+            }
             if self.d.hmm_on {
                 self.fe.near_run = 0;
                 self.hmm.step(&HmmObs { rel: 0.0, confidence: 0.0, voiced: false, near: false });
@@ -229,6 +242,30 @@ impl Corrector {
         f.w = w;
         f.vib_rate = vo.rate_hz;
         f.vib_extent = vo.extent;
+        self.intent.push(HFrame {
+            voiced: true,
+            onset,
+            forget: false,
+            p,
+            p_s,
+            p_c: f.p_c,
+            centre: vo.centre,
+            level,
+            conf: f.confidence,
+            w,
+            ext: vo.extent,
+            rate: vo.rate_hz,
+        });
+        // Follow singer's tuning: the vibrato-free centre is the evidence
+        // (an octave-guarded frame holds p, so it is none).
+        if self.d.follow {
+            if !f.guard {
+                let d = f.p_c - self.be.offset();
+                let dev = self.targets.nearest(d).map(|n| d - 100.0 * n as f32).filter(|x| x.abs() <= 50.0);
+                self.rt.voiced(d, dev, f.confidence, restart);
+            }
+            f.r_dec = self.adaptive_offset();
+        }
 
         // E. Decision pitch (+ note HMM evidence in HQ/Max).
         f.p_dec = if self.s.ignore_vibrato { f.p_c } else { p_s };
@@ -239,7 +276,7 @@ impl Corrector {
             // one-hop glitch over several hops and defeat the cap (measured: a
             // single +600 c hop flipped the note through p_s, not through p).
             let raw = if self.s.ignore_vibrato { f.ref_c } else { p };
-            let rel = raw - self.be.offset();
+            let rel = if self.d.follow { raw - self.be.offset() - f.r_dec } else { raw - self.be.offset() };
             // Near-band persistence (CL-2): the pitch has stayed past the
             // current note's cents band (x > T_c toward the nearest other
             // candidate) for NEAR_PERSIST_MS. No note yet: no hysteresis.

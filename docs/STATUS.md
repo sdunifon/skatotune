@@ -38,10 +38,12 @@ State of the tree on 2026-10-09, after the hardening pass (onsets, sustained not
   - Voice-range changes that keep the latency are applied at runtime (`Engine::set_voice_range`).
   - Telemetry for the GUI.
 - **GUI** (egui): scrolling piano-roll pitch graph, cents meter, scale keyboard (with MIDI Learn, CLEAR and KEEP), knobs, mode/tier selectors, CPU readout and a latency readout ("X ms reported" plus "heard avg").
+- **Labs** (opt-in, saved with the project): correction coloring (ribbon, heat line, five themes), and two options that change the sound, off by default (`docs/research/note-intent.md`): **Learned note hold** (HQ/Max, scale targets: a learned switch veto, a release freeze and, in Studio, the onset note from the late lookahead; Live HQ hard chromatic on the TEST singers: warble 50.0 → 24.0 per minute, stable p95 25.6 → 20.2 c, frame accuracy 70.5 → 73.8 %, per-note accuracy 79.7 → 76.5 %) and **Follow singer's tuning**. The sound options reach the audio thread through a lock-free saved copy, so they apply with the editor closed and after a reload.
 - **Evaluation** (`skato_eval`):
   - Synthetic singing with exact ground truth, two held-out scenarios, and real singing (vocadito).
   - Gates as tests (`tests/quality_gates.rs`).
-  - CLI: `suite`, `vocadito`, `latency`, `rt-bench`, `render`, `synth`, `track`.
+  - CLI: `suite`, `vocadito`, `note-intent`, `latency`, `rt-bench`, `render`, `synth`, `track`.
+  - Note-intent harness (`note-intent`): cached detector streams of vocadito replayed through the control law on a fixed DEV/TEST split, scored against both annotators, with the frontier yardstick; `note-intent synth` for the synthetic scenarios; the learned veto's training pipeline (`dump`, `dump-synth`, `convert-model`, `tools/note_intent/train_veto.py`).
 - **Distribution:** ISC `LICENSE` at the repo root; every bundle carries `THIRD-PARTY-NOTICES.txt` and `LICENSE.txt` (`cargo xtask notices`).
 
 ## 2. Latency: what we average
@@ -247,6 +249,8 @@ cargo test -p skato_eval --release --test quality_gates -- --nocapture       # 1
 cargo test -p skato_eval --release --test vocadito -- --ignored --nocapture  # real-singing gates, ≈ 25 s
 cargo run --release -p skato_eval -- suite --out out                          # synthetic suite, 252 renders, ≈ 20 s → out/report.md
 cargo run --release -p skato_eval -- vocadito                                 # real singing, ≈ 3.2 min → out/vocadito/report.md
+cargo run --release -p skato_eval -- note-intent                              # note decisions on TEST, Labs options off vs on, ≈ 15 s → out/note-intent/report.md
+cargo run --release -p skato_eval -- note-intent synth                        # synthetic scenarios, Labs options off vs on → out/note-intent/synth.md
 cargo run --release -p skato_eval -- latency                                  # measured vs reported D + content-delay gauge
 cargo run --release -p skato_eval -- rt-bench --seconds 5                     # CPU tail latency (run on a quiet machine)
 

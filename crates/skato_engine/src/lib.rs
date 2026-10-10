@@ -664,6 +664,13 @@ impl Engine {
         self.corrector.learned_states()
     }
 
+    /// What the Labs learned note hold did since the last reset (forwarded
+    /// from the corrector): switches the model judged and held back, and
+    /// release freezes.
+    pub fn note_hold_stats(&self) -> skato_control::NoteHoldStats {
+        self.corrector.note_hold_stats()
+    }
+
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------

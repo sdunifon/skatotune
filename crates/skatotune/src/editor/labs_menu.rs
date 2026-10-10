@@ -570,6 +570,7 @@ mod tests {
             correction_ribbon: false,
             heat_line: false,
             correction_theme: CorrectionTheme::Inferno,
+            ..LabsSettings::DEFAULT
         });
         let (texts, _) = draw_menu(&ctx, &params);
         assert!(texts.iter().any(|t| t == THEME_IDLE_NOTE), "{texts:?}");

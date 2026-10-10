@@ -10,22 +10,34 @@
 //! lead the audio (see [`CorrectorConfig::lookahead_hops`]), the back end
 //! runs `lead` frames behind the front end, so fixed-lag decisions (Viterbi
 //! backtrace, lookahead medians, onset notes) can use the frames in between.
+//!
+//! The Labs options hook in at three places: the front end records every hop
+//! for the learned veto and the release freeze and feeds the singer tuning
+//! tracker; the HQ/Max decisions consult the release freeze; and `decide`
+//! hands every proposed switch away from a held note to the learned veto.
 
 mod back;
 mod front;
 
-use skato_core::{EngineKind, LatencyMode, MidiEvent, MidiMode, NoteState, PitchEstimate, QualityTier, Settings, SynthVibrato};
+use skato_core::{
+    EngineKind, LatencyMode, MidiEvent, MidiMode, NoteState, PitchEstimate, QualityTier, ReferenceMode, Settings, SynthVibrato,
+};
 
 use crate::clock::{HopClock, finite_or, sane};
+use crate::intent::{NoteHoldStats, NoteIntent};
 use crate::lfo::SynthLfo;
 use crate::midi::MidiState;
 use crate::note_hmm::{MAX_JUMP_HQ, MAX_JUMP_MAX, MAX_LAG, NoteHmm};
+use crate::reftrack::RefTracker;
+use crate::release::{self, ReleaseFreeze};
 use crate::rules::RuleDecider;
-use crate::targets::TargetSet;
+use crate::targets::{TargetSet, TargetSource};
 use crate::vibrato::VibratoTracker;
 use crate::{ControlOutput, CorrectorConfig};
 
 use back::BackState;
+#[cfg(test)]
+pub(crate) use back::Change;
 use front::{Frame, FrontState};
 
 // Timing constants of R§7.6.2 / R§7.6.4, in ms unless noted. Converted to
@@ -111,6 +123,11 @@ const STUDIO_ADVANCE_PERIODS: f32 = 0.25;
 const STUDIO_PERSIST_MS: f32 = 30.0;
 /// Most voiced frames a lookahead median looks at.
 const MEDIAN_CAP: usize = 64;
+/// Learned note hold, Studio: the onset note is read from the newest third of
+/// the visible onset window instead of all of it (where a scoop has landed;
+/// note-intent prototypes B and C found this independently: onset glitches
+/// on vocadito DEV 1.1 → 0.5 %, not confirmed on TEST).
+const STUDIO_LATE_ONSET: f32 = 0.33;
 /// Snap Min values below this (cents) are treated as 0 (off). Nothing audible
 /// changes below a few hundredths of a cent, and an exponentially decaying
 /// automation or modulation tail would otherwise hand the dead zone values
@@ -157,6 +174,10 @@ struct Derived {
     /// The PSOLA engine renders the output (it fades in from the dry
     /// signal itself at a voiced onset, ON-9).
     natural: bool,
+    /// Labs learned note hold in effect (on, and an HQ/Max tier).
+    note_hold: bool,
+    /// Labs follow singer's tuning.
+    follow: bool,
 }
 
 fn derive(clock: &HopClock, s: &Settings, mode: LatencyMode) -> Derived {
@@ -199,6 +220,8 @@ fn derive(clock: &HopClock, s: &Settings, mode: LatencyMode) -> Derived {
         attack_hops: clock.whole_hops(ATTACK_MS, 0),
         studio_persist_hops: clock.whole_hops(STUDIO_PERSIST_MS, 0) as usize,
         natural: s.engine == EngineKind::Natural && mode != LatencyMode::LiveMin,
+        note_hold: s.note_hold && s.tier != QualityTier::Eco,
+        follow: s.reference == ReferenceMode::FollowSinger,
     }
 }
 
@@ -271,6 +294,16 @@ pub struct Corrector {
     pc_head: usize,
     pc_len: usize,
     scratch: [f32; MEDIAN_CAP],
+    /// Learned note hold: the switch veto (history, features, model) and the
+    /// release freeze's level ring. Both record every hop, so switching the
+    /// option on mid-phrase finds the context in place.
+    intent: NoteIntent,
+    release: ReleaseFreeze,
+    /// Follow singer's tuning (idle while the option is off).
+    rt: RefTracker,
+    /// Tests: every voiced hop's (rule decision, final decision), when on.
+    #[cfg(test)]
+    pub(crate) decisions: Option<Vec<(Change, Change)>>,
 }
 
 impl Corrector {
@@ -307,6 +340,11 @@ impl Corrector {
             pc_head: 0,
             pc_len: 0,
             scratch: [0.0; MEDIAN_CAP],
+            intent: NoteIntent::new(clock.hop_ms, cfg.latency_mode),
+            release: ReleaseFreeze::new(clock.whole_hops(release::WINDOW_MS, 1)),
+            rt: RefTracker::new(clock.hop_s),
+            #[cfg(test)]
+            decisions: None,
         };
         c.be.prime(&c.s);
         c.rebuild_targets();
@@ -329,6 +367,9 @@ impl Corrector {
         self.lead = 0;
         self.pc_head = 0;
         self.pc_len = 0;
+        self.intent.reset();
+        self.release.reset();
+        self.rt.reset();
         self.targets_dirty = true;
         self.rebuild_targets();
     }
@@ -350,6 +391,12 @@ impl Corrector {
             self.targets_dirty = true;
         }
         self.hmm.set_params(s.tolerance_cents, s.tolerance_ms, self.d.max_jump);
+        if s.reference != old.reference {
+            // Follow singer's tuning starts (or stops) from A440; a note that
+            // is already sounding keeps the A440 grid until the next one.
+            self.rt.reset();
+            self.be.r_tgt = 0.0;
+        }
         if s.tier != old.tier {
             self.vib.set_kalman(self.d.hmm_on);
             if self.d.hmm_on && old.tier == QualityTier::Eco {
@@ -414,6 +461,43 @@ impl Corrector {
     /// Effective scale after MIDI Learn edits (for the GUI keyboard), one state per pitch class.
     pub fn learned_states(&self) -> Option<[NoteState; 12]> {
         if self.s.midi_mode == MidiMode::Learn { self.midi.learned_states() } else { None }
+    }
+
+    /// What the learned note hold did since the last reset: switches the
+    /// model judged, switches it held back, and downward switches the
+    /// release freeze held back (diagnostics and evaluation).
+    pub fn note_hold_stats(&self) -> NoteHoldStats {
+        self.intent.stats
+    }
+
+    /// Offline tools (the learned veto's training data): the veto's features
+    /// of the frame decided by the latest `process_hop`, as
+    /// (decided pitch r in cents, the 58 features, lookahead hops used,
+    /// segment age in hops or `u32::MAX`). None when that frame is unvoiced.
+    /// Costs what a veto does; not for the audio thread.
+    #[doc(hidden)]
+    pub fn note_hold_features(&mut self) -> Option<(f32, [f32; crate::intent::FEATURES], usize, u32)> {
+        let age = self.lead_now();
+        self.intent.features_at(age)
+    }
+
+    /// Offset of the singer's tuning from A440 that follow singer's tuning
+    /// applies to new decisions, cents (0 while the option is off or the
+    /// targets are not a scale).
+    pub fn singer_offset(&self) -> f32 {
+        self.adaptive_offset()
+    }
+
+    /// Decision offset of the singer tuning tracker for this hop (0 unless
+    /// the option is on and the targets come from a scale).
+    fn adaptive_offset(&self) -> f32 {
+        if self.d.follow && self.targets.source() == TargetSource::Scale { self.rt.offset() } else { 0.0 }
+    }
+
+    /// Tests: run as if the embedded model were missing or corrupt.
+    #[cfg(test)]
+    pub(crate) fn drop_model_for_test(&mut self) {
+        self.intent = NoteIntent::without_model(self.clock.hop_ms);
     }
 
     /// MIDI notes currently decide the targets (Target, or Auto with notes held).

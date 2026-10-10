@@ -1,10 +1,18 @@
-//! Labs: opt-in editor experiments, switched in the header's LABS menu.
+//! Labs: opt-in experiments, switched in the header's LABS menu.
 //!
-//! An experiment is a GUI-only idea we want to try on real sessions before it
-//! earns a permanent place in the main UI. The switches are saved with the
-//! project (the `labs` persistent field of
-//! [`SkatotuneParams`](crate::params::SkatotuneParams)), never automated, and
-//! never read on the audio thread.
+//! An experiment is an idea we want to try on real sessions before it earns
+//! a permanent place in the main UI. The switches are saved with the project
+//! (the `labs` persistent field of
+//! [`SkatotuneParams`](crate::params::SkatotuneParams)) and never automated.
+//!
+//! Most experiments only change the editor and are never read on the audio
+//! thread. Two change the sound: [`LabsSettings::learned_note_hold`] and
+//! [`LabsSettings::follow_singer`] (`docs/research/note-intent.md`). Their
+//! bits ([`LabsSettings::sound_bits`]) are mirrored into a lock-free
+//! persisted value (`labs-sound` in the saved state, like the learned scale),
+//! which the audio thread reads every block ([`apply_sound`]); so they apply
+//! with the editor closed and right after a project is loaded, and the mirror
+//! is what the menu shows for them.
 //!
 //! # Adding an experiment
 //!
@@ -12,7 +20,9 @@
 //!    [`LabsSettings::DEFAULT`]).
 //! 2. Add a row to [`EXPERIMENTS`]: name, one-line description, and the
 //!    accessor pair for the new field.
-//! 3. Read the flag where the editor draws the feature.
+//! 3. Read the flag where the editor draws the feature. A flag the audio
+//!    thread needs gets a bit in [`LabsSettings::sound_bits`] and is applied
+//!    in [`apply_sound`] instead (never lock on the audio thread).
 //!
 //! # Adding a choice
 //!
@@ -45,6 +55,7 @@
 //! new field a new name instead.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use skato_core::{ReferenceMode, Settings};
 
 /// Colours of the correction-strength displays: the ribbon, the heat line and
 /// the key in the graph legend ([`LabsSettings::correction_theme`]). Which
@@ -162,6 +173,15 @@ pub struct LabsSettings {
     /// Colours of the two experiments above and of the legend's key.
     #[serde(deserialize_with = "lenient_theme")]
     pub correction_theme: CorrectionTheme,
+    /// Sound: learned note hold ([`skato_core::Settings::note_hold`]). In the
+    /// HQ and Max tiers, holds the current note when a switch looks like
+    /// wobble or a phrase-end droop (fewer note flips, at the cost of some
+    /// short notes); Eco and MIDI targets are unaffected.
+    pub learned_note_hold: bool,
+    /// Sound: follow singer's tuning ([`skato_core::ReferenceMode::FollowSinger`]).
+    /// Corrects to the singer's own reference instead of A440, for
+    /// consistently detuned material; the output is off A440 by design.
+    pub follow_singer: bool,
 }
 
 impl LabsSettings {
@@ -171,6 +191,8 @@ impl LabsSettings {
         correction_ribbon: true,
         heat_line: false,
         correction_theme: CorrectionTheme::Teal,
+        learned_note_hold: false,
+        follow_singer: false,
     };
 }
 
@@ -180,12 +202,43 @@ impl Default for LabsSettings {
     }
 }
 
+/// Bits of [`LabsSettings::sound_bits`]. Never reuse a retired bit.
+const SOUND_NOTE_HOLD: u32 = 1 << 0;
+const SOUND_FOLLOW_SINGER: u32 = 1 << 1;
+
 impl LabsSettings {
     /// Any experiment that colours the graph by correction strength is on
     /// (the graph legend then shows the colour key).
     pub fn shows_correction_colour(&self) -> bool {
         self.correction_ribbon || self.heat_line
     }
+
+    /// The experiments that change the sound, as the bits the audio thread
+    /// reads (see the module docs).
+    pub const fn sound_bits(&self) -> u32 {
+        (if self.learned_note_hold { SOUND_NOTE_HOLD } else { 0 })
+            | (if self.follow_singer { SOUND_FOLLOW_SINGER } else { 0 })
+    }
+
+    /// These settings with the sound experiments taken from `bits`.
+    pub const fn with_sound_bits(self, bits: u32) -> Self {
+        Self {
+            learned_note_hold: bits & SOUND_NOTE_HOLD != 0,
+            follow_singer: bits & SOUND_FOLLOW_SINGER != 0,
+            ..self
+        }
+    }
+}
+
+/// Apply the sound experiments of `bits` ([`LabsSettings::sound_bits`]) to
+/// the engine settings. Audio thread: pure, allocation-free.
+pub fn apply_sound(settings: &mut Settings, bits: u32) {
+    settings.note_hold = bits & SOUND_NOTE_HOLD != 0;
+    settings.reference = if bits & SOUND_FOLLOW_SINGER != 0 {
+        ReferenceMode::FollowSinger
+    } else {
+        ReferenceMode::A440
+    };
 }
 
 /// One row of the LABS menu.
@@ -199,7 +252,7 @@ pub struct Experiment {
 }
 
 /// Every experiment, in menu order.
-pub const EXPERIMENTS: [Experiment; 2] = [
+pub const EXPERIMENTS: [Experiment; 4] = [
     Experiment {
         name: "Correction ribbon",
         description: "Shades the correction under the output; brighter = more.",
@@ -211,6 +264,18 @@ pub const EXPERIMENTS: [Experiment; 2] = [
         description: "Colours the output trace by correction strength.",
         get: |l| l.heat_line,
         set: |l, on| l.heat_line = on,
+    },
+    Experiment {
+        name: "Learned note hold",
+        description: "Holds notes through wobble and phrase-end droops.",
+        get: |l| l.learned_note_hold,
+        set: |l, on| l.learned_note_hold = on,
+    },
+    Experiment {
+        name: "Follow singer's tuning",
+        description: "Corrects to the singer's own tuning, not A440.",
+        get: |l| l.follow_singer,
+        set: |l, on| l.follow_singer = on,
     },
 ];
 
@@ -272,6 +337,7 @@ mod tests {
                 correction_ribbon: false,
                 heat_line: true,
                 correction_theme: theme,
+                ..LabsSettings::DEFAULT
             };
             let json = serialize_field(&s).unwrap();
             assert!(
@@ -315,6 +381,7 @@ mod tests {
                 correction_ribbon: false,
                 heat_line: true,
                 correction_theme: CorrectionTheme::Teal,
+                ..LabsSettings::DEFAULT
             }
         );
     }
@@ -345,6 +412,7 @@ mod tests {
                     correction_ribbon: false,
                     heat_line: true,
                     correction_theme: CorrectionTheme::Teal,
+                    ..LabsSettings::DEFAULT
                 },
                 "{stored}"
             );
@@ -386,6 +454,65 @@ mod tests {
         let note = CorrectionTheme::GreenRed.note().to_lowercase();
         assert!(note.contains("red-green colour-blind"), "{note}");
         assert!(note.contains("ends apart"), "{note}");
+    }
+
+    /// The sound experiments are off by default, round-trip through their
+    /// bits, and set exactly their engine setting.
+    #[test]
+    fn sound_experiments_map_to_their_engine_settings() {
+        let d = LabsSettings::default();
+        assert!(!d.learned_note_hold && !d.follow_singer);
+        assert_eq!(d.sound_bits(), 0);
+        let mut s = Settings::default();
+        apply_sound(&mut s, d.sound_bits());
+        assert_eq!(s, Settings::default(), "off is the engine default");
+        for (hold, follow) in [(true, false), (false, true), (true, true)] {
+            let l = LabsSettings {
+                learned_note_hold: hold,
+                follow_singer: follow,
+                ..LabsSettings::DEFAULT
+            };
+            assert_eq!(LabsSettings::DEFAULT.with_sound_bits(l.sound_bits()), l);
+            let mut s = Settings::default();
+            apply_sound(&mut s, l.sound_bits());
+            assert_eq!(s.note_hold, hold);
+            assert_eq!(s.reference == ReferenceMode::FollowSinger, follow);
+            assert_eq!(
+                Settings {
+                    note_hold: false,
+                    reference: ReferenceMode::A440,
+                    ..s
+                },
+                Settings::default(),
+                "nothing else changes"
+            );
+        }
+        // The editor experiments have no sound bits.
+        let gui = LabsSettings {
+            correction_ribbon: true,
+            heat_line: true,
+            correction_theme: CorrectionTheme::Inferno,
+            ..LabsSettings::DEFAULT
+        };
+        assert_eq!(gui.sound_bits(), 0);
+        // Unknown bits (a newer version's) are ignored.
+        assert_eq!(LabsSettings::DEFAULT.with_sound_bits(!0).sound_bits(), 3);
+    }
+
+    /// A project saved before the sound experiments existed loads with them
+    /// off; one saved with them keeps them.
+    #[test]
+    fn sound_experiments_round_trip_and_default_off() {
+        let old: LabsSettings =
+            deserialize_field(r#"{"correction_ribbon":false,"heat_line":true}"#).unwrap();
+        assert!(!old.learned_note_hold && !old.follow_singer);
+        let s = LabsSettings {
+            learned_note_hold: true,
+            follow_singer: true,
+            ..LabsSettings::DEFAULT
+        };
+        let back: LabsSettings = deserialize_field(&serialize_field(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

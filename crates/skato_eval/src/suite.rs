@@ -139,10 +139,24 @@ pub fn evaluate(
     retune_ms: f32,
     blocks: &BlockPattern,
 ) -> (RunResult, Rendered) {
+    let settings = run_settings(scn, mode, tier, retune_ms);
+    evaluate_with(scn, in_track, mode, blocks, settings)
+}
+
+/// [`evaluate`] with explicit settings (e.g. the suite's with a Labs option
+/// on); the tier and retune come from `settings`.
+pub fn evaluate_with(
+    scn: &Scenario,
+    in_track: Option<&PitchTrack>,
+    mode: LatencyMode,
+    blocks: &BlockPattern,
+    settings: Settings,
+) -> (RunResult, Rendered) {
+    let (tier, retune_ms) = (settings.tier, settings.retune_ms);
     let sig = &scn.signal;
     let opts = RenderOptions {
         config: engine_config(sig.sample_rate, mode, scn.voice_range),
-        settings: run_settings(scn, mode, tier, retune_ms),
+        settings,
         blocks: blocks.clone(),
         telemetry: true,
         midi: Vec::new(),

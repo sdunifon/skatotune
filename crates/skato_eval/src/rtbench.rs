@@ -9,7 +9,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use skato_core::{EngineConfig, EngineKind, LatencyMode, QualityTier, Settings, VoiceRange};
+use skato_core::{EngineConfig, EngineKind, LatencyMode, QualityTier, ReferenceMode, Settings, VoiceRange};
 use skato_engine::Engine;
 
 use crate::render::default_engine;
@@ -25,6 +25,14 @@ pub struct RtBenchOptions {
     pub modes: Vec<LatencyMode>,
     pub tiers: Vec<QualityTier>,
     pub channels: usize,
+    /// Labs learned note hold on (the switch veto runs on proposal hops).
+    pub note_hold: bool,
+    /// Labs follow singer's tuning on.
+    pub follow_singer: bool,
+    /// Material to process instead of the synthetic male melody (mono, at
+    /// `sample_rate`), e.g. a real recording: real singing makes the note
+    /// decision propose many more switches for the learned veto to judge.
+    pub material: Option<Vec<f32>>,
 }
 
 impl Default for RtBenchOptions {
@@ -36,6 +44,9 @@ impl Default for RtBenchOptions {
             modes: MODES.to_vec(),
             tiers: TIERS.to_vec(),
             channels: 2,
+            note_hold: false,
+            follow_singer: false,
+            material: None,
         }
     }
 }
@@ -59,6 +70,9 @@ pub struct RtBenchRow {
     pub max_us: f64,
     /// Buffer period, µs.
     pub period_us: f64,
+    /// Switches the learned veto judged during the timed blocks (0 with the
+    /// option off).
+    pub veto_runs: u64,
 }
 
 impl RtBenchRow {
@@ -87,10 +101,14 @@ impl RtBenchRow {
 /// Run every configuration. `progress` is called after each one.
 pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<RtBenchRow> {
     let sr = opts.sample_rate;
-    // Realistic material: the male melody (voiced/unvoiced changes, consonants).
-    let material = scenarios::build("melody_male", sr)
-        .map(|s| s.signal.audio)
-        .unwrap_or_else(|| vec![0.0; sr as usize]);
+    // Realistic material: the male melody (voiced/unvoiced changes,
+    // consonants), unless the caller brought its own.
+    let material = match &opts.material {
+        Some(m) if !m.is_empty() => m.clone(),
+        _ => scenarios::build("melody_male", sr)
+            .map(|s| s.signal.audio)
+            .unwrap_or_else(|| vec![0.0; sr as usize]),
+    };
     let warmup = (0.5 * sr as f64) as usize;
     let timed = (opts.seconds * sr as f64) as usize;
     let mut rows = Vec::new();
@@ -110,6 +128,8 @@ pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<
                     tier,
                     engine: default_engine(mode),
                     retune_ms: 10.0,
+                    note_hold: opts.note_hold,
+                    reference: if opts.follow_singer { ReferenceMode::FollowSinger } else { ReferenceMode::A440 },
                     ..scenarios::settings_for(0, skato_core::ScaleKind::Major)
                 };
                 let mut engine = Engine::new(cfg);
@@ -119,7 +139,11 @@ pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<
                 let mut times: Vec<u64> = Vec::with_capacity(timed / buffer + 1);
                 let mut pos = 0usize;
                 let mut done = 0usize;
+                let mut veto_start = None;
                 while done < warmup + timed {
+                    if done >= warmup && veto_start.is_none() {
+                        veto_start = Some(engine.note_hold_stats().proposals);
+                    }
                     for b in io.iter_mut() {
                         for (i, v) in b.iter_mut().enumerate() {
                             *v = material
@@ -157,6 +181,7 @@ pub fn run(opts: &RtBenchOptions, progress: &mut dyn FnMut(&RtBenchRow)) -> Vec<
                     p999_us: pct(99.9),
                     max_us: times.last().map_or(0.0, |t| *t as f64 / 1000.0),
                     period_us: buffer as f64 / sr as f64 * 1e6,
+                    veto_runs: engine.note_hold_stats().proposals.saturating_sub(veto_start.unwrap_or(0)),
                 };
                 progress(&row);
                 rows.push(row);

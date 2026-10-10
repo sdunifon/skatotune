@@ -1,0 +1,43 @@
+# Note-intent harness split (created once; never edit).
+# DEV iff fnv1a64("noteintent-v1:" + singer_id) % 100 < 70
+# file singer split
+1 S1 dev
+2 S2 dev
+3 S1 dev
+4 S3 dev
+5 S4 dev
+6 S5 dev
+7 S6 test
+8 S1 dev
+9 S6 test
+10 S7 test
+11 S8 test
+12 S9 test
+13 S10 test
+14 S11 test
+15 S12 dev
+16 S6 test
+17 S12 dev
+18 S13 dev
+19 S14 dev
+20 S15 dev
+21 S16 dev
+22 S17 dev
+23 S18 dev
+24 S19 test
+25 S20 dev
+26 S21 dev
+27 S22 dev
+28 S21 dev
+29 S23 dev
+30 S24 test
+31 S23 dev
+32 S25 test
+33 S26 dev
+34 S27 dev
+35 S28 dev
+36 S28 dev
+37 S29 dev
+38 S29 dev
+39 S29 dev
+40 S9 test

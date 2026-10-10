@@ -389,6 +389,9 @@ impl Skatotune {
         let learned_word = self.params.learned_scale.load(Ordering::Relaxed);
         let mut settings = values.to_settings();
         learn::apply(&mut settings, values.midi_mode, learned_word);
+        // Labs experiments that change the sound, from their lock-free
+        // mirror (applies with the editor closed and after a reload).
+        labs::apply_sound(&mut settings, self.params.labs_sound_bits());
         engine.set_settings(&settings);
         engine.set_telemetry_enabled(editor_open);
 
@@ -872,6 +875,7 @@ nice_export_vst3!(Skatotune);
 mod tests {
     use super::*;
     use nice_plug::midi::{Channel, Key, VoiceID};
+    use labs::LabsSettings;
     use params::{LatencyModeChoice, VoiceRangeChoice};
     use skato_core::EngineConfig;
 
@@ -1464,6 +1468,71 @@ mod tests {
         assert!(plain.contains_key("learned-scale"), "{plain:?}");
         p.params.deserialize_fields(&plain);
         assert_eq!(p.params.learned_states(), None);
+    }
+
+    /// Sing `notes` (Hz) for 0.4 s each, with 60 ms of silence between them
+    /// when `gaps`, and return the last note's output and its frequency.
+    fn sing_notes(p: &mut Skatotune, v: &ParamValues, notes: &[f32], gaps: bool) -> (Vec<f32>, f32) {
+        let mut host = FakeHost::default();
+        let mut t0 = 0;
+        let mut last = Vec::new();
+        for &hz in notes {
+            last = render(p, v, &mut host, hz, 0.4, 512, &mut t0);
+            if gaps {
+                for _ in 0..6 {
+                    run_signal(p, v, &mut host, &[0.0; 480]);
+                }
+            }
+        }
+        (last, notes.last().copied().unwrap_or(0.0))
+    }
+
+    /// The Labs experiments that change the sound reach the engine through
+    /// their lock-free mirror, with the editor closed, and come back with a
+    /// saved project: a singer 30 c sharp is corrected down to A440 by
+    /// default and left on their own tuning with Follow singer's tuning.
+    #[test]
+    fn labs_sound_experiments_apply_with_the_editor_closed_and_after_a_reload() {
+        let sharp = 2f32.powf(30.0 / 1200.0);
+        let line: Vec<f32> = [220.0f32, 246.94, 261.63, 293.66, 329.63, 293.66, 261.63, 246.94]
+            .iter()
+            .cycle()
+            .take(24)
+            .map(|hz| hz * sharp)
+            .collect();
+        let v = ParamValues::default();
+        let offset = |p: &mut Skatotune| {
+            p.activate_with(&v, 48_000.0, 512, 2);
+            assert!(!p.editor_state.is_open());
+            let (y, hz) = sing_notes(p, &v, &line, true);
+            cents(tail_pitch(&y), hz / sharp)
+        };
+        let mut plain = Skatotune::default();
+        let a440 = offset(&mut plain);
+        assert!(a440.abs() < 5.0, "A440: corrected to the grid, {a440:+.1} c");
+
+        let mut follow = Skatotune::default();
+        follow.params.set_labs(LabsSettings { follow_singer: true, ..LabsSettings::DEFAULT });
+        let own = offset(&mut follow);
+        assert!((own - 30.0).abs() < 5.0, "follow: left on the singer's tuning, {own:+.1} c");
+
+        // A project saved with it loads with it, before any editor opens.
+        let saved = follow.params.serialize_fields();
+        let mut reloaded = Skatotune::default();
+        reloaded.params.deserialize_fields(&saved);
+        assert!(reloaded.params.labs().follow_singer);
+        let again = offset(&mut reloaded);
+        assert!((again - 30.0).abs() < 5.0, "after a reload: {again:+.1} c");
+
+        // Learned note hold reaches the engine too: legato notes make the note
+        // decision propose switches, and the model judges them.
+        let mut hold = Skatotune::default();
+        hold.params.set_labs(LabsSettings { learned_note_hold: true, ..LabsSettings::DEFAULT });
+        hold.activate_with(&v, 48_000.0, 512, 2);
+        sing_notes(&mut hold, &v, &line, false);
+        let judged = hold.engine.as_ref().map_or(0, |e| e.note_hold_stats().proposals);
+        assert!(judged > 0, "the learned veto ran");
+        assert_eq!(plain.engine.as_ref().map(|e| e.note_hold_stats().proposals), Some(0));
     }
 
     /// HI-4: the learned scale is part of the saved plugin state.

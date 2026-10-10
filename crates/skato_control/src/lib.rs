@@ -16,7 +16,7 @@
 //! | C | 4 ms pre-smoothing of the analysis pitch | front end |
 //! | D | centre/vibrato split (extrema tracker; + AR(2) Kalman in HQ/Max) | `vibrato` |
 //! | E | decision pitch and candidate notes (scale On/Bypass, MIDI held notes) | `targets` |
-//! | F | note decision: rules (Eco), MonoNote-style HMM gated by the OR-tolerance (HQ/Max; no near-band persistence in a scoop into the first note, ON-5), fixed-lag in Studio (switches only on crossings that persist through the lookahead) | `rules`, `note_hmm` |
+//! | F | note decision: rules (Eco), MonoNote-style HMM gated by the OR-tolerance (HQ/Max; no near-band persistence in a scoop into the first note, ON-5), fixed-lag in Studio (switches only on crossings that persist through the lookahead); Labs: learned switch veto and release freeze (HQ/Max), the singer's tuning as the grid | `rules`, `note_hmm`, `intent`, `release`, `reftrack` |
 //! | G | error: Amount, Snap Min/Max, Flex-Tune, Bypass, clamp | `shape` |
 //! | H/I | retune one-pole on the correction, transition τ, Humanize | back end |
 //! | J/K | vibrato depth scaling, synthetic vibrato | back end, `lfo` |
@@ -26,15 +26,26 @@
 //! constant is converted to hops from the actual sample rate and hop and
 //! re-derived whenever the settings change; `α(τ) = 1 − exp(−Δ/τ)`.
 //!
+//! Two Labs options change the note decision, both off by default
+//! (`docs/research/note-intent.md`): **learned note hold**
+//! ([`Settings::note_hold`]: a learned switch veto, [`intent`], plus a
+//! release freeze, `release`, and in Studio a note onset read from the late
+//! part of the lookahead) and **follow singer's tuning**
+//! ([`Settings::reference`], `reftrack`). With both off the control law is
+//! bit-identical to the one before they existed.
+//!
 //! Realtime: everything is allocated in [`Corrector::new`]; `set_settings`,
 //! `midi` and `process_hop` never allocate, lock, log or panic, and every loop
 //! is bounded (at most 128 notes × the jump band, or the lookahead length).
 
 mod clock;
 mod corrector;
+pub mod intent;
 mod lfo;
 mod midi;
 mod note_hmm;
+mod reftrack;
+mod release;
 mod rules;
 mod shape;
 mod targets;
@@ -44,7 +55,8 @@ mod vibrato;
 mod tests;
 
 pub use corrector::Corrector;
-pub use skato_core::{LatencyMode, MidiEvent, PitchEstimate, PitchFrame, Settings, ShiftControl};
+pub use intent::NoteHoldStats;
+pub use skato_core::{LatencyMode, MidiEvent, PitchEstimate, PitchFrame, ReferenceMode, Settings, ShiftControl};
 
 /// Static configuration of a [`Corrector`].
 #[derive(Clone, Copy, Debug, PartialEq)]

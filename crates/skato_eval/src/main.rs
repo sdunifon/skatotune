@@ -9,8 +9,15 @@
 //! skato_eval suite [--out out/] [--sr 48000] [--scenario a,b] [--modes ..] [--tiers ..] [--wavs hq] [--quick]
 //! skato_eval latency [--sr 44100,48000,96000] [--no-content]
 //! skato_eval rt-bench [--sr 48000] [--seconds 10] [--buffers 32,64,128,256,512] [--modes ..] [--tiers ..]
+//!                  [--note-hold] [--follow-singer]
 //! skato_eval vocadito [--data data/vocadito] [--out out/vocadito] [--modes ..] [--tiers ..] [--engine ..]
 //!                  [--files 1,2] [--conditions ..] [--range auto] [--listen ..] [--dump ..] [--no-wavs]
+//! skato_eval note-intent [--split test] [--configs live_hq,studio_hq] [--conditions ..] [--systems note_hold]
+//!                  [--tolerance 8] [--sweep 0,3,5,..|none] [--data ..] [--out out/note-intent] [--cache ..]
+//! skato_eval note-intent synth [--configs live_hq,studio_hq] [--systems note_hold] [--out out/note-intent]
+//! skato_eval note-intent dump --configs live_hq --split dev --out <file.f32>
+//! skato_eval note-intent dump-synth --configs live_hq --n 400 --seed0 50000 --out <file.f32>
+//! skato_eval note-intent convert-model <in.ldm> <out.skgb>
 //! ```
 //!
 //! Exit codes: 0 success, 1 a gate failed (latency mismatch, rt-bench over
@@ -27,6 +34,7 @@ use skato_eval::reference::{ReferenceConfig, ReferenceTracker};
 use skato_eval::render::{self, BlockPattern, RenderOptions};
 use skato_eval::rtbench::{self, RtBenchOptions};
 use skato_eval::suite::{self, SuiteOptions, WavPolicy};
+use skato_eval::note_intent::{self, NoteIntentOptions, System};
 use skato_eval::vocadito::{self, Condition, RunConfig, VocaditoOptions};
 use skato_eval::{scenarios, wav};
 
@@ -55,7 +63,10 @@ USAGE:
       then the latency gauge: the delay of voiced content (D + PSOLA wander) per
       mode x engine x voice range at 48 kHz, i.e. what a performer hears.
   skato_eval rt-bench [--sr 48000] [--seconds 10] [--buffers 32,64,128,256,512] [--modes ..] [--tiers ..]
+                  [--note-hold] [--follow-singer] [--wav FILE]
       process() tail latency per config; exit 1 if p99.9 > 10% of the period at 32/64/128.
+      --note-hold / --follow-singer switch the Labs options on; --wav times a recording
+      (first channel, at its own sample rate) instead of the synthetic melody.
   skato_eval vocadito [--data data/vocadito] [--out out/vocadito] [--modes live,studio,livemin]
                    [--tiers eco,hq,max] [--engine classic|natural] [--files 1,2,3]
                    [--conditions detect,hard_chromatic,natural_chromatic,hard_key,natural_key]
@@ -73,6 +84,26 @@ USAGE:
       --dump writes 1 ms per-frame CSVs. Writes report.md, files.csv, detector.csv,
       correction.csv, segments.csv (failure spans) under --out. Prints the real-singing
       gates (Live HQ; exit 1 if one fails). Full run: about 4 min on 16 threads.
+  skato_eval note-intent [--split test|dev|all] [--configs live_hq,studio_hq] [--files 7,9]
+                   [--conditions hard_chromatic,hard_key,natural_key] [--systems note_hold,follow]
+                   [--tolerance 8] [--sweep 0,3,5,8,12,16,20,25,30,40,45|none]
+                   [--data data/vocadito] [--out out/note-intent] [--cache DIR] [--threads N]
+      Note-intent harness: replays the cached detector stream of every vocadito file
+      through the control law with the Labs options off (baseline) and on, on the fixed
+      DEV/TEST split, and scores the note decisions against both annotators: frame and
+      per-note accuracy, warble, stable p95 and note agreement of a proxy output, onset
+      glitches, legato decision latency, and the gaps to the baseline's Tolerance
+      frontier. The detector streams are cached under <out>/cache (rebuilt when the
+      detector changes). Writes report.md and points.csv under --out.
+  skato_eval note-intent synth [--configs live_hq,studio_hq] [--systems note_hold] [--out out/note-intent]
+      The synthetic scenarios with the Labs options off and on: tuning p95, target accuracy
+      and settling, on the study's proxy and through the engine. Writes synth.md under --out.
+  skato_eval note-intent dump --configs live_hq --split dev --out FILE.f32 [--data ..] [--cache ..]
+  skato_eval note-intent dump-synth --configs live_hq [--n 400] [--seed0 50000] --out FILE.f32
+      Training data for the learned veto (see crates/skato_control/models/README.md):
+      per-hop features and annotations of the split's vocadito files, or of synthetic lines.
+  skato_eval note-intent convert-model <in.ldm> <out.skgb>
+      Convert a trained candidate tree ensemble (LDMODEL text) to the embedded format.
 ";
 
 /// Flags that take no value.
@@ -83,6 +114,8 @@ const SWITCHES: &[&str] = &[
     "help",
     "no-wavs",
     "no-content",
+    "note-hold",
+    "follow-singer",
 ];
 
 struct Args {
@@ -261,6 +294,7 @@ fn main() -> ExitCode {
         "latency" => cmd_latency(&args),
         "rt-bench" | "rtbench" => cmd_rt_bench(&args),
         "vocadito" => cmd_vocadito(&args),
+        "note-intent" => cmd_note_intent(&args),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(true)
@@ -621,14 +655,21 @@ fn cmd_rt_bench(args: &Args) -> CmdResult {
     if let Some(t) = args.list("tiers", parse_tier)? {
         opts.tiers = t;
     }
+    opts.note_hold = args.has("note-hold");
+    opts.follow_singer = args.has("follow-singer");
+    if let Some(path) = args.get("wav") {
+        let (chans, sr) = wav::read_wav(std::path::Path::new(path))?;
+        opts.material = chans.into_iter().next();
+        opts.sample_rate = sr;
+    }
     if cfg!(debug_assertions) {
         eprintln!(
             "warning: debug build; timings are meaningless (use `cargo run --release -p skato_eval -- rt-bench`)"
         );
     }
     println!(
-        "{:>9} {:>4} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8}  budget",
-        "mode", "tier", "engine", "buffer", "p50 µs", "p99 µs", "p99.9 µs", "max µs", "p99.9 %"
+        "{:>9} {:>4} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8} {:>6}  budget",
+        "mode", "tier", "engine", "buffer", "p50 µs", "p99 µs", "p99.9 µs", "max µs", "p99.9 %", "vetos"
     );
     let rows = rtbench::run(&opts, &mut |r| {
         let gate = match r.design_gate() {
@@ -637,7 +678,7 @@ fn cmd_rt_bench(args: &Args) -> CmdResult {
             None => "",
         };
         println!(
-            "{:>9} {:>4} {:>8} {:>6} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>7.2}%  {}{}",
+            "{:>9} {:>4} {:>8} {:>6} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>7.2}% {:>6}  {}{}",
             suite::mode_name(r.mode),
             suite::tier_name(r.tier),
             suite::engine_name(r.engine),
@@ -647,6 +688,7 @@ fn cmd_rt_bench(args: &Args) -> CmdResult {
             r.p999_us,
             r.max_us,
             r.p999_fraction() * 100.0,
+            r.veto_runs,
             if r.within_budget() { "ok" } else { "OVER" },
             gate
         );
@@ -761,4 +803,150 @@ fn cmd_vocadito(args: &Args) -> CmdResult {
         println!("[{r}] {}: {}", g.name, g.value);
     }
     Ok(gates.iter().all(|g| g.pass != Some(false)))
+}
+
+fn parse_config(s: &str) -> Result<note_intent::cache::Config, String> {
+    note_intent::cache::Config::parse(s)
+        .ok_or_else(|| format!("unknown config {s} (expected live_hq, studio_hq, live_eco, ...)"))
+}
+
+fn parse_system(s: &str) -> Result<System, String> {
+    System::parse(s).ok_or_else(|| format!("unknown system {s} (expected note_hold or follow)"))
+}
+
+fn parse_cents(s: &str) -> Result<f32, String> {
+    s.parse::<f32>()
+        .ok()
+        .filter(|v| (0.0..=45.0).contains(v))
+        .ok_or_else(|| format!("bad Tolerance {s} (0-45 c)"))
+}
+
+fn cmd_note_intent(args: &Args) -> CmdResult {
+    if args.pos.first().map(String::as_str) == Some("convert-model") {
+        let input = PathBuf::from(args.pos.get(1).ok_or("convert-model: missing input .ldm")?);
+        let output = PathBuf::from(args.pos.get(2).ok_or("convert-model: missing output .skgb")?);
+        let text = std::fs::read_to_string(&input)?;
+        let bytes = note_intent::model::convert_ldm(&text)?;
+        let m = skato_control::intent::gbt::GbtModel::parse(&bytes)?;
+        std::fs::write(&output, &bytes)?;
+        println!(
+            "wrote {} ({} bytes): {} trees, {} nodes, {} features, checksum {:#018x}",
+            output.display(),
+            bytes.len(),
+            m.trees(),
+            m.nodes(),
+            m.features(),
+            m.checksum()
+        );
+        return Ok(true);
+    }
+    let sub = args.pos.first().map(String::as_str);
+    if sub == Some("synth") {
+        let cfgs = args.list("configs", parse_config)?.unwrap_or_else(|| {
+            vec![note_intent::cache::Config::LIVE_HQ, note_intent::cache::Config::STUDIO_HQ]
+        });
+        let mut systems = vec![System::Baseline];
+        systems.extend(args.list("systems", parse_system)?.unwrap_or_else(|| vec![System::NoteHold]));
+        let threads = args.get("threads").map(parse_usize).transpose()?.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| n.get())
+        });
+        let out = PathBuf::from(args.get("out").unwrap_or("out/note-intent"));
+        let rows = note_intent::synth::run(&cfgs, &systems, threads);
+        let md = format!(
+            "# Synthetic scenarios, Labs options off → on\n\nProxy = the note-intent study's replay (input + shift, no shifter); \
+             engine = a real render. `rule`: a p95 under 15 c stays under, a higher one rises ≤ 2 c, no new onset ≥ 30 ms.\n\n{}",
+            note_intent::synth::report(&rows)
+        );
+        std::fs::create_dir_all(&out)?;
+        std::fs::write(out.join("synth.md"), &md)?;
+        print!("{md}");
+        println!("wrote {}", out.join("synth.md").display());
+        return Ok(true);
+    }
+    if matches!(sub, Some("dump" | "dump-synth")) {
+        let cfgs = args.list("configs", parse_config)?.unwrap_or_else(|| vec![note_intent::cache::Config::LIVE_HQ]);
+        let [cfg] = cfgs.as_slice() else {
+            return Err("dump: one --configs value".into());
+        };
+        let out = PathBuf::from(args.get("out").ok_or("dump: --out FILE.f32")?);
+        let threads = args.get("threads").map(parse_usize).transpose()?.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| n.get())
+        });
+        if sub == Some("dump") {
+            let defaults = NoteIntentOptions::default();
+            let data = args.get("data").map_or(defaults.data.clone(), PathBuf::from);
+            let cache = args.get("cache").map_or_else(|| defaults.cache_dir(), PathBuf::from);
+            let split = note_intent::data::Split::parse(args.get("split").unwrap_or("dev"))
+                .ok_or("--split: expected dev|test|all")?;
+            let n = note_intent::train::dump(&data, &cache, *cfg, split, &out, threads)?;
+            println!("dumped {n} rows x {} columns to {}", note_intent::train::NCOL, out.display());
+        } else {
+            let n = args.get("n").map(parse_usize).transpose()?.unwrap_or(400);
+            let seed0 = args.get("seed0").map(|s| s.parse::<u64>()).transpose()?.unwrap_or(50_000);
+            let (rows, secs) = note_intent::train::dump_synth(*cfg, n, seed0, &out, threads)?;
+            println!("synthetic: {n} lines, {secs:.0} s of audio, {rows} rows to {}", out.display());
+        }
+        return Ok(true);
+    }
+    if let Some(p) = sub {
+        return Err(format!("note-intent: unknown argument {p}").into());
+    }
+    let mut opts = NoteIntentOptions::default();
+    if let Some(d) = args.get("data") {
+        opts.data = PathBuf::from(d);
+    }
+    if let Some(o) = args.get("out") {
+        opts.out = PathBuf::from(o);
+    }
+    if let Some(c) = args.get("cache") {
+        opts.cache = Some(PathBuf::from(c));
+    }
+    if let Some(s) = args.get("split") {
+        opts.split = note_intent::data::Split::parse(s)
+            .ok_or_else(|| format!("--split: expected dev|test|all, got {s}"))?;
+    }
+    if let Some(f) = args.list("files", parse_u32)? {
+        opts.files = Some(f);
+    }
+    if let Some(c) = args.list("configs", parse_config)? {
+        opts.configs = c;
+    }
+    if let Some(c) = args.list("conditions", parse_condition)? {
+        if c.contains(&Condition::Detect) {
+            return Err("--conditions: detect is not a note-decision condition".into());
+        }
+        opts.conditions = c;
+    }
+    if let Some(s) = args.list("systems", parse_system)? {
+        opts.systems = s;
+    }
+    if let Some(t) = args.get("tolerance") {
+        opts.tolerance = parse_cents(t)?;
+    }
+    match args.get("sweep") {
+        Some("none") => opts.sweep.clear(),
+        Some(_) => opts.sweep = args.list("sweep", parse_cents)?.unwrap_or_default(),
+        None => {}
+    }
+    if let Some(t) = args.get("threads") {
+        opts.threads = parse_usize(t)?.max(1);
+    }
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "warning: debug build; use `cargo run --release -p skato_eval -- note-intent` (much faster)"
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let outcome = note_intent::run(&opts, &|line| eprintln!("{line}"))?;
+    note_intent::write_all(&outcome, &opts)?;
+    print!("{}", note_intent::report(&outcome, &opts));
+    println!(
+        "{} files, {} points in {:.1} s ({} cache files rebuilt); wrote {}/{{report.md, points.csv}}",
+        outcome.files.len(),
+        outcome.points.len(),
+        t0.elapsed().as_secs_f64(),
+        outcome.rebuilt,
+        opts.out.display()
+    );
+    Ok(true)
 }

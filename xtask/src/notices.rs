@@ -24,6 +24,9 @@
 //! It refuses to produce a file (and so to bundle) when a shipped package has
 //! no license at all, or only copyleft options, so a new dependency cannot
 //! slip into the bundles unnoticed. Our own crates are ISC (`LICENSE`).
+//!
+//! The file ends with the datasets that embedded model weights were trained
+//! on ([`TRAINING_DATA`]), with the attribution their licenses require.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -46,6 +49,62 @@ const SHIPPED_FEATURES: &[&str] = &["standalone"];
 const PLATFORMS: &[&str] = &["aarch64-apple-darwin", "x86_64-apple-darwin"];
 /// License files larger than this are not license files.
 const MAX_TEXT_BYTES: u64 = 256 * 1024;
+
+/// A dataset that shipped model weights are derived from.
+struct TrainingData {
+    name: &'static str,
+    /// What in the binaries derives from it, and how (lines of the notice).
+    used_for: &'static [&'static str],
+    citation: &'static [&'static str],
+    license: &'static str,
+    source: &'static str,
+}
+
+/// Datasets behind the embedded models. Add one here whenever a model
+/// trained on third-party data is embedded (and keep its README in step).
+const TRAINING_DATA: &[TrainingData] = &[TrainingData {
+    name: "vocadito",
+    used_for: &[
+        "The Labs \"Learned note hold\" embeds two gradient-boosted tree ensembles",
+        "(crates/skato_control/models/live_hq.skgb and studio_hq.skgb). They were",
+        "trained on features that Skatotune's pitch detector and control law compute",
+        "from the 28 vocadito takes of its 20 DEV singers, labelled with the dataset's",
+        "two note annotations, together with synthetic singing. The model weights",
+        "are derived from vocadito; no audio or annotation of it is included.",
+    ],
+    citation: &[
+        "Rachel M. Bittner, Katherine Pasalo, Juan José Bosch, Gabriel Meseguer-Brocal",
+        "and David Rubinstein: \"vocadito: A dataset of solo vocals with f0, note, and",
+        "lyric annotations\", 2021 (arXiv:2110.05580); dataset version 3,",
+        "doi:10.5281/zenodo.5578807.",
+    ],
+    license: "Creative Commons Attribution 4.0 International (CC BY 4.0),\nhttps://creativecommons.org/licenses/by/4.0/",
+    source: "https://zenodo.org/records/5578807",
+}];
+
+/// The "Data used to train embedded models" section.
+fn training_data_section() -> String {
+    let mut out = String::new();
+    let heading = "Data used to train embedded models";
+    let _ = writeln!(out, "\n{heading}\n{}\n", "-".repeat(heading.len()));
+    let _ = writeln!(
+        out,
+        "The binaries contain model weights trained on the datasets below, which\n\
+         are credited here as their licenses require."
+    );
+    for d in TRAINING_DATA {
+        let _ = writeln!(out, "\n{}\n{}\n", "~".repeat(72), d.name);
+        for line in d.used_for {
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = writeln!(out, "\nCredit:");
+        for line in d.citation {
+            let _ = writeln!(out, "  {line}");
+        }
+        let _ = writeln!(out, "\nLicense: {}\nSource: {}", d.license, d.source);
+    }
+    out
+}
 
 /// `cargo xtask notices [--check] [-p <package>]`.
 pub fn command(args: &[String]) -> Result<()> {
@@ -350,6 +409,7 @@ pub fn generate(package: &str) -> Result<String> {
             t.body.trim_end()
         );
     }
+    out.push_str(&training_data_section());
     // Trailing whitespace on each line is never meaningful here and makes
     // the file churn between generators.
     let mut clean: String = out
@@ -599,6 +659,28 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(bundle_packages(&args(&["--release"])), [DEFAULT_PACKAGE]);
+    }
+
+    /// The training-data section credits vocadito as CC BY 4.0 requires:
+    /// the work and its authors, the license with a link, and what changed.
+    #[test]
+    fn the_training_data_section_credits_vocadito() {
+        let s = training_data_section();
+        assert!(s.contains("Data used to train embedded models"));
+        for needle in [
+            "vocadito",
+            "Rachel M. Bittner",
+            "David Rubinstein",
+            "doi:10.5281/zenodo.5578807",
+            "CC BY 4.0",
+            "https://creativecommons.org/licenses/by/4.0/",
+            "live_hq.skgb",
+            "derived from vocadito",
+        ] {
+            assert!(s.contains(needle), "missing {needle}:\n{s}");
+        }
+        assert!(s.contains("Juan José Bosch"), "names keep their accents");
+        assert!(s.lines().all(|l| l.chars().count() <= 80), "{s}");
     }
 
     #[test]

@@ -1964,6 +1964,7 @@ mod tests {
                 correction_ribbon: false,
                 heat_line: true,
                 correction_theme: CorrectionTheme::Inferno,
+                ..crate::labs::LabsSettings::DEFAULT
             }
         );
     }

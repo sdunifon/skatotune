@@ -44,10 +44,12 @@
 - **Latency readout:** the reported latency plus the average delay you actually hear for the note you're singing, and a CPU meter.
 
 <p align="center">
-  <img src="docs/images/labs.png" width="880" alt="The Labs menu open over the editor, with switches for the correction ribbon and the heat-tinted output line and a picker for five correction color themes.">
+  <img src="docs/images/labs.png" width="880" alt="The Labs menu open over the editor, with switches for the correction ribbon, the heat-tinted output line, learned note hold and follow singer's tuning, and a picker for five correction color themes.">
 </p>
 
-The **Labs** menu holds experimental features before they're promoted to the main UI. Correction coloring comes in five themes: Teal, Green → Red, Viridis, Inferno and Blue → Orange (three of them are color-blind safe).
+The **Labs** menu holds experimental features before they're promoted to the main UI. Correction coloring comes in five themes: Teal, Green → Red, Viridis, Inferno and Blue → Orange (three of them are color-blind safe). Two Labs switches change the sound, both off by default:
+- **Learned note hold** (HQ/Max): a small learned model may hold the current note when a switch looks like wobble rather than a new note, and a note doesn't drop while the voice fades at a phrase end. On real singing it halves hard-tune warble, at the cost of a few short notes ([research](docs/research/note-intent.md)).
+- **Follow singer's tuning:** corrects to the singer's own reference instead of A440, for consistently detuned material.
 
 <p align="center">
   <img src="docs/images/themes.png" width="880" alt="The same passage of the pitch graph in each of the five correction color themes.">
@@ -180,6 +182,6 @@ Work is tracked in [GitHub issues](https://github.com/sdunifon/skatotune/issues)
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
 - **License:** [ISC](LICENSE). Third-party licenses are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) and inside every bundle.
 - **Built on** [nice-plug](https://codeberg.org/RustAudio/nice-plug) (the community continuation of NIH-plug), [egui](https://github.com/emilk/egui), [RustFFT](https://github.com/ejmahler/RustFFT)/[realfft](https://github.com/HEnquist/realfft), and the CLAP and VST3 SDKs.
-- **Evaluation data:** vocadito (Bittner et al., 2021, [CC BY 4.0](https://zenodo.org/records/5578807)); it is downloaded for evaluation and not redistributed here.
+- **Evaluation and training data:** vocadito (Bittner et al., 2021, [CC BY 4.0](https://zenodo.org/records/5578807)) is downloaded for evaluation and not redistributed here. The Labs learned note hold's models were trained on part of it, so their weights ship in the plugin with the attribution in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) ([model card](crates/skato_control/models/README.md)).
 - **Prior art:** the methods build on published research and expired patents (Hildebrand's pitch-correction patent US 5,973,252; IVL's formant patent US 5,567,901), credited in [docs/research.md](docs/research.md).
 - **Trademarks:** VST, Ableton, Bitwig and other names belong to their owners; Skatotune is not affiliated with them. See [TRADEMARKS.md](TRADEMARKS.md).

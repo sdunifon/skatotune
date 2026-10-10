@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 use nice_plug::prelude::*;
 use skato_core::{
     AnalysisChannel, EngineConfig, EngineKind, LatencyMode, MidiMode, NoteState, QualityTier,
-    ScaleKind, Settings, SynthVibrato, VoiceRange,
+    ReferenceMode, ScaleKind, Settings, SynthVibrato, VoiceRange,
 };
 
 use crate::labs::LabsSettings;
@@ -555,6 +555,10 @@ impl ParamValues {
             midi_mode: self.midi_mode.into(),
             midi_all_octaves: self.midi_all_octaves,
             bend_range_st: clean(self.bend_range_st, 0.0, 12.0, 2.0),
+            // Labs sound experiments: not parameters; `process_block` applies
+            // them from their lock-free mirror (`labs::apply_sound`).
+            note_hold: false,
+            reference: ReferenceMode::A440,
         }
     }
 
@@ -972,10 +976,18 @@ pub struct SkatotuneParams {
     /// with the project; engine resets and rebuilds never clear it.
     #[persist = "learned-scale"]
     pub learned_scale: AtomicU32,
-    /// Editor experiments switched in the LABS menu ([`crate::labs`]). Saved
-    /// with the project; GUI-only, never read on the audio thread.
+    /// Experiments switched in the LABS menu ([`crate::labs`]). Saved with
+    /// the project; never read on the audio thread (see `labs_sound`).
     #[persist = "labs"]
     pub labs: RwLock<LabsSettings>,
+    /// The Labs experiments that change the sound
+    /// ([`LabsSettings::sound_bits`]), mirrored from `labs` so the audio
+    /// thread reads them without a lock. Saved with the project like the
+    /// learned scale, so they apply with the editor closed and right after a
+    /// reload. Authoritative for those experiments: [`Self::labs`] reads them
+    /// from here.
+    #[persist = "labs-sound"]
+    pub labs_sound: AtomicU32,
 }
 
 impl Default for SkatotuneParams {
@@ -1094,6 +1106,7 @@ impl SkatotuneParams {
                 .with_step_size(1.0),
             learned_scale: AtomicU32::new(0),
             labs: RwLock::new(LabsSettings::default()),
+            labs_sound: AtomicU32::new(LabsSettings::DEFAULT.sound_bits()),
         }
     }
 
@@ -1109,20 +1122,31 @@ impl SkatotuneParams {
         self.learned_scale.store(0, Ordering::Relaxed);
     }
 
-    /// The current Labs switches (GUI thread; a short read lock).
+    /// The current Labs switches (GUI thread; a short read lock). The sound
+    /// experiments come from their lock-free mirror, so this is what the
+    /// audio thread applies.
     pub fn labs(&self) -> LabsSettings {
-        match self.labs.read() {
+        let l = match self.labs.read() {
             Ok(l) => *l,
             Err(poisoned) => *poisoned.into_inner(),
-        }
+        };
+        l.with_sound_bits(self.labs_sound_bits())
     }
 
-    /// Change the Labs switches (GUI thread). Saved with the project.
+    /// Change the Labs switches (GUI thread). Saved with the project; the
+    /// sound experiments reach the audio thread at its next block.
     pub fn set_labs(&self, labs: LabsSettings) {
         match self.labs.write() {
             Ok(mut l) => *l = labs,
             Err(poisoned) => *poisoned.into_inner() = labs,
         }
+        self.labs_sound.store(labs.sound_bits(), Ordering::Relaxed);
+    }
+
+    /// The sound experiments ([`LabsSettings::sound_bits`]). Atomic load;
+    /// safe on any thread, the audio thread included.
+    pub fn labs_sound_bits(&self) -> u32 {
+        self.labs_sound.load(Ordering::Relaxed)
     }
 
     /// The override parameter of pitch class `pc` (0 = C; wraps modulo 12).
@@ -1460,16 +1484,22 @@ mod tests {
             correction_ribbon: false,
             heat_line: true,
             correction_theme: CorrectionTheme::Viridis,
+            learned_note_hold: true,
+            follow_singer: false,
         };
         p.set_labs(mine);
+        assert_eq!(p.labs(), mine);
+        assert_eq!(p.labs_sound_bits(), mine.sound_bits());
         p.learned_scale
             .store(crate::learn::pack(&[0, 4, 7]), Ordering::Relaxed);
         let saved = p.serialize_fields();
         assert!(saved.contains_key("labs"), "{saved:?}");
+        assert!(saved.contains_key("labs-sound"), "{saved:?}");
         assert!(saved.contains_key("learned-scale"), "{saved:?}");
         let restored = SkatotuneParams::default();
         restored.deserialize_fields(&saved);
         assert_eq!(restored.labs(), mine);
+        assert_eq!(restored.labs_sound_bits(), mine.sound_bits(), "the audio thread's copy");
         assert!(
             !p.param_map().iter().any(|(id, _, _)| id.contains("lab")),
             "never a host parameter"
@@ -1479,6 +1509,7 @@ mod tests {
         // it loads, and the switches keep their defaults.
         let mut pre_labs = saved.clone();
         pre_labs.remove("labs");
+        pre_labs.remove("labs-sound");
         let old_project = SkatotuneParams::default();
         old_project.deserialize_fields(&pre_labs);
         assert_eq!(old_project.labs(), LabsSettings::default());
@@ -1498,6 +1529,9 @@ mod tests {
                 correction_ribbon: true,
                 heat_line: true,
                 correction_theme: CorrectionTheme::Teal,
+                // From the saved `labs-sound` (authoritative for these).
+                learned_note_hold: true,
+                follow_singer: false,
             }
         );
 
@@ -1515,7 +1549,18 @@ mod tests {
                 correction_ribbon: false,
                 heat_line: true,
                 correction_theme: CorrectionTheme::Teal,
+                learned_note_hold: true,
+                follow_singer: false,
             }
         );
+    }
+
+    /// Settings resolution leaves the Labs sound experiments off; they are
+    /// not parameters (`process_block` applies them).
+    #[test]
+    fn to_settings_leaves_the_labs_sound_experiments_off() {
+        let s = ParamValues::default().to_settings();
+        assert!(!s.note_hold);
+        assert_eq!(s.reference, ReferenceMode::A440);
     }
 }

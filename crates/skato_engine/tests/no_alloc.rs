@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{Rng, noise_bursts, silence, vowel};
 use skato_core::{
-    AnalysisChannel, EngineConfig, EngineKind, LatencyMode, MidiEvent, MidiMode, QualityTier, ScaleKind, Settings,
-    VoiceRange,
+    AnalysisChannel, EngineConfig, EngineKind, LatencyMode, MidiEvent, MidiMode, QualityTier, ReferenceMode, ScaleKind,
+    Settings, VoiceRange,
 };
 use skato_engine::{Engine, TimedMidi};
 
@@ -244,5 +244,76 @@ fn voice_range_switches_never_allocate() {
         });
         assert_eq!(count, 0, "{mode:?}: {count} allocator calls");
         assert!(l.iter().chain(&r).all(|v| v.is_finite()));
+    }
+}
+
+/// A sung line that wobbles across semitone midpoints and steps between
+/// notes (so the note decision proposes switches for the learned veto to
+/// judge), with level decays, gaps and garbage.
+fn wandering_line(sr: f32) -> Vec<f32> {
+    let mut x = Vec::new();
+    for (k, base) in [196.0f64, 207.65, 185.0, 220.0, 196.0, 174.6].into_iter().enumerate() {
+        let off = [45.0, -40.0, 30.0, -48.0, 10.0, 42.0][k];
+        let mut v = vowel(sr, 0.4, 0.8, move |t| base * 2f64.powf((off + 25.0 * (std::f64::consts::TAU * 5.0 * t).sin()) / 1200.0));
+        let n = v.len();
+        for (i, s) in v.iter_mut().enumerate() {
+            // The last 80 ms decay by 20 dB (a phrase-end release).
+            let tail = (i as f64 - (n as f64 - 0.08 * f64::from(sr))).max(0.0) / (0.08 * f64::from(sr));
+            *s *= 10f32.powf(-tail as f32);
+        }
+        x.extend(v);
+        if k % 2 == 1 {
+            x.extend(silence(sr, 0.05));
+        }
+    }
+    x.extend(material(sr));
+    x
+}
+
+/// The Labs note-intent options (learned note hold, follow singer's tuning)
+/// in every mode and tier, switched on and off mid-stream: no allocation in
+/// the realtime path (the learned veto runs its tree ensemble on the audio
+/// thread) and finite output.
+#[test]
+fn note_intent_options_never_allocate() {
+    let sr = 48_000.0;
+    let x = wandering_line(sr);
+    for mode in [LatencyMode::LiveMin, LatencyMode::Live, LatencyMode::LivePlus, LatencyMode::Studio] {
+        for tier in [QualityTier::Eco, QualityTier::Hq, QualityTier::Max] {
+            let cfg = EngineConfig { sample_rate: sr, channels: 1, latency_mode: mode, ..EngineConfig::default() };
+            let mut e = Engine::new(cfg);
+            let _rx = e.take_telemetry();
+            let on = Settings {
+                tier,
+                retune_ms: 0.0,
+                tolerance_cents: 5.0,
+                note_hold: true,
+                reference: ReferenceMode::FollowSinger,
+                ..Settings::default()
+            };
+            let off = Settings { note_hold: false, reference: ReferenceMode::A440, ..on };
+            let mut buf = x.clone();
+            let sizes = [32usize, 7, 128, 64, 480, 1];
+            let (count, _) = armed(|| {
+                e.set_telemetry_enabled(true);
+                let mut pos = 0;
+                let mut i = 0;
+                while pos < buf.len() {
+                    let n = sizes[i % sizes.len()].min(buf.len() - pos);
+                    e.set_settings(if i % 400 < 300 { &on } else { &off });
+                    e.process(&mut [&mut buf[pos..pos + n]], &[]);
+                    if i == 2000 {
+                        e.reset();
+                    }
+                    pos += n;
+                    i += 1;
+                }
+            });
+            assert_eq!(count, 0, "{mode:?} {tier:?}: {count} allocator calls");
+            assert!(buf.iter().all(|v| v.is_finite()), "{mode:?} {tier:?}: non-finite output");
+            // The veto ran (HQ/Max; Eco keeps the plain control law).
+            let judged = e.note_hold_stats().proposals;
+            assert_eq!(judged > 0, tier != QualityTier::Eco, "{mode:?} {tier:?}: {judged} switches judged");
+        }
     }
 }

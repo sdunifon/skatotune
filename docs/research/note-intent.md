@@ -1,6 +1,6 @@
 # Note intent: deciding which note a singer means
 
-**Date:** 2026-10-09 · **Status:** research done, recommendation audited (**sound, with caveats**); implementation awaiting the user's decision · **Issue:** [#7](https://github.com/sdunifon/skatotune/issues/7)
+**Date:** 2026-10-09 · **Status:** research done, recommendation audited (**sound, with caveats**); implemented as two Labs options, off by default (see "Implementation" below) · **Issue:** [#7](https://github.com/sdunifon/skatotune/issues/7)
 
 **How this was done.** A replay harness re-runs the control law over cached detector output for vocadito's 40 real singing takes, scored against both annotators' notes, with a fixed DEV/TEST split by singer (20 DEV singers, 9 TEST singers) and leave-one-singer-out selection inside DEV. Four prototypes competed (adaptive tuning reference, musical note model, trajectory cues, learned decider); a lead combined them and an independent audit re-ran everything.
 
@@ -16,6 +16,16 @@ The audit reproduced every number bit for bit and found no tuning on TEST, but i
 - **Onset glitches are mostly not note decisions:** the published 6.3 % / 11.4 % come mainly from the shifter and output path (decision-side proxy 1.1 %), so they belong to the shifter work (#8, #16).
 
 The full recommendation follows, unchanged except that the location of scratch files is omitted (the experiment code lives outside the repository; implementing the recommendation moves the harness into `skato_eval`).
+
+## Implementation (Labs experiment)
+
+The user chose a Labs experiment first. Both options are in the LABS menu and off by default; with both off the engine is bit-identical to the code before them (golden hashes of 72 renders, `crates/skato_eval/tests/note_intent_off.rs`).
+
+- **Learned note hold** (`Settings::note_hold`): DC exactly as recommended in §5.1-5.2, in HQ/Max for scale targets (Eco and MIDI targets unchanged). The Live model also serves Live+ and Live-Min, and the HQ models serve the Max tier; none of these was evaluated. Models: `crates/skato_control/models` (card in its README). The veto runs only on proposal hops and never allocates.
+- **Follow singer's tuning** (`Settings::reference = FollowSinger`): prototype A's fg45 tracker in follow mode, target offset latched per note (§5.3).
+- **Harness:** `skato_eval note-intent` (cache, replay, metrics, frontier) with the frozen split in `crates/skato_eval/data/note_intent_splits.txt`; `note-intent synth` for the synthetic scenarios; `dump`, `dump-synth`, `convert-model` and `tools/note_intent/train_veto.py` retrain the models. Every TEST number of §4.1 (Live HQ and Studio HQ, three conditions, the Tolerance sweep) and the frontier gaps of §4.3 reproduce to four decimals, the synthetic proxy rows of §4.6 exactly, and the training dumps and both models byte for byte.
+- **Check:** `crates/skato_eval/tests/note_intent.rs` (needs `data/vocadito`) holds the §5.4 Live HQ chromatic TEST numbers.
+- **CPU** (`skato_eval rt-bench --note-hold` on a vocadito take, off and on interleaved twice, M4 Max at load 15-23, so tails are noisy): Live HQ at 128 samples keeps its 38 µs median; p99 rises from about 60 to about 80 µs on blocks where the model judges a switch (98 judged in 5 s); p99.9 stays at 4.3-4.9 % of the buffer, inside the 5 % gate. Studio HQ is within noise of off.
 
 ---
 
