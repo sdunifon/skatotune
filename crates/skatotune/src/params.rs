@@ -235,8 +235,52 @@ pub enum ScaleChoice {
     #[name = "Minor Pentatonic"]
     MinorPentatonic,
     #[id = "blues"]
-    #[name = "Blues"]
+    #[name = "Blues Minor"]
     Blues,
+    // Bitwig's scales (docs/research/host-key-scale.md §3.6). Only ever
+    // append: VST3 stores this parameter as index / (n - 1).
+    #[id = "harmonic-major"]
+    #[name = "Harmonic Major"]
+    HarmonicMajor,
+    #[id = "overtone"]
+    #[name = "Overtone"]
+    Overtone,
+    #[id = "blues-major"]
+    #[name = "Blues Major"]
+    BluesMajor,
+    #[id = "double-harmonic-major"]
+    #[name = "Double Harmonic Major"]
+    DoubleHarmonicMajor,
+    #[id = "double-harmonic-minor"]
+    #[name = "Double Harmonic Minor"]
+    DoubleHarmonicMinor,
+    #[id = "whole-tone"]
+    #[name = "Whole Tone"]
+    WholeTone,
+    #[id = "half-diminished"]
+    #[name = "Half Diminished"]
+    HalfDiminished,
+    #[id = "diminished-wh"]
+    #[name = "Diminished (W-H)"]
+    DiminishedWh,
+    #[id = "diminished-hw"]
+    #[name = "Diminished (H-W)"]
+    DiminishedHw,
+    #[id = "major-triad"]
+    #[name = "Major Triad"]
+    MajorTriad,
+    #[id = "minor-triad"]
+    #[name = "Minor Triad"]
+    MinorTriad,
+}
+
+impl ScaleChoice {
+    /// The menu entry for a built-in scale (the inverse of the `From` below).
+    pub fn from_kind(kind: ScaleKind) -> Self {
+        // Both enums list the scales in the same order (checked by a test).
+        let i = ScaleKind::ALL.iter().position(|&k| k == kind).unwrap_or(0);
+        Self::from_index(i)
+    }
 }
 
 impl From<ScaleChoice> for ScaleKind {
@@ -255,6 +299,17 @@ impl From<ScaleChoice> for ScaleKind {
             ScaleChoice::MajorPentatonic => ScaleKind::MajorPentatonic,
             ScaleChoice::MinorPentatonic => ScaleKind::MinorPentatonic,
             ScaleChoice::Blues => ScaleKind::Blues,
+            ScaleChoice::HarmonicMajor => ScaleKind::HarmonicMajor,
+            ScaleChoice::Overtone => ScaleKind::Overtone,
+            ScaleChoice::BluesMajor => ScaleKind::BluesMajor,
+            ScaleChoice::DoubleHarmonicMajor => ScaleKind::DoubleHarmonicMajor,
+            ScaleChoice::DoubleHarmonicMinor => ScaleKind::DoubleHarmonicMinor,
+            ScaleChoice::WholeTone => ScaleKind::WholeTone,
+            ScaleChoice::HalfDiminished => ScaleKind::HalfDiminished,
+            ScaleChoice::DiminishedWh => ScaleKind::DiminishedWh,
+            ScaleChoice::DiminishedHw => ScaleKind::DiminishedHw,
+            ScaleChoice::MajorTriad => ScaleKind::MajorTriad,
+            ScaleChoice::MinorTriad => ScaleKind::MinorTriad,
         }
     }
 }
@@ -1553,6 +1608,28 @@ mod tests {
                 follow_singer: false,
             }
         );
+    }
+
+    /// The Scale menu lists the built-in scales in `ScaleKind::ALL` order,
+    /// with the same names, and the original 13 keep their ids and indices
+    /// (saved projects and VST3 automation depend on both).
+    #[test]
+    fn scale_menu_mirrors_the_built_in_scales_and_only_appends() {
+        let names = ScaleChoice::variants();
+        assert_eq!(names.len(), ScaleKind::ALL.len());
+        for (i, kind) in ScaleKind::ALL.iter().enumerate() {
+            let choice = ScaleChoice::from_index(i);
+            assert_eq!(ScaleKind::from(choice), *kind);
+            assert_eq!(ScaleChoice::from_kind(*kind), choice);
+            assert_eq!(names[i], kind.name());
+        }
+        let ids = ScaleChoice::ids().expect("scale ids");
+        let original = [
+            "chromatic", "major", "natural-minor", "harmonic-minor", "melodic-minor", "dorian",
+            "phrygian", "lydian", "mixolydian", "locrian", "major-pentatonic", "minor-pentatonic",
+            "blues",
+        ];
+        assert_eq!(&ids[..original.len()], &original);
     }
 
     /// Settings resolution leaves the Labs sound experiments off; they are

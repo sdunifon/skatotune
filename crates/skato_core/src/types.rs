@@ -110,10 +110,24 @@ pub enum ScaleKind {
     MajorPentatonic,
     MinorPentatonic,
     Blues,
+    // Appended for Bitwig's scale set (docs/research/host-key-scale.md §3.6).
+    // New scales only ever go at the end: VST3 stores the Scale parameter as
+    // index / (n - 1), so inserting one would move saved automation.
+    HarmonicMajor,
+    Overtone,
+    BluesMajor,
+    DoubleHarmonicMajor,
+    DoubleHarmonicMinor,
+    WholeTone,
+    HalfDiminished,
+    DiminishedWh,
+    DiminishedHw,
+    MajorTriad,
+    MinorTriad,
 }
 
 impl ScaleKind {
-    pub const ALL: [ScaleKind; 13] = [
+    pub const ALL: [ScaleKind; 24] = [
         ScaleKind::Chromatic,
         ScaleKind::Major,
         ScaleKind::NaturalMinor,
@@ -127,6 +141,17 @@ impl ScaleKind {
         ScaleKind::MajorPentatonic,
         ScaleKind::MinorPentatonic,
         ScaleKind::Blues,
+        ScaleKind::HarmonicMajor,
+        ScaleKind::Overtone,
+        ScaleKind::BluesMajor,
+        ScaleKind::DoubleHarmonicMajor,
+        ScaleKind::DoubleHarmonicMinor,
+        ScaleKind::WholeTone,
+        ScaleKind::HalfDiminished,
+        ScaleKind::DiminishedWh,
+        ScaleKind::DiminishedHw,
+        ScaleKind::MajorTriad,
+        ScaleKind::MinorTriad,
     ];
 
     /// Semitone offsets from the key that belong to the scale.
@@ -145,7 +170,71 @@ impl ScaleKind {
             ScaleKind::MajorPentatonic => &[0, 2, 4, 7, 9],
             ScaleKind::MinorPentatonic => &[0, 3, 5, 7, 10],
             ScaleKind::Blues => &[0, 3, 5, 6, 7, 10],
+            ScaleKind::HarmonicMajor => &[0, 2, 4, 5, 7, 8, 11],
+            ScaleKind::Overtone => &[0, 2, 4, 6, 7, 9, 10],
+            ScaleKind::BluesMajor => &[0, 2, 3, 4, 7, 9],
+            ScaleKind::DoubleHarmonicMajor => &[0, 1, 4, 5, 7, 8, 11],
+            ScaleKind::DoubleHarmonicMinor => &[0, 2, 3, 6, 7, 8, 11],
+            ScaleKind::WholeTone => &[0, 2, 4, 6, 8, 10],
+            ScaleKind::HalfDiminished => &[0, 2, 3, 5, 6, 8, 10],
+            ScaleKind::DiminishedWh => &[0, 2, 3, 5, 6, 8, 9, 11],
+            ScaleKind::DiminishedHw => &[0, 1, 3, 4, 6, 7, 9, 10],
+            ScaleKind::MajorTriad => &[0, 4, 7],
+            ScaleKind::MinorTriad => &[0, 3, 7],
         }
+    }
+
+    /// Display name (matches the plugin's Scale menu).
+    pub const fn name(self) -> &'static str {
+        match self {
+            ScaleKind::Chromatic => "Chromatic",
+            ScaleKind::Major => "Major",
+            ScaleKind::NaturalMinor => "Natural Minor",
+            ScaleKind::HarmonicMinor => "Harmonic Minor",
+            ScaleKind::MelodicMinor => "Melodic Minor",
+            ScaleKind::Dorian => "Dorian",
+            ScaleKind::Phrygian => "Phrygian",
+            ScaleKind::Lydian => "Lydian",
+            ScaleKind::Mixolydian => "Mixolydian",
+            ScaleKind::Locrian => "Locrian",
+            ScaleKind::MajorPentatonic => "Major Pentatonic",
+            ScaleKind::MinorPentatonic => "Minor Pentatonic",
+            ScaleKind::Blues => "Blues Minor",
+            ScaleKind::HarmonicMajor => "Harmonic Major",
+            ScaleKind::Overtone => "Overtone",
+            ScaleKind::BluesMajor => "Blues Major",
+            ScaleKind::DoubleHarmonicMajor => "Double Harmonic Major",
+            ScaleKind::DoubleHarmonicMinor => "Double Harmonic Minor",
+            ScaleKind::WholeTone => "Whole Tone",
+            ScaleKind::HalfDiminished => "Half Diminished",
+            ScaleKind::DiminishedWh => "Diminished (W-H)",
+            ScaleKind::DiminishedHw => "Diminished (H-W)",
+            ScaleKind::MajorTriad => "Major Triad",
+            ScaleKind::MinorTriad => "Minor Triad",
+        }
+    }
+
+    /// The scale in `key` as a 12-bit pitch-class mask (bit 0 = C).
+    pub fn mask(self, key: u8) -> u16 {
+        self.intervals()
+            .iter()
+            .fold(0, |m, &iv| m | 1 << ((key as usize + iv as usize) % 12))
+    }
+
+    /// Name a pitch-class set: the first built-in scale (in [`Self::ALL`]
+    /// order, so Major before Natural Minor before the modes) that is exactly
+    /// `mask` in some key, trying `prefer_root` first (e.g. the bass note of a
+    /// chord). None for a set no built-in scale matches.
+    pub fn identify(mask: u16, prefer_root: Option<u8>) -> Option<(u8, ScaleKind)> {
+        let mask = mask & 0x0FFF;
+        if let Some(r) = prefer_root.map(|r| r % 12)
+            && let Some(&k) = Self::ALL.iter().find(|k| k.mask(r) == mask)
+        {
+            return Some((r, k));
+        }
+        Self::ALL
+            .iter()
+            .find_map(|&k| (0..12u8).find(|&r| k.mask(r) == mask).map(|r| (r, k)))
     }
 
     /// Effective note states for every pitch class (index 0 = C) when this
@@ -504,5 +593,40 @@ mod tests {
         let s = ScaleKind::Major.note_states(2); // D major: D E F# G A B C#
         let on: Vec<usize> = (0..12).filter(|&i| s[i] == NoteState::On).collect();
         assert_eq!(on, vec![1, 2, 4, 6, 7, 9, 11]);
+    }
+
+    #[test]
+    fn every_scale_is_listed_once_with_sorted_intervals_from_the_key() {
+        let mut seen = std::collections::HashSet::new();
+        for k in ScaleKind::ALL {
+            assert!(seen.insert(k), "{k:?} listed twice");
+            let iv = k.intervals();
+            assert_eq!(iv[0], 0, "{k:?} starts on the key");
+            assert!(iv.windows(2).all(|w| w[0] < w[1]) && iv[iv.len() - 1] < 12, "{k:?}");
+            assert_eq!(k.mask(0).count_ones() as usize, iv.len());
+            assert_eq!(k.note_states(0).iter().filter(|s| **s == NoteState::On).count(), iv.len());
+        }
+        // The appended scales, spot-checked against their usual spelling.
+        assert_eq!(ScaleKind::DoubleHarmonicMinor.mask(9), 0b1011_0011_1001); // A B C D# E F G#
+        assert_eq!(ScaleKind::Overtone.mask(0), 0b0110_1101_0101); // C D E F# G A Bb
+        assert_eq!(ScaleKind::DiminishedHw.mask(0), ScaleKind::DiminishedWh.mask(1));
+    }
+
+    #[test]
+    fn sets_are_named_by_the_first_matching_scale_preferring_the_given_root() {
+        let c_major = ScaleKind::Major.mask(0);
+        assert_eq!(ScaleKind::identify(c_major, None), Some((0, ScaleKind::Major)));
+        assert_eq!(ScaleKind::identify(c_major, Some(9)), Some((9, ScaleKind::NaturalMinor)));
+        assert_eq!(ScaleKind::identify(c_major, Some(2)), Some((2, ScaleKind::Dorian)));
+        // A root that isn't a tonic of the set falls back to the first match.
+        assert_eq!(ScaleKind::identify(c_major, Some(1)), Some((0, ScaleKind::Major)));
+        assert_eq!(ScaleKind::identify(0x0FFF, Some(5)), Some((5, ScaleKind::Chromatic)));
+        assert_eq!(ScaleKind::identify(0b1000_0000_0011, None), None);
+        for k in ScaleKind::ALL {
+            for r in 0..12 {
+                let (r2, k2) = ScaleKind::identify(k.mask(r), Some(r)).expect("built-in sets are named");
+                assert_eq!(k2.mask(r2), k.mask(r), "{k:?} in {r}");
+            }
+        }
     }
 }

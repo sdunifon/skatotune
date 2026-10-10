@@ -99,6 +99,11 @@ const RESTART_GAP_MS: f32 = 15.0;
 /// vocadito warble +1.8 % (chromatic). Later notes, and Studio (onset from
 /// the lookahead median), keep the persistence.
 const ATTACK_MS: f32 = 150.0;
+/// A scale change that removes the note being sung keeps that note's target
+/// until the next note starts, for at most this long, then glides to the new
+/// scale with the transition (docs/research/host-key-scale.md §3.3: a key
+/// change from MIDI Scale, Auto-Key or an edit never yanks a held note).
+const KEY_CHANGE_HOLD_MS: f32 = 200.0;
 const ATTACK_MOVE_C: f32 = 20.0;
 /// Studio (SN-3): the shifter applies a new ratio some time after the
 /// boundary that hands it over (its linear ramp over the next hop; PSOLA
@@ -170,6 +175,8 @@ struct Derived {
     restart_window_hops: u32,
     restart_gap_hops: u32,
     attack_hops: u32,
+    /// Voiced hops a note removed by a scale change keeps its target.
+    key_hold_hops: u32,
     studio_persist_hops: usize,
     /// The PSOLA engine renders the output (it fades in from the dry
     /// signal itself at a voiced onset, ON-9).
@@ -218,6 +225,7 @@ fn derive(clock: &HopClock, s: &Settings, mode: LatencyMode) -> Derived {
         restart_window_hops: clock.whole_hops(RESTART_WINDOW_MS, 0),
         restart_gap_hops: clock.whole_hops(RESTART_GAP_MS, 1),
         attack_hops: clock.whole_hops(ATTACK_MS, 0),
+        key_hold_hops: clock.whole_hops(KEY_CHANGE_HOLD_MS, 0),
         studio_persist_hops: clock.whole_hops(STUDIO_PERSIST_MS, 0) as usize,
         natural: s.engine == EngineKind::Natural && mode != LatencyMode::LiveMin,
         note_hold: s.note_hold && s.tier != QualityTier::Eco,
@@ -279,6 +287,9 @@ pub struct Corrector {
     midi: MidiState,
     targets: TargetSet,
     targets_dirty: bool,
+    /// The scale (note states) changed since the targets were last built:
+    /// the next rebuild may start the key-change hold.
+    scale_changed: bool,
     hmm: NoteHmm,
     vib: VibratoTracker,
     rules: RuleDecider,
@@ -326,6 +337,7 @@ impl Corrector {
             midi: MidiState::new(),
             targets: TargetSet::default(),
             targets_dirty: true,
+            scale_changed: false,
             hmm,
             vib: VibratoTracker::new(clock.hop_s, d.hmm_on),
             rules: RuleDecider::default(),
@@ -390,6 +402,9 @@ impl Corrector {
         if s.note_states != old.note_states || s.midi_mode != old.midi_mode || s.midi_all_octaves != old.midi_all_octaves {
             self.targets_dirty = true;
         }
+        if self.primed && s.note_states != old.note_states {
+            self.scale_changed = true;
+        }
         self.hmm.set_params(s.tolerance_cents, s.tolerance_ms, self.d.max_jump);
         if s.reference != old.reference {
             // Follow singer's tuning starts (or stops) from A440; a note that
@@ -440,6 +455,14 @@ impl Corrector {
         }
         if self.targets_dirty {
             self.rebuild_targets();
+        }
+        if std::mem::take(&mut self.scale_changed)
+            && self.targets.source() == TargetSource::Scale
+            && self.be.note.is_some_and(|n| !self.targets.is_allowed(n))
+        {
+            // A key change removed the note being sung: keep its target until
+            // the next note starts, capped (KEY_CHANGE_HOLD_MS).
+            self.be.key_hold = self.d.key_hold_hops;
         }
         self.smooth_params();
         self.update_lead(est);

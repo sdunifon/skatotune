@@ -27,7 +27,7 @@
 
 **Correction**
 - **Two engines.** *Natural* shifts pitch one voice cycle at a time (PSOLA), so formants stay put and the voice keeps its character. *Classic* is the classic resample-and-splice method: the hard-tune sound, at about 1 ms.
-- **Key and scale** (13 scales) with **per-note states**: *On* (snap to it), *Bypass* (leave pitch near it untouched), *Remove* (pull to a neighbour).
+- **Key and scale** (24 scales, including Bitwig's full scale set) with **per-note states**: *On* (snap to it), *Bypass* (leave pitch near it untouched), *Remove* (pull to a neighbour).
 - **The familiar controls:** Retune speed, Note transition, Humanize, Flex-Tune, Amount, Tolerance, Snap min/max, Detune, Transpose, Formant shift (± 12 st, cleanest within ± 3), Tracking and input gate.
 - **Vibrato-aware correction.** Skatotune separates each note's centre from its vibrato, tunes the centre and puts the singer's vibrato back, so hard tuning no longer flattens vibrato unless you want it to (Vibrato depth −100 … 200 %). Optional synthetic vibrato.
 - **MIDI target notes.** Play the notes you want (*Target*), teach the plugin a scale from MIDI (*Learn*, saved with the project), or fall back to the scale when no key is held (*Auto*). Pitch bend and sustain work.

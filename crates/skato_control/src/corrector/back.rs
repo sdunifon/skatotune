@@ -40,6 +40,9 @@ pub(super) struct BackState {
     grace: u32,
     /// Studio: hops after an onset during which the onset note is kept.
     onset_hold: u32,
+    /// Voiced hops the current note keeps its target although a scale change
+    /// removed it (the key-change hold; 0 = none).
+    pub(super) key_hold: u32,
     /// Voiced weight of the output shift (5 ms ramp to Transpose when unvoiced).
     u: f32,
     /// Last voiced shift before Transpose (c + vibrato scaling + LFO).
@@ -128,6 +131,7 @@ impl Corrector {
         // skipped the frame that carried the forget.
         if f.forget || (f.onset && self.be.note.is_some()) {
             self.be.note = None;
+            self.be.key_hold = 0;
             self.be.onset_hold = 0;
             self.be.trans = false;
             self.be.g_s = 0.0;
@@ -167,6 +171,7 @@ impl Corrector {
         if pass {
             // MIDI Target with nothing held: pass through untuned (c → 0, 50 ms).
             self.be.note = None;
+            self.be.key_hold = 0;
             self.be.trans = false;
             self.be.was_pass = true;
             self.be.midi_armed = false;
@@ -341,6 +346,12 @@ impl Corrector {
         };
 
         if !self.targets.is_allowed(cur) {
+            if self.be.key_hold > 0 {
+                // A key change removed the note being sung: it keeps its
+                // target until the next note starts or the hold runs out.
+                self.be.key_hold -= 1;
+                return Change::Keep;
+            }
             // Scale or MIDI change removed the current note.
             let pick = if hmm { self.hmm.argmax(rel).map(|(n, _)| n) } else { None };
             return pick.or_else(|| self.targets.nearest(rel)).map_or(Change::Keep, Change::Switch);
@@ -487,6 +498,7 @@ impl Corrector {
 
     fn start_note(&mut self, n: usize, transition: bool) {
         self.be.note = Some(n);
+        self.be.key_hold = 0;
         self.be.trans = transition;
         self.be.t_note = 0;
         self.be.g_s = 0.0;

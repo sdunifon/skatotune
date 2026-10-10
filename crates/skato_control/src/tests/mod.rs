@@ -1,6 +1,7 @@
 //! Contract tests for the control law (DESIGN §3.3): synthetic
 //! `PitchEstimate` sequences in, `ControlOutput`s checked against R§7.6.
 
+mod key_change;
 mod midi;
 mod note_intent;
 mod notes;
