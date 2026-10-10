@@ -18,6 +18,7 @@
 //! skato_eval note-intent dump --configs live_hq --split dev --out <file.f32>
 //! skato_eval note-intent dump-synth --configs live_hq --n 400 --seed0 50000 --out <file.f32>
 //! skato_eval note-intent convert-model <in.ldm> <out.skgb>
+//! skato_eval autokey [--per-key 4] [--seconds 60] [--no-sweep] [--data ..] [--out out/autokey] [--cache ..]
 //! ```
 //!
 //! Exit codes: 0 success, 1 a gate failed (latency mismatch, rt-bench over
@@ -34,6 +35,7 @@ use skato_eval::reference::{ReferenceConfig, ReferenceTracker};
 use skato_eval::render::{self, BlockPattern, RenderOptions};
 use skato_eval::rtbench::{self, RtBenchOptions};
 use skato_eval::suite::{self, SuiteOptions, WavPolicy};
+use skato_eval::autokey::{self, AutoKeyOptions};
 use skato_eval::note_intent::{self, NoteIntentOptions, System};
 use skato_eval::vocadito::{self, Condition, RunConfig, VocaditoOptions};
 use skato_eval::{scenarios, wav};
@@ -104,6 +106,10 @@ USAGE:
       per-hop features and annotations of the split's vocadito files, or of synthetic lines.
   skato_eval note-intent convert-model <in.ldm> <out.skgb>
       Convert a trained candidate tree ensemble (LDMODEL text) to the embedded format.
+  skato_eval autokey [--per-key 4] [--seconds 60] [--no-sweep] [--data data/vocadito] [--out out/autokey]
+                     [--cache out/note-intent/cache] [--threads N]
+      Auto-Key: tune on DEV (synthetic melodies in 36 keys + vocadito DEV), then report TEST once
+      against classic Krumhansl-Schmuckler key finding. Writes report.md under --out.
 ";
 
 /// Flags that take no value.
@@ -116,6 +122,7 @@ const SWITCHES: &[&str] = &[
     "no-content",
     "note-hold",
     "follow-singer",
+    "no-sweep",
 ];
 
 struct Args {
@@ -295,6 +302,7 @@ fn main() -> ExitCode {
         "rt-bench" | "rtbench" => cmd_rt_bench(&args),
         "vocadito" => cmd_vocadito(&args),
         "note-intent" => cmd_note_intent(&args),
+        "autokey" | "auto-key" => cmd_autokey(&args),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(true)
@@ -819,6 +827,23 @@ fn parse_cents(s: &str) -> Result<f32, String> {
         .ok()
         .filter(|v| (0.0..=45.0).contains(v))
         .ok_or_else(|| format!("bad Tolerance {s} (0-45 c)"))
+}
+
+fn cmd_autokey(args: &Args) -> CmdResult {
+    let d = AutoKeyOptions::default();
+    let opts = AutoKeyOptions {
+        data: args.get("data").map_or(d.data.clone(), PathBuf::from),
+        out: args.get("out").map_or(d.out.clone(), PathBuf::from),
+        cache: args.get("cache").map(PathBuf::from),
+        per_key: args.get("per-key").map(parse_usize).transpose()?.unwrap_or(d.per_key),
+        dur_s: args.get("seconds").map(|s| s.parse::<f32>()).transpose()?.unwrap_or(d.dur_s),
+        threads: args.get("threads").map(parse_usize).transpose()?.unwrap_or(d.threads),
+        no_sweep: args.has("no-sweep"),
+    };
+    let report = autokey::run(&opts, &|m: &str| eprintln!("{m}"))?;
+    print!("{report}");
+    println!("wrote {}", opts.out.join("report.md").display());
+    Ok(true)
 }
 
 fn cmd_note_intent(args: &Args) -> CmdResult {

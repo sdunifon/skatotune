@@ -101,6 +101,7 @@
 //! loop is bounded by the block length (DESIGN §2.1). A counting-allocator test
 //! binary (`tests/no_alloc.rs`) proves it.
 
+pub use skato_control::{KeyConfig, KeyDetector, KeyName, KeyReading};
 use rtrb::{Consumer, Producer, RingBuffer};
 use skato_control::{ControlOutput, Corrector, CorrectorConfig};
 use skato_core::{
@@ -669,6 +670,40 @@ impl Engine {
     /// release freezes.
     pub fn note_hold_stats(&self) -> skato_control::NoteHoldStats {
         self.corrector.note_hold_stats()
+    }
+
+    /// Auto-Key (forwarded from the corrector): the proposed key, its
+    /// confidence and the confirmed key the Detect key source follows.
+    pub fn key_reading(&self) -> skato_control::KeyReading {
+        self.corrector.key_reading()
+    }
+
+    /// The Auto-Key detector's state, to carry into a rebuilt engine
+    /// ([`Self::set_key_detector`]). It survives [`Self::reset`].
+    pub fn key_detector(&self) -> &skato_control::KeyDetector {
+        self.corrector.key_detector()
+    }
+
+    /// Continue Auto-Key from another engine's detector (same control hop,
+    /// i.e. the same sample rate). Copies fixed-size state; no allocation.
+    pub fn set_key_detector(&mut self, detector: &skato_control::KeyDetector) {
+        self.corrector.set_key_detector(detector);
+    }
+
+    /// Restore an Auto-Key confirmed key saved with the project.
+    pub fn seed_key(&mut self, key: skato_control::KeyName) {
+        self.corrector.seed_key(key);
+    }
+
+    /// Forget everything Auto-Key has heard.
+    pub fn clear_key(&mut self) {
+        self.corrector.clear_key();
+    }
+
+    /// Evaluation: tune the Auto-Key detector.
+    #[doc(hidden)]
+    pub fn set_key_config(&mut self, cfg: skato_control::KeyConfig) {
+        self.corrector.set_key_config(cfg);
     }
 
     // -----------------------------------------------------------------------

@@ -16,9 +16,10 @@ Skatotune is a research-heavy project: most design decisions rest on measurement
 | [Architecture research](../research.md) | 2026-10-08 | Baseline for v1 (verified) | DSP beats neural for live tuning (neural trackers need 32-176 ms lookahead); pitch-synchronous E/H + FFT NSDF/CMNDF + causal HMM detector; causal PSOLA (Live) / lookahead PSOLA (Studio) / Classic splice; Auto-Tune-style control law with vibrato split; latency × quality grid; evaluation plan; IP review | #6, #7, #8, #9, #13, #14, #15, #27 |
 | [Rust performance and real-time engineering](../rust-performance.md) | 2026-10-08 | Baseline (verified) | FFT-first kernels, SIMD layers, fast math, denormals, allocation-free design, worker-thread pool with macOS work intervals, the performance/RT-safety test plan | #13, #28, #29, #31 |
 | [Performance evidence](../PERFORMANCE.md) | 2026-10-09 | Living document | Measured kernel and engine costs; FFT route 3.7-11× vs direct SIMD; hand NEON only 2-5 % end to end; vDSP slower end to end; `target-cpu=native`/PGO ≈ 0 % | #28, #29 |
-| [Following the DAW's key](host-key-scale.md) | 2026-10-09 | Done, design awaiting decisions | No DAW sends its key to third-party plugins today (CLAP has no extension; VST3 `kScaleEvent` exists but no host is documented as sending it); Key Source design (Manual / Host / MIDI Scale / Detect); Bitwig Key Filter+ → MIDI workaround | #5, #6, #7, #30 |
+| [Following the DAW's key](host-key-scale.md) | 2026-10-09 | Done; decisions made 2026-10-10 and implemented (Key Source: Manual / MIDI Scale / Detect) | No DAW sends its key to third-party plugins today (CLAP has no extension; VST3 `kScaleEvent` exists but no host is documented as sending it); Key Source design (Manual / Host / MIDI Scale / Detect); Bitwig Key Filter+ → MIDI workaround | #5, #6, #7, #30 |
 | [Graph / editing mode](graph-mode.md) | 2026-10-09 | Done, 11 open questions | Neither Bitwig nor Live hosts ARA, so in-host graph mode must be capture-based; recommended MVP: capture pitch, analyse offline, edit Melodyne-style notes, play back from a timeline; about 9-14 engineer-weeks | #10, #11, #7, #21 |
 | [Note intent](note-intent.md) (deciding which note a singer means) | 2026-10-09 | Done, audited (sound with caveats); implemented as two Labs options (off by default) and the `skato_eval note-intent` harness | With pitch alone nothing beats raising Tolerance; a learned switch veto plus a release freeze halves warble and lowers held-note error in Live HQ, at a ~3-point cost in per-note accuracy; onset glitches are mostly a shifter problem | #7, #6, #10, #14, #16, #26 |
+| [Auto-Key and Key Source](auto-key.md) | 2026-10-10 | Done, implemented; real-singing evidence thin | Pitch-class-set likelihood beats classic key profiles on synthetic melodies (99.3 % vs ≤ 66.7 %, confident proposals 99.9 % right, median 12 s); on vocadito's ~12 s takes no method is reliable and Auto-Key confirms nothing; a latched MIDI chord is how a DAW's key reaches the plugin | #6, #5, #7, #26, #10, #12 |
 | Latency deep dive | queued | Not started | Goal: formant-preserving Live mode at or below Auto-Tune's ~2.3 ms | #8, #9, #15 |
 | Perceptual test suite | queued | Not started | Make the test suite measure what listeners hear | #26, #12 |
 | Apple Silicon and the Neural Engine | queued | Not started | Viability of Neural Engine / BNNS Graph / SME2 / Accelerate for live and offline work | #28, #29, #27, #14 |
@@ -33,6 +34,7 @@ Arrows mean "findings from A feed B". Numbers are GitHub issues.
 ```mermaid
 flowchart LR
   K5["#5 DAW key"] --> K6["#6 Auto-Key"]
+  K6 --> P26
   K6 --> N7["#7 Note intent"]
   K5 --> N7
   N7 --> G10["#10 Graph mode"]

@@ -1,5 +1,7 @@
 # Following the DAW's key in Skatotune: Bitwig 6 and other hosts
 
+> **Status (2026-10-10):** decisions made (recommended options on all four; Bitwig's scales added) and implemented as the Key Source setting: Manual / MIDI Scale / Detect. See [auto-key.md](auto-key.md) for the implementation and the Auto-Key evaluation. The Host source waits for a DAW that sends its key.
+
 ## Short answer
 
 - **No, Skatotune can't follow the "C Major" in Bitwig 6's transport bar, and no third-party plugin can today.** The readout is Bitwig's project key. It is made of two transport parameters, Root Note and Scale. You can pick from 23 scales, automate them, and modulate them from the master track ([6.0 notes](https://downloads.bitwig.com/6.0/Release-Notes-6.0.html)). Bitwig only passes the key to its own devices:

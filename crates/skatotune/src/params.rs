@@ -369,6 +369,23 @@ impl From<AnalysisChoice> for AnalysisChannel {
     }
 }
 
+/// Where the base scale comes from ([`crate::keysource`]).
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySourceChoice {
+    /// Key + Scale (or a MIDI-learned scale).
+    #[id = "manual"]
+    #[name = "Manual"]
+    Manual,
+    /// A chord on the MIDI input sets the scale and stays latched.
+    #[id = "midi-scale"]
+    #[name = "MIDI Scale"]
+    MidiScale,
+    /// Auto-Key's confirmed key.
+    #[id = "detect"]
+    #[name = "Detect"]
+    Detect,
+}
+
 /// MIDI target mode. Mirrors [`MidiMode`].
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidiModeChoice {
@@ -464,6 +481,8 @@ pub struct ParamValues {
     pub lfo_ramp_ms: f32,
 
     pub midi_mode: MidiModeChoice,
+    /// Where the base scale comes from (a mode, not automatable).
+    pub key_source: KeySourceChoice,
     pub midi_all_octaves: bool,
     /// Pitch-bend range, semitones (0-12).
     pub bend_range_st: f32,
@@ -512,6 +531,7 @@ impl Default for ParamValues {
             lfo_delay_ms: 250.0,
             lfo_ramp_ms: 300.0,
             midi_mode: MidiModeChoice::Off,
+            key_source: KeySourceChoice::Manual,
             midi_all_octaves: false,
             bend_range_st: 2.0,
             output_gain_db: 0.0,
@@ -1021,6 +1041,9 @@ pub struct SkatotuneParams {
     // --- MIDI -------------------------------------------------------------------------------
     #[id = "midi_mode"]
     pub midi_mode: EnumParam<MidiModeChoice>,
+    /// Manual / MIDI Scale / Detect. Saved with the project, not automatable.
+    #[id = "key_source"]
+    pub key_source: EnumParam<KeySourceChoice>,
     #[id = "midi_all_octaves"]
     pub midi_all_octaves: BoolParam,
     #[id = "bend_range"]
@@ -1031,6 +1054,14 @@ pub struct SkatotuneParams {
     /// with the project; engine resets and rebuilds never clear it.
     #[persist = "learned-scale"]
     pub learned_scale: AtomicU32,
+    /// The chord MIDI Scale latched ([`crate::keysource`] word), so a project
+    /// reloads in key before anything is played.
+    #[persist = "midi-scale"]
+    pub midi_scale: AtomicU32,
+    /// Auto-Key's confirmed key ([`crate::keysource`] word), restored into
+    /// the engine at activation (shown as saved until the singing confirms it).
+    #[persist = "detected-key"]
+    pub detected_key: AtomicU32,
     /// Experiments switched in the LABS menu ([`crate::labs`]). Saved with
     /// the project; never read on the audio thread (see `labs_sound`).
     #[persist = "labs"]
@@ -1156,10 +1187,13 @@ impl SkatotuneParams {
             analysis_channel: EnumParam::new("Analysis Channel", d.analysis_channel),
 
             midi_mode: EnumParam::new("MIDI Mode", d.midi_mode),
+            key_source: EnumParam::new("Key Source", d.key_source).non_automatable(),
             midi_all_octaves: BoolParam::new("MIDI All Octaves", d.midi_all_octaves),
             bend_range: linear("Bend Range", d.bend_range_st, 0.0, 12.0, " st", 0)
                 .with_step_size(1.0),
             learned_scale: AtomicU32::new(0),
+            midi_scale: AtomicU32::new(0),
+            detected_key: AtomicU32::new(0),
             labs: RwLock::new(LabsSettings::default()),
             labs_sound: AtomicU32::new(LabsSettings::DEFAULT.sound_bits()),
         }
@@ -1260,6 +1294,7 @@ impl SkatotuneParams {
             lfo_delay_ms: self.lfo_delay.value(),
             lfo_ramp_ms: self.lfo_ramp.value(),
             midi_mode: self.midi_mode.value(),
+            key_source: self.key_source.value(),
             midi_all_octaves: self.midi_all_octaves.value(),
             bend_range_st: self.bend_range.value(),
             output_gain_db: self.output_gain_db.value(),
@@ -1522,7 +1557,7 @@ mod tests {
         let p = SkatotuneParams::default();
         let map = p.param_map();
         let mut hashes: Vec<u32> = map.iter().map(|(id, _, _)| hash(id)).collect();
-        assert_eq!(map.len(), 49, "the full parameter set");
+        assert_eq!(map.len(), 50, "the full parameter set");
         assert!(hashes.iter().all(|&h| h < midi_start));
         hashes.sort_unstable();
         hashes.dedup();

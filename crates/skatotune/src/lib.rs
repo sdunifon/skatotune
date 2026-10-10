@@ -54,12 +54,14 @@ use skato_engine::Engine;
 
 pub mod editor;
 pub mod labs;
+pub mod keysource;
 pub mod learn;
 pub mod midi;
 pub mod params;
 pub mod shared;
 pub mod swap;
 
+use keysource::MidiScaleTracker;
 use learn::LearnTracker;
 use midi::MidiBuffer;
 use params::{ParamValues, Structural, SkatotuneParams};
@@ -109,6 +111,10 @@ pub struct Skatotune {
     reported_latency: u32,
     midi: MidiBuffer,
     learn: LearnTracker,
+    /// MIDI Scale chord latch (audio thread).
+    midi_scale: MidiScaleTracker,
+    /// Key Source of the previous block (a change re-arms the chord latch).
+    last_key_source: Option<params::KeySourceChoice>,
     /// Consecutive quiet input samples (CLAP sleep decision).
     quiet_run: u64,
     /// Audio-thread half of the engine handoff.
@@ -178,6 +184,8 @@ impl Default for Skatotune {
             reported_latency: 0,
             midi: MidiBuffer::default(),
             learn: LearnTracker::default(),
+            midi_scale: MidiScaleTracker::default(),
+            last_key_source: None,
             quiet_run: 0,
             swap: swap_audio,
             builder: Arc::new(EngineBuilder::new(swap_builder)),
@@ -251,6 +259,16 @@ impl Skatotune {
             // A fresh engine starts silent; no swap fade applies to it.
             self.fade = SwapFade::new(sample_rate);
             let mut engine = Box::new(Engine::new(cfg));
+            // Auto-Key keeps what it has heard across a rebuild at the same
+            // rate; otherwise it starts from the key saved with the project.
+            match self.engine.as_ref().filter(|old| old.config().sample_rate == cfg.sample_rate) {
+                Some(old) => engine.set_key_detector(old.key_detector()),
+                None => {
+                    if let Some(k) = keysource::unpack_key(self.params.detected_key.load(Ordering::Relaxed)) {
+                        engine.seed_key(k);
+                    }
+                }
+            }
             if let Some(consumer) = engine.take_telemetry() {
                 self.shared.install_telemetry(consumer);
             }
@@ -369,10 +387,26 @@ impl Skatotune {
         };
         self.midi.begin_block(hop, phase);
         self.learn.begin_block(values.midi_mode);
+        let following_midi = values.key_source == params::KeySourceChoice::MidiScale;
+        if self.last_key_source != Some(values.key_source) {
+            self.midi_scale.reset();
+            self.last_key_source = Some(values.key_source);
+        }
+        let sr = self.active.map_or(48_000.0, |a| a.sample_rate);
         let block_len = u32::try_from(samples).unwrap_or(u32::MAX);
         while let Some(ev) = host.next_event() {
             if let Some(m) = midi::convert_event(&ev, block_len) {
-                self.learn.event(&m.event, &self.params.learned_scale);
+                if matches!(m.event, skato_core::MidiEvent::NoteOn { velocity, .. } if velocity > 0.0) {
+                    self.shared.midi_note_ons.fetch_add(1, Ordering::Relaxed);
+                }
+                if following_midi {
+                    let pos = self.engine_pos.wrapping_add(u64::from(m.timing));
+                    if self.midi_scale.event(&m.event, pos, sr, &self.params.midi_scale) {
+                        self.shared.midi_latched.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    self.learn.event(&m.event, &self.params.learned_scale);
+                }
                 self.midi.push(m);
             }
         }
@@ -387,8 +421,19 @@ impl Skatotune {
         };
         let editor_open = self.editor_state.is_open();
         let learned_word = self.params.learned_scale.load(Ordering::Relaxed);
+        if self.shared.key_clear.swap(false, Ordering::AcqRel) {
+            engine.clear_key();
+            self.params.detected_key.store(0, Ordering::Relaxed);
+        }
+        let reading = engine.key_reading();
         let mut settings = values.to_settings();
-        learn::apply(&mut settings, values.midi_mode, learned_word);
+        let in_effect = keysource::apply(
+            &mut settings,
+            values,
+            learned_word,
+            self.params.midi_scale.load(Ordering::Relaxed),
+            reading.confirmed,
+        );
         // Labs experiments that change the sound, from their lock-free
         // mirror (applies with the editor closed and after a reload).
         labs::apply_sound(&mut settings, self.params.labs_sound_bits());
@@ -446,6 +491,7 @@ impl Skatotune {
         self.shared
             .learned_states
             .store(pack_states(learn::unpack(learned_word)), Ordering::Relaxed);
+        publish_key(engine, &self.shared, &self.params, in_effect);
         self.shared
             .telemetry_dropped
             .store(engine.stats().telemetry_dropped, Ordering::Relaxed);
@@ -519,6 +565,10 @@ impl Skatotune {
         };
         let latency = engine.latency_samples();
         let old = self.engine.replace(engine);
+        // Same activation, same rate: Auto-Key continues (fixed-size copy).
+        if let (Some(new), Some(old)) = (self.engine.as_mut(), old.as_ref()) {
+            new.set_key_detector(old.key_detector());
+        }
         self.engine_pos = 0;
         self.active = Some(Active {
             structural: wanted,
@@ -868,6 +918,24 @@ impl Vst3Plugin for Skatotune {
 
 nice_export_clap!(Skatotune);
 nice_export_vst3!(Skatotune);
+
+/// Auto-Key and the Key Source for the editor, and a newly confirmed key
+/// into the saved state (audio thread; atomic loads and stores only).
+fn publish_key(engine: &Engine, shared: &SharedState, params: &SkatotuneParams, in_effect: keysource::InEffect) {
+    let r = engine.key_reading();
+    shared.key_proposal.store(r.proposal.map_or(0, keysource::pack_key), Ordering::Relaxed);
+    shared.key_confidence.store(r.confidence, Ordering::Relaxed);
+    shared.key_evidence.store(r.evidence_s, Ordering::Relaxed);
+    let saved = if r.saved { keysource::KEY_SAVED } else { 0 };
+    shared.key_confirmed.store(r.confirmed.map_or(0, |k| keysource::pack_key(k) | saved), Ordering::Relaxed);
+    shared.key_in_effect.store(keysource::pack_in_effect(in_effect), Ordering::Relaxed);
+    if let Some(k) = r.confirmed.filter(|_| !r.saved) {
+        let w = keysource::pack_key(k);
+        if params.detected_key.load(Ordering::Relaxed) != w {
+            params.detected_key.store(w, Ordering::Relaxed);
+        }
+    }
+}
 
 #[cfg(test)]
 // Tests read best as "defaults, then change what matters".
@@ -1533,6 +1601,112 @@ mod tests {
         let judged = hold.engine.as_ref().map_or(0, |e| e.note_hold_stats().proposals);
         assert!(judged > 0, "the learned veto ran");
         assert_eq!(plain.engine.as_ref().map(|e| e.note_hold_stats().proposals), Some(0));
+    }
+
+    fn note_off(timing: u32, key: u8) -> NoteEvent<()> {
+        NoteEvent::NoteOff {
+            timing,
+            voice_id: VoiceID::Wildcard,
+            channel: Channel::Number(0),
+            key: Key::Number(key),
+            velocity: 0.0,
+        }
+    }
+
+    /// F4 + 30 c: corrected to F# in D major (or to a D-F#-A chord).
+    const F4_SHARPISH: f32 = 349.228 * 1.017_478_8;
+    const FS4: f32 = 369.994;
+
+    /// #5 MIDI Scale: a chord on the MIDI input sets the scale, stays latched
+    /// after its release, overrides MIDI Target (its notes are not targets),
+    /// and is saved with the project.
+    #[test]
+    fn midi_scale_latches_a_chord_tunes_to_it_and_saves_it() {
+        let mut v = ParamValues::default();
+        v.key_source = params::KeySourceChoice::MidiScale;
+        v.midi_mode = params::MidiModeChoice::Target;
+        v.retune_ms = 0.0;
+        let mut p = Skatotune::default();
+        p.activate_with(&v, 48_000.0, 512, 2);
+        let mut host = FakeHost::default();
+        for k in [62u8, 66, 69] {
+            host.events.push(note_on(0, k)); // D F# A
+        }
+        run_signal(&mut p, &v, &mut host, &[0.0; 512]);
+        for (i, k) in [69u8, 62, 66].into_iter().enumerate() {
+            host.events.push(note_off(100 * i as u32, k));
+        }
+        run_signal(&mut p, &v, &mut host, &[0.0; 512]);
+        let d_chord = (1u16 << 2) | (1 << 6) | (1 << 9);
+        assert_eq!(keysource::unpack_midi(p.params.midi_scale.load(Ordering::Relaxed)), Some((d_chord, 2)));
+        let mut t0 = 0;
+        let y = render(&mut p, &v, &mut host, F4_SHARPISH, 0.6, 512, &mut t0);
+        let c = cents(tail_pitch(&y), FS4);
+        assert!(c.abs() < 10.0, "tuned to the latched chord: {c:+.1} c from F#");
+        assert_eq!(
+            keysource::unpack_in_effect(p.shared.key_in_effect.load(Ordering::Relaxed)),
+            keysource::InEffect::Midi { mask: d_chord, bass: 2 }
+        );
+        // A reloaded project is in key before any MIDI arrives.
+        let saved = p.params.serialize_fields();
+        let mut q = Skatotune::default();
+        q.params.deserialize_fields(&saved);
+        q.activate_with(&v, 48_000.0, 512, 2);
+        let mut t0 = 0;
+        let y = render(&mut q, &v, &mut FakeHost::default(), F4_SHARPISH, 0.6, 512, &mut t0);
+        assert!(cents(tail_pitch(&y), FS4).abs() < 10.0, "after a reload");
+    }
+
+    /// #6 Detect: a confirmed key saved with the project is restored into the
+    /// engine at activation and tunes at once (marked as saved until the
+    /// singing confirms it).
+    #[test]
+    fn a_detected_key_saved_with_the_project_is_in_force_after_a_reload() {
+        let mut v = ParamValues::default();
+        v.key_source = params::KeySourceChoice::Detect;
+        v.retune_ms = 0.0;
+        let d_major = skato_engine::KeyName::new(2, skato_core::ScaleKind::Major);
+        let first = Skatotune::default();
+        first.params.detected_key.store(keysource::pack_key(d_major), Ordering::Relaxed);
+        let saved = first.params.serialize_fields();
+        let mut p = Skatotune::default();
+        p.params.deserialize_fields(&saved);
+        p.activate_with(&v, 48_000.0, 512, 2);
+        let mut t0 = 0;
+        let y = render(&mut p, &v, &mut FakeHost::default(), F4_SHARPISH, 0.6, 512, &mut t0);
+        assert!(cents(tail_pitch(&y), FS4).abs() < 10.0, "D major: F is corrected to F#");
+        let w = p.shared.key_confirmed.load(Ordering::Relaxed);
+        assert_eq!(keysource::unpack_key(w & !keysource::KEY_SAVED), Some(d_major));
+        assert_ne!(w & keysource::KEY_SAVED, 0, "shown as saved");
+        assert_eq!(
+            keysource::unpack_in_effect(p.shared.key_in_effect.load(Ordering::Relaxed)),
+            keysource::InEffect::Detect(d_major)
+        );
+    }
+
+    /// Auto-Key keeps what it heard through an engine reset (CLAP sleep/wake,
+    /// transport) and through a rebuild at the same sample rate.
+    #[test]
+    fn auto_key_survives_engine_resets_and_rebuilds() {
+        let v = ParamValues::default();
+        let mut p = Skatotune::default();
+        p.activate_with(&v, 48_000.0, 512, 2);
+        let mut t0 = 0;
+        for hz in [220.0, 246.94, 261.63, 293.66] {
+            render(&mut p, &v, &mut FakeHost::default(), hz, 0.5, 512, &mut t0);
+        }
+        let heard = p.engine.as_ref().map(|e| e.key_reading().evidence_s).unwrap_or(0.0);
+        assert!(heard > 0.5, "{heard}");
+        if let Some(e) = p.engine.as_mut() {
+            e.reset();
+        }
+        assert_eq!(p.engine.as_ref().map(|e| e.key_reading().evidence_s), Some(heard));
+        // A structural rebuild in activate() at the same rate continues it.
+        let mut studio = v;
+        studio.latency_mode = params::LatencyModeChoice::Studio;
+        p.activate_with(&studio, 48_000.0, 512, 2);
+        let after = p.engine.as_ref().map(|e| e.key_reading().evidence_s);
+        assert_eq!(after, Some(heard), "carried into the new engine");
     }
 
     /// HI-4: the learned scale is part of the saved plugin state.

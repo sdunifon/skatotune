@@ -31,6 +31,8 @@ State of the tree on 2026-10-09, after the hardening pass (onsets, sustained not
   - Retune one-pole on the correction, transition τ, Humanize, Flex-Tune, Snap Min/Max.
   - Centre/vibrato split with Vibrato Depth, synthetic vibrato, Transpose/Detune.
   - MIDI Target, Learn and Auto, plus pitch bend.
+  - A scale change that removes the note being sung keeps its target until the next note starts (at most 200 ms).
+  - Auto-Key (`autokey.rs`, `docs/research/auto-key.md`): pitch-class-set likelihood over a decaying histogram of the sung, vibrato-free centre, with posterior confidence; the confirmed key changes only after a new key has led for 8 s, between phrases. It survives engine resets and rebuilds. Synthetic TEST (36 keys, 60 s): set right at the end 99.3 % (classic Krumhansl-Schmuckler ≤ 66.7 %), confident proposals right 99.9 %, median 12 s to a confident, correct proposal. vocadito (12 short takes): 41.7 %, with no key confirmed; 75 ns per hop.
   - Studio decides with up to 40 ms of lookahead, takes the pitch that sets the shift from a slightly newer frame (matching the shifter's ratio timing), and ignores note crossings that return within the lookahead.
 - **Engine** (`skato_engine`):
   - Processing: block-size-invariant, allocation-free, NaN-safe.
@@ -38,11 +40,12 @@ State of the tree on 2026-10-09, after the hardening pass (onsets, sustained not
   - Voice-range changes that keep the latency are applied at runtime (`Engine::set_voice_range`).
   - Telemetry for the GUI.
 - **GUI** (egui): scrolling piano-roll pitch graph, cents meter, scale keyboard (with MIDI Learn, CLEAR and KEEP), knobs, mode/tier selectors, CPU readout and a latency readout ("X ms reported" plus "heard avg").
+- **Key Source** (`keysource.rs`, #5): Manual / MIDI Scale (a latched chord from the MIDI input; how a DAW's key reaches the plugin, e.g. Bitwig via Key Filter+) / Detect (Auto-Key). Per-note overrides apply on top as absolute pitch classes; the latched chord and the confirmed key are saved with the project. 24 scales, including Bitwig's set. Sidebar: MANUAL / MIDI / DETECT switch and a status line with APPLY / COPY.
 - **Labs** (opt-in, saved with the project): correction coloring (ribbon, heat line, five themes), and two options that change the sound, off by default (`docs/research/note-intent.md`): **Learned note hold** (HQ/Max, scale targets: a learned switch veto, a release freeze and, in Studio, the onset note from the late lookahead; Live HQ hard chromatic on the TEST singers: warble 50.0 → 24.0 per minute, stable p95 25.6 → 20.2 c, frame accuracy 70.5 → 73.8 %, per-note accuracy 79.7 → 76.5 %) and **Follow singer's tuning**. The sound options reach the audio thread through a lock-free saved copy, so they apply with the editor closed and after a reload.
 - **Evaluation** (`skato_eval`):
   - Synthetic singing with exact ground truth, two held-out scenarios, and real singing (vocadito).
   - Gates as tests (`tests/quality_gates.rs`).
-  - CLI: `suite`, `vocadito`, `note-intent`, `latency`, `rt-bench`, `render`, `synth`, `track`.
+  - CLI: `suite`, `vocadito`, `note-intent`, `autokey`, `latency`, `rt-bench`, `render`, `synth`, `track`.
   - Note-intent harness (`note-intent`): cached detector streams of vocadito replayed through the control law on a fixed DEV/TEST split, scored against both annotators, with the frontier yardstick; `note-intent synth` for the synthetic scenarios; the learned veto's training pipeline (`dump`, `dump-synth`, `convert-model`, `tools/note_intent/train_veto.py`).
 - **Distribution:** ISC `LICENSE` at the repo root; every bundle carries `THIRD-PARTY-NOTICES.txt` and `LICENSE.txt` (`cargo xtask notices`).
 

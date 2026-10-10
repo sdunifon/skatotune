@@ -38,6 +38,7 @@
 //! `midi` and `process_hop` never allocate, lock, log or panic, and every loop
 //! is bounded (at most 128 notes × the jump band, or the lookahead length).
 
+pub mod autokey;
 mod clock;
 mod corrector;
 pub mod intent;
@@ -54,6 +55,7 @@ mod vibrato;
 #[cfg(test)]
 mod tests;
 
+pub use autokey::{KeyConfig, KeyDetector, KeyName, KeyReading};
 pub use corrector::Corrector;
 pub use intent::NoteHoldStats;
 pub use skato_core::{LatencyMode, MidiEvent, PitchEstimate, PitchFrame, ReferenceMode, Settings, ShiftControl};

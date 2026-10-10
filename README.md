@@ -3,7 +3,7 @@
 **Open-source real-time vocal pitch correction, written in Rust.** Skatotune is a VST3 and CLAP plugin (plus a standalone app) that tunes a singing voice live. It has a formant-preserving natural mode, a classic hard-tune mode, and a scrolling pitch graph that shows exactly what it is doing to your voice.
 
 <p align="center">
-  <img src="docs/images/hero.png" width="880" alt="Skatotune's editor: the scrolling pitch graph with the sung pitch (white), the vibrato-free centre (blue), the corrected output (green) over target-note bars, with the correction shaded underneath; key and scale editor on the left, knobs along the bottom.">
+  <img src="docs/images/hero.png" width="880" alt="Skatotune's editor: the scrolling pitch graph with the sung pitch (white), the vibrato-free centre (blue), the corrected output (green) over target-note bars, with the correction shaded underneath; on the left the Key Source switch (Manual, MIDI, Detect), key and scale, Auto-Key's status (the key it hears matches the one set) and the scale editor; knobs along the bottom.">
   <br><sub>The editor with the Hard Tune preset, rendered from the plugin's GUI using its built-in demo data.</sub>
 </p>
 
@@ -31,6 +31,7 @@
 - **The familiar controls:** Retune speed, Note transition, Humanize, Flex-Tune, Amount, Tolerance, Snap min/max, Detune, Transpose, Formant shift (± 12 st, cleanest within ± 3), Tracking and input gate.
 - **Vibrato-aware correction.** Skatotune separates each note's centre from its vibrato, tunes the centre and puts the singer's vibrato back, so hard tuning no longer flattens vibrato unless you want it to (Vibrato depth −100 … 200 %). Optional synthetic vibrato.
 - **MIDI target notes.** Play the notes you want (*Target*), teach the plugin a scale from MIDI (*Learn*, saved with the project), or fall back to the scale when no key is held (*Auto*). Pitch bend and sustain work.
+- **Key Source: follow a key instead of setting it.** *MIDI Scale* latches a chord from the MIDI input, which is how a DAW's key reaches the plugin (in Bitwig, route all 12 notes through Key Filter+ with Use Global Key). *Detect* follows **Auto-Key**, which listens to the singing, proposes a key with its confidence ("Detected Am 86 % · Apply") and, when you choose Detect, switches only after a new key has clearly taken over, and only between phrases ([how it works and how well](docs/research/auto-key.md)). A note you're holding keeps its target through a key change until the next note.
 - **Presets:** Hard Tune, Natural, Live Safe, Classic.
 
 **Latency and quality you choose separately**
@@ -126,7 +127,7 @@ The analysis never delays the audio: only the shifter needs lookahead, and that 
 The design rests on a large literature review, adversarial fact-checking and measurements, collected in the [research library](docs/research/README.md):
 - [Architecture research](docs/research.md): every detector, shifter and control-law option considered, with evidence and sources.
 - [Rust performance research](docs/rust-performance.md) and the measured [performance evidence](docs/PERFORMANCE.md).
-- Topic reports: [following the DAW's key](docs/research/host-key-scale.md), [graph/editing mode](docs/research/graph-mode.md), and the [technique registry](docs/research/TECHNIQUES.md).
+- Topic reports: [following the DAW's key](docs/research/host-key-scale.md), [Auto-Key](docs/research/auto-key.md), [note intent](docs/research/note-intent.md), [graph/editing mode](docs/research/graph-mode.md), and the [technique registry](docs/research/TECHNIQUES.md).
 
 ## How well it works
 

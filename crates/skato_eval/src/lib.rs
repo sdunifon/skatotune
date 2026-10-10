@@ -21,6 +21,7 @@
 //!
 //! The `skato_eval` binary (`src/main.rs`) exposes all of this on the command line.
 
+pub mod autokey;
 pub mod dsp;
 pub mod metrics;
 pub mod note_intent;

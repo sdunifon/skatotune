@@ -4,7 +4,7 @@ Every technique the research has evaluated, with where it came from, how strong 
 
 **Status:** **Adopted** (in the plugin) · **Candidate** (promising, not built) · **Prototyped** (built in a scratch copy and measured) · **Rejected** (with the reason) · **Unknown** (research pending).
 
-Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performance.md`](../rust-performance.md), `PERF§` = [`../PERFORMANCE.md`](../PERFORMANCE.md), `KEY` = [`host-key-scale.md`](host-key-scale.md), `GRAPH` = [`graph-mode.md`](graph-mode.md), `NI` = [`note-intent.md`](note-intent.md) (audited).
+Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performance.md`](../rust-performance.md), `PERF§` = [`../PERFORMANCE.md`](../PERFORMANCE.md), `KEY` = [`host-key-scale.md`](host-key-scale.md), `GRAPH` = [`graph-mode.md`](graph-mode.md), `NI` = [`note-intent.md`](note-intent.md) (audited), `AK` = [`auto-key.md`](auto-key.md).
 
 ## Pitch detection
 
@@ -57,14 +57,22 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 | Studio onset note read from the newest third of the lookahead | NI protos B, C | DEV onset glitches 1.1 → 0.5 %; not confirmed on TEST | Adopted in the Labs "Learned note hold" (Studio) | #7, #10 |
 | Frontier yardstick: compare a change against the Pareto envelope of a Tolerance sweep | NI lead | Separates "better" from "a different setting of the same trade-off" | Adopted (`skato_eval note-intent`) | #26, #12, #7, #8 |
 | Uncertainty-scaled transition time | NI literature | Shrinks A→B→A swings without delaying confident switches | Candidate | #7 |
-| Key detection: profile matching on a stable-note histogram; optional sidechain chroma | R§6, KEY §5.3 | Vocal-only needs ~20-30 s of singing | Candidate | #6, #5, #7 |
+| Key detection as a pitch-class-set likelihood (in/out probability ε, family priors: diatonic, harmonic minor, melodic minor) with posterior confidence, over a decaying histogram of the sung vibrato-free centre | AK, R§6, KEY §5.3 | Synthetic TEST: set right at the end 99.3 % vs ≤ 66.7 % for profile correlation; confident proposals 99.9 % right; median 12 s; vocadito's ~12 s takes inconclusive for every method, 0 wrong confirmations; 75 ns per hop | Adopted (Auto-Key) | #6, #5, #7, #26, #10, #12 |
+| Krumhansl-Schmuckler profile correlation (KK, Temperley, Aarden-Essen, Bellman-Budge profiles) | AK | ≤ 66.7 % set accuracy on synthetic (can't answer harmonic minor); fine for naming the tonic of a set | Baseline; Temperley used for naming | #6 |
+| Tonal-bias tie-break: add the profile fit of a set's best name to its score | AK | In every top DEV setting (bias 3) | Adopted | #6 |
+| Offset-compensated soft pitch-class evidence (circular-mean singer offset; weight 1 − (2d)²) | AK | DEV synthetic @10 s 83 % vs 79 % without offset tracking | Adopted | #6, #7 (follow singer's tuning), #26 |
+| Steadiness gating of pitch evidence (slope over 20 ms) | AK | Hop-to-hop slope reads detector jitter as glides; on real singing the loosest setting (4 c/ms) won | Adopted (loose) | #6, #7 |
+| "Sung-notes" agreement confidence (sets differing only on unsung notes agree) | AK | Confident on incomplete scales, lower confident precision on DEV | Available, off | #6 |
+| Key confirmation with hysteresis (new key leads 8 s, at a pause ≥ 150 ms) | AK, KEY §5.3 | 142/144 synthetic takes confirmed, all right; no wrong confirmations on vocadito | Adopted | #6, #5 |
+| Optional sidechain chroma from the backing track | R§9.6, KEY §5.3 | Where Antares puts Auto-Key; vocal-only is weak on short material (AK §3) | Candidate | #6, #12 |
 
 ## Host integration
 
 | Technique | Source | Evidence | Status | Helps |
 |---|---|---|---|---|
 | VST3 `kScaleEvent` / `ProcessContext.chord` via a nice-plug patch | KEY | No host documented as sending scale events | Candidate (cheap) | #5 |
-| Latched MIDI-scale key source; Bitwig Key Filter+ → MIDI input | KEY §5 | Works in any DAW that routes MIDI to an effect (Bitwig route untested) | Candidate | #5, #6 |
+| Latched MIDI-scale key source; Bitwig Key Filter+ → MIDI input | KEY §5, AK §1.1 | Note-on sets the scale to every held note (2+ classes); only older notes lifted within 50 ms of a chord shrink it (staccato, staggered release and legato retrigger tested end to end); saved with the project. Bitwig route not yet tried in Bitwig | Adopted (Key Source = MIDI Scale) | #5, #6, #19 |
+| Key-change hold: a note removed by a scale change keeps its target until the next note (≤ 200 ms), then glides | KEY §3.3 | Control tests in Live and Studio; default output bit-identical | Adopted | #5, #6, #7 |
 | Display timeline that survives CLAP sleep/wake resets | commit 704d95d | Graph no longer wipes on pauses | Adopted | #19 |
 | In-place voice-range switch when latency is unchanged | STATUS (v1.1) | No host restart needed | Adopted | #19 |
 | Capture-based graph mode (Auto-Tune "Track Pitch" model) vs ARA 2 | GRAPH | Bitwig and Live have no ARA | Candidate | #10, #21 |
@@ -99,7 +107,7 @@ Sources: `R§` = [`../research.md`](../research.md), `P§` = [`../rust-performan
 - **Onset cues** (#7) could also fix slow breathy/voiced-consonant onsets (#16), Live-Min low-voice settling (#17), and note segmentation for graph mode (#10).
 - **Envelope correction** from the latency work (#8) is the core of a throat model (#9) and of formant quality beyond ±3 st (#15).
 - **The worker pool** (#13) is the prerequisite for a neural arbiter (#14) and live neural tracking (#27); the Apple research (#28) decides where that inference runs.
-- **Key detection** (#6) feeds the musical note model's key prior (#7) and the DAW-key fallback (#5).
+- **Key detection** (#6) feeds the musical note model's key prior (#7) and the DAW-key fallback (#5). Its synthetic melody generator and DEV/TEST protocol (`skato_eval autokey`) belong in the perceptual test suite (#26), and offline it can pre-fill the key in graph mode (#10).
 - **The note-intent harness, the detuned-singer benchmark and the frontier yardstick** should become part of the perceptual test suite (#26) and the Auto-Tune A/B (#12).
 - **"Rule proposes, model vetoes"** kept the synthetic gates passing where models that decided notes directly failed; the same pattern fits a neural octave/voicing arbiter (#14, #27) and other hysteresis decisions (voicing release, octave guard).
 - **Onset glitches are mostly shifter/output-path events** (note-decision proxy 1.1 % of the published 6.3 %), so they belong with the shifter and latency work (#8, #16).

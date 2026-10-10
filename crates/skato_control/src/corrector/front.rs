@@ -177,6 +177,7 @@ impl Corrector {
         };
 
         if !voiced {
+            self.key.unvoiced();
             self.intent.push(HFrame { forget, level, conf: f.confidence, ..HFrame::default() });
             if self.d.follow {
                 self.rt.unvoiced();
@@ -266,6 +267,9 @@ impl Corrector {
             }
             f.r_dec = self.adaptive_offset();
         }
+        // Auto-Key: the uncorrected, vibrato-free centre on the user's grid
+        // (Detune + bend), independent of the scale it might change.
+        self.key.voiced(f.p_c - self.be.offset(), f.confidence, f.guard);
 
         // E. Decision pitch (+ note HMM evidence in HQ/Max).
         f.p_dec = if self.s.ignore_vibrato { f.p_c } else { p_s };

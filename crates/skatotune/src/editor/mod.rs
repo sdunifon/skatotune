@@ -25,6 +25,7 @@
 mod correction;
 mod graph;
 mod history;
+mod key_panel;
 mod keyboard;
 mod labs_menu;
 mod theme;
@@ -47,8 +48,8 @@ use nice_plug_egui::{
 use skato_core::{NoteState, PitchFrame, cents_to_hz, frame_flags};
 
 use crate::params::{
-    EngineChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues, Preset,
-    SkatotuneParams,
+    EngineChoice, KeySourceChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues,
+    Preset, SkatotuneParams,
 };
 use crate::shared::SharedState;
 use graph::{RollContext, RollScratch, draw_pitch_roll, is_voiced, note_label};
@@ -258,6 +259,9 @@ pub struct SkatotuneEditor {
     labs_open: bool,
     last_ui: Option<Instant>,
     pending: PendingSince,
+    /// MIDI note-ons seen so far, and when the count last moved.
+    midi_ons: u32,
+    midi_seen: Option<Instant>,
     #[cfg(feature = "demo-telemetry")]
     demo: demo::DemoSource,
     #[cfg(feature = "demo-telemetry")]
@@ -287,6 +291,8 @@ impl SkatotuneEditor {
             labs_open: false,
             last_ui: None,
             pending: PendingSince::default(),
+            midi_ons: 0,
+            midi_seen: None,
             #[cfg(feature = "demo-telemetry")]
             demo: demo::DemoSource::default(),
             #[cfg(feature = "demo-telemetry")]
@@ -449,9 +455,24 @@ impl SkatotuneEditor {
 
         let values = self.params.values();
         let settings = values.to_settings();
-        // A learned scale replaces Key/Scale in every MIDI mode until cleared.
-        let learned = self.params.learned_states();
-        let states = learned.unwrap_or(settings.note_states);
+        // MIDI notes arriving while MIDI does nothing (the MIDI hint).
+        let ons = self.shared.midi_note_ons.load(Ordering::Relaxed);
+        if ons != self.midi_ons {
+            self.midi_ons = ons;
+            self.midi_seen = Some(now);
+        }
+        let midi_unused = values.key_source == KeySourceChoice::Manual
+            && values.midi_mode == MidiModeChoice::Off
+            && self.midi_seen.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(3));
+        let key_view = key_panel::KeyView::read(&self.shared, &self.params, &values, midi_unused);
+        // The scale in effect: a followed key (note settings on top), else a
+        // learned scale (it replaces Key/Scale until cleared), else Key/Scale.
+        let followed = key_view.followed_mask().filter(|_| values.key_source != KeySourceChoice::Manual);
+        let learned = self.params.learned_states().filter(|_| followed.is_none());
+        let states = match followed {
+            Some(mask) => crate::keysource::mask_states(mask, &values.note_overrides),
+            None => learned.unwrap_or(settings.note_states),
+        };
         self.pending
             .update(self.shared.restart_pending.load(Ordering::Acquire), now);
         // Frames arriving now were produced under the current Transpose.
@@ -498,6 +519,7 @@ impl SkatotuneEditor {
             &states,
             learned.is_some(),
             target_pc,
+            &key_view,
         );
 
         let main = Rect::from_min_max(
@@ -899,6 +921,7 @@ impl SkatotuneEditor {
         states: &[NoteState; 12],
         learned: bool,
         target_pc: Option<usize>,
+        key_view: &key_panel::KeyView,
     ) {
         panel(ui, rect);
         let params = self.params.clone();
@@ -922,22 +945,9 @@ impl SkatotuneEditor {
         }
         widgets::section_title(ui, pos2(x0, y), rule_end, "KEY & SCALE");
         y += 12.0;
-        let selectors = Rect::from_min_size(pos2(x0, y), vec2(w, 24.0));
-        ui.add_enabled_ui(!learned, |ui| {
-            widgets::combo(
-                ui,
-                Rect::from_min_size(pos2(x0, y), vec2(54.0, 24.0)),
-                setter,
-                &params.key,
-            );
-            widgets::combo(
-                ui,
-                Rect::from_min_size(pos2(x0 + 62.0, y), vec2(w - 62.0, 24.0)),
-                setter,
-                &params.scale,
-            );
-        });
-        if learned {
+        let selectors = Rect::from_min_size(pos2(x0, y + 28.0), vec2(w, 24.0));
+        y = key_panel::rows(ui, x0, x1, y, setter, &params, v, key_view, learned);
+        if learned && v.key_source == KeySourceChoice::Manual {
             ui.interact(
                 selectors,
                 Id::new("skato-key-scale-learned"),
@@ -945,7 +955,6 @@ impl SkatotuneEditor {
             )
             .on_hover_text(LEARNED_REPLACES_SCALE);
         }
-        y += 42.0;
 
         widgets::section_title(ui, pos2(x0, y), x1, "PRESETS");
         y += 12.0;
@@ -1983,9 +1992,9 @@ mod tests {
         app.setup(&ctx, GuiContext::new(host.clone()));
         run_frame(&ctx, &mut app, egui::RawInput::default());
 
-        // Sidebar layout: keyboard rows of 24 px from y = 230, B at the top,
-        // so D (pitch class 2) is row 9; the CLEAR button sits at (136, 218).
-        let d_row = egui::pos2(100.0, 230.0 + 9.0 * 24.0 + 12.0);
+        // Sidebar layout: keyboard rows of 24 px from y = 272, B at the top,
+        // so D (pitch class 2) is row 9; the CLEAR button sits at (136, 260).
+        let d_row = egui::pos2(100.0, 272.0 + 9.0 * 24.0 + 12.0);
         click(&ctx, &mut app, d_row);
         assert_eq!(
             params.learned_states(),
@@ -1997,7 +2006,7 @@ mod tests {
             0,
             "no note override was touched"
         );
-        click(&ctx, &mut app, egui::pos2(136.0, 218.0));
+        click(&ctx, &mut app, egui::pos2(136.0, 260.0));
         assert_eq!(params.learned_states(), None, "CLEAR");
 
         // Without a learned scale the same click cycles D's override again.

@@ -16,6 +16,9 @@
 //!          (heat-tinted output line on), --labs (the LABS menu open),
 //!          --theme=<teal|green-red|viridis|inferno|blue-orange> (the
 //!          Correction colors theme; teal is the default)
+//!   Key:   --key-source=<manual|midi|detect>, --detected (Auto-Key proposes
+//!          A minor at 86 %), --confirmed (and has confirmed it), --midi-chord
+//!          (MIDI Scale latched a D major cluster this session)
 //! sips -s format png out.bmp --out out.png   # macOS, optional
 //! ```
 //!
@@ -37,9 +40,10 @@ use nice_plug::context::gui::GuiContext;
 use nice_plug::prelude::*;
 use skatotune::editor::{HEIGHT, SkatotuneEditor, WIDTH};
 use skatotune::labs::CorrectionTheme;
+use skatotune::keysource;
 use skatotune::params::{
-    KeyChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues, Preset, ScaleChoice,
-    SkatotuneParams,
+    KeyChoice, KeySourceChoice, LatencyModeChoice, MidiModeChoice, NoteOverride, ParamValues,
+    Preset, ScaleChoice, SkatotuneParams,
 };
 use skatotune::shared::SharedState;
 
@@ -281,6 +285,14 @@ fn main() {
     if let Some(ms) = number("--retune=") {
         values.retune_ms = ms;
     }
+    if let Some(src) = args.iter().find_map(|a| a.strip_prefix("--key-source=")) {
+        values.key_source = match src {
+            "manual" => KeySourceChoice::Manual,
+            "midi" => KeySourceChoice::MidiScale,
+            "detect" => KeySourceChoice::Detect,
+            other => panic!("unknown --key-source={other}; use manual, midi or detect"),
+        };
+    }
     let params = Arc::new(SkatotuneParams::with_values(&values));
     if flag("--learn") || flag("--learned") {
         params
@@ -293,6 +305,24 @@ fn main() {
     shared.latency_samples.store(d, Ordering::Relaxed);
     shared.cpu_load.store(0.014, Ordering::Relaxed);
     shared.cpu_peak.store(0.031, Ordering::Relaxed);
+    let a_minor = skato_engine::KeyName::new(9, skato_core::ScaleKind::NaturalMinor);
+    if flag("--detected") || flag("--confirmed") {
+        shared.key_proposal.store(keysource::pack_key(a_minor), Ordering::Relaxed);
+        shared.key_confidence.store(0.86, Ordering::Relaxed);
+        shared.key_evidence.store(24.0, Ordering::Relaxed);
+    }
+    if flag("--confirmed") {
+        shared.key_confirmed.store(keysource::pack_key(a_minor), Ordering::Relaxed);
+        shared.key_in_effect.store(keysource::pack_in_effect(keysource::InEffect::Detect(a_minor)), Ordering::Relaxed);
+    }
+    if flag("--midi-chord") {
+        let d_major = skato_core::ScaleKind::Major.mask(2);
+        params.midi_scale.store(keysource::pack_midi(d_major, 2), Ordering::Relaxed);
+        shared.midi_latched.store(true, Ordering::Relaxed);
+        shared
+            .key_in_effect
+            .store(keysource::pack_in_effect(keysource::InEffect::Midi { mask: d_major, bass: 2 }), Ordering::Relaxed);
+    }
     if flag("--pending") {
         // A structural change waiting for the host restart.
         shared.restart_pending.store(true, Ordering::Relaxed);

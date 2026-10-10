@@ -23,6 +23,7 @@ use skato_core::{
     EngineKind, LatencyMode, MidiEvent, MidiMode, NoteState, PitchEstimate, QualityTier, ReferenceMode, Settings, SynthVibrato,
 };
 
+use crate::autokey::{KeyConfig, KeyDetector, KeyName, KeyReading};
 use crate::clock::{HopClock, finite_or, sane};
 use crate::intent::{NoteHoldStats, NoteIntent};
 use crate::lfo::SynthLfo;
@@ -312,6 +313,9 @@ pub struct Corrector {
     release: ReleaseFreeze,
     /// Follow singer's tuning (idle while the option is off).
     rt: RefTracker,
+    /// Auto-Key. Not cleared by `reset()`: the key of a song survives the
+    /// transport stopping and CLAP sleep/wake.
+    key: KeyDetector,
     /// Tests: every voiced hop's (rule decision, final decision), when on.
     #[cfg(test)]
     pub(crate) decisions: Option<Vec<(Change, Change)>>,
@@ -355,6 +359,7 @@ impl Corrector {
             intent: NoteIntent::new(clock.hop_ms, cfg.latency_mode),
             release: ReleaseFreeze::new(clock.whole_hops(release::WINDOW_MS, 1)),
             rt: RefTracker::new(clock.hop_s),
+            key: KeyDetector::new(clock.hop_s),
             #[cfg(test)]
             decisions: None,
         };
@@ -502,6 +507,39 @@ impl Corrector {
     pub fn note_hold_features(&mut self) -> Option<(f32, [f32; crate::intent::FEATURES], usize, u32)> {
         let age = self.lead_now();
         self.intent.features_at(age)
+    }
+
+    /// What Auto-Key believes: the proposed key, its confidence and the
+    /// confirmed key the Detect key source follows.
+    pub fn key_reading(&self) -> KeyReading {
+        self.key.reading()
+    }
+
+    /// The Auto-Key detector (its whole state, to carry into a new engine).
+    pub fn key_detector(&self) -> &KeyDetector {
+        &self.key
+    }
+
+    /// Continue from another detector's state (an engine rebuilt for a
+    /// structural change keeps what has been heard). Its hop must match.
+    pub fn set_key_detector(&mut self, detector: &KeyDetector) {
+        self.key.clone_from(detector);
+    }
+
+    /// Restore a confirmed key saved with the project.
+    pub fn seed_key(&mut self, key: KeyName) {
+        self.key.seed_confirmed(key);
+    }
+
+    /// Forget everything Auto-Key has heard (the editor's re-listen).
+    pub fn clear_key(&mut self) {
+        self.key.clear();
+    }
+
+    /// Evaluation: tune the Auto-Key detector (keeps its evidence).
+    #[doc(hidden)]
+    pub fn set_key_config(&mut self, cfg: KeyConfig) {
+        self.key.set_config(cfg);
     }
 
     /// Offset of the singer's tuning from A440 that follow singer's tuning

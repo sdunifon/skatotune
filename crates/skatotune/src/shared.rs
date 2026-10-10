@@ -53,6 +53,23 @@ pub struct SharedState {
     pub telemetry_dropped: AtomicU64,
     /// Incremented every time a new engine (and telemetry ring) is installed.
     pub engine_generation: AtomicU32,
+    /// Auto-Key for the editor: the proposal (a `keysource` key word, 0 =
+    /// none), its confidence and the evidence behind it (seconds of steady
+    /// singing), and the confirmed key (key word, `KEY_SAVED` when it came
+    /// from the saved project).
+    pub key_proposal: AtomicU32,
+    pub key_confidence: AtomicF32,
+    pub key_evidence: AtomicF32,
+    pub key_confirmed: AtomicU32,
+    /// The scale the Key Source puts in effect (`keysource::pack_in_effect`).
+    pub key_in_effect: AtomicU32,
+    /// MIDI note-ons received (any source; the editor's MIDI hint).
+    pub midi_note_ons: AtomicU32,
+    /// MIDI Scale has latched a chord since the plugin was loaded (the
+    /// editor tells it apart from the chord saved with the project).
+    pub midi_latched: AtomicBool,
+    /// The editor asks the audio thread to forget what Auto-Key has heard.
+    pub key_clear: AtomicBool,
     /// GUI-side mailbox for the telemetry consumer (see module docs).
     telemetry: Mutex<Option<rtrb::Consumer<PitchFrame>>>,
 }
@@ -74,6 +91,14 @@ impl Default for SharedState {
             learned_states: AtomicU32::new(0),
             telemetry_dropped: AtomicU64::new(0),
             engine_generation: AtomicU32::new(0),
+            key_proposal: AtomicU32::new(0),
+            key_confidence: AtomicF32::new(0.0),
+            key_evidence: AtomicF32::new(0.0),
+            key_confirmed: AtomicU32::new(0),
+            key_in_effect: AtomicU32::new(0),
+            midi_note_ons: AtomicU32::new(0),
+            midi_latched: AtomicBool::new(false),
+            key_clear: AtomicBool::new(false),
             telemetry: Mutex::new(None),
         }
     }
