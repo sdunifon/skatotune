@@ -79,9 +79,7 @@ def latency_chart():
         ("Live · Low Male", 5.85, 8.73),
         ("Live+ (default 10 ms)", 10.00, 10.25),
     ]
-    # Auto-Tune 2026, host-reported in Cubase (Sound On Sound, Jan 2026).
-    refs = [(0.8, "Auto-Tune Classic 0.8"), (2.3, "Auto-Tune low-latency 2.3")]
-    W, left, right, top = 760, 210, 40, 116
+    W, left, right, top = 760, 210, 40, 100
     rowh, barh = 44, 14
     xmax = 12.0
     plotw = W - left - right
@@ -100,10 +98,6 @@ def latency_chart():
         b.append(text(sx(rep) + 5, y + barh - 1, fmt1(rep), "val"))
         b.append(rect(left, y + barh + 5, sx(heard) - left, barh, "s2"))
         b.append(text(sx(heard) + 5, y + 2 * barh + 2, fmt1(heard), "val"))
-    for v, name in refs:
-        b.append(f'<line x1="{sx(v):.1f}" y1="{top - 14}" x2="{sx(v):.1f}" y2="{top + rowh * len(rows)}" class="ref"/>')
-    b.append(text(sx(0.8) - 4, top - 18, "Auto-Tune Classic 0.8", "tick", "end"))
-    b.append(text(sx(2.3) + 4, top - 18, "Auto-Tune low-latency 2.3 (both host-reported)", "tick"))
     b.append(text(20, H - 10, "Studio mode reports 20-50 ms (default 40), which the DAW compensates on recorded tracks. Values at 48 kHz.", "sub"))
     return svg(W, H, "".join(b), "Plugin latency by mode")
 
